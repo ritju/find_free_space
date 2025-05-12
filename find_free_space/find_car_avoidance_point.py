@@ -19,13 +19,20 @@ from tf_transformations import quaternion_from_euler
 
 class CarAvoidancePointActionServer(Node):
     def __init__(self):
-        super().__init__('car_avoidance_action_server')
+        super().__init__('find_free_space_action_server')
+
+        self.robot_pose = PoseStamped()
+        # 创建一个timer，用于实时获取机器人的位姿
+        self.get_robot_pose_timer_ = self.create_timer(timer_period_sec=0.1, callback=self.get_robot_pose_timer_callback)
+
+        self.polygons = []
+        self.verties = []
+        # 创建一个timer,用于实时得到距离机器人最近的通道位姿。
+        # self.get_verties_timer = self.create_timer(timer_period_sec=0.5, callback=self.get_verties_callback)
+
         callback_gp1 = MutuallyExclusiveCallbackGroup()
         callback_gp2 = MutuallyExclusiveCallbackGroup()
         callback_gp3 = MutuallyExclusiveCallbackGroup()
-        callback_gp4 = MutuallyExclusiveCallbackGroup()
-        callback_gp5 = MutuallyExclusiveCallbackGroup()
-        callback_gp6 = MutuallyExclusiveCallbackGroup()
         
         # action
         action_server_feedback_qos = QoSProfile(depth=1)
@@ -56,12 +63,41 @@ class CarAvoidancePointActionServer(Node):
 
     def global_costmap_callback(self, msg):
         self.global_costmap = msg
+    
+    # 用于实时获取机器人的位姿
+    def get_robot_pose_timer_callback(self):
+        try:
+            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+            self.robot_pose.header.stamp = self.get_clock().now().to_msg()
+            self.robot_pose.header.frame_id = 'map'
+            self.robot_pose.pose.position.x = trans.transform.translation.x
+            self.robot_pose.pose.position.y = trans.transform.translation.y
+            self.robot_pose.pose.orientation = trans.transform.rotation
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().error(f'{e}')
+
+    def get_verties_callback(self):
+        if len(self.polygons == 0):
+            pass
+        else:
+            current_polygon_verties = []
+            for polygon in self.polygons:
+                current_polygon_verties = np.array([[point.x,point.y] for point in polygon.points])
+                robot_is_in_area = self.is_point_inside_parallelogram(self.robot_pose.pose.position.x,self.robot_pose.pose.position.y,current_polygon_verties)
+                if robot_is_in_area:
+                    self.verties = current_polygon_verties
+                    break   
 
     def action_goal_callback(self, goal_handle):
-        self.get_logger().info('开始执行让行动作...')
+        self.get_logger().info('开始寻找避让点...')
         self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
         self.action_goal_handle_msg = goal_handle.request
         self.vehicle_width = self.action_goal_handle_msg.car_size.y
+        self.polygons = self.action_goal_handle_msg.polygons
+        
+        # 每次需要用到self.verties时，调用一下 get_verties_callback()
+        self.get_verties_callback()
+
         # 获取机器人当前位姿
         robot_pose = None
         start_get_tf2_time = time.time()
@@ -371,7 +407,7 @@ class CarAvoidancePointActionServer(Node):
             j = i
         return inside
     
-    # 寻找点相对于边界的对称点
+    # 选择平行四边形区域内的点
     def select_points_in_parallelogram(self, vertices, interval, boundary_distance):
         """
         选择平行四边形区域内的点

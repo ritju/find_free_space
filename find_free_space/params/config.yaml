@@ -1,0 +1,12 @@
+find_free_space_action_server:
+  ros__parameters:
+    topic_name_global_costmap: '/global_costmap/costmap_raw'
+    service_name_check_car_passble: '/check_car_passable'
+    redundancy_distance: 0.5
+    search_interval: 0.5
+    search_radius: 4.0
+
+
+
+
+
