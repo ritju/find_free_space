@@ -61,6 +61,25 @@ class CarAvoidancePointActionServer(Node):
         self.action_goal_handle_msg = None
         self.search_radius = 4.0
 
+    def init_params(self):
+        self.declare_parameter("topic_name_global_costmap", "")
+        self.declare_parameter("service_name_check_car_passble", "")
+        self.declare_parameter("redundancy_distance", "")
+        self.declare_parameter("search_interval", "")
+        self.declare_parameter("search_radius", "")
+
+        self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
+        self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
+        self.redundancy_distance = self.get_parameter("redundancy_distance").value
+        self.search_interval = self.get_parameter("search_interval").value
+        self.search_radius = self.get_parameter("search_radius").value
+
+        self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
+        self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
+        self.get_logger().info(f'redundancy_distance: {self.redundancy_distance}')
+        self.get_logger().info(f'search_interval: {self.search_interval}')
+        self.get_logger().info(f'search_radius: {self.search_radius}')
+    
     def global_costmap_callback(self, msg):
         self.global_costmap = msg
     
