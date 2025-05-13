@@ -22,8 +22,8 @@ params_file = os.path.join(find_free_space_pkg, "params", "config.yaml")
 def generate_launch_description():
         return LaunchDescription([
                 Node(
-                        package='find_free_space_pkg',
-                        executable='find_robot_parking_space_action',
+                        package='find_free_space',
+                        executable='find_parking_space',
                         name='find_free_space_action_server',
                         output='screen',
                         respawn_delay=2.0,

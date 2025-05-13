@@ -15,11 +15,35 @@ import cv2
 from nav_msgs.msg import OccupancyGrid
 from capella_ros_msg.action import FindCarAvoidancePoint
 from tf_transformations import quaternion_from_euler
+from geometry_msgs.msg import PolygonStamped
 
 
 class CarAvoidancePointActionServer(Node):
     def __init__(self):
         super().__init__('find_free_space_action_server')
+        self.get_logger().info('find_free_space_action_server started.')
+
+        # 初始化参数
+        self.robot_width = 1.0
+        self.vehicle_width = 2.0
+        self.redundancy_distance = 0.5
+        self.search_interval = 0.5
+        self.action_goal_handle_msg = None
+        self.search_radius = 4.0
+
+        self.init_params()
+
+        callback_gp1 = MutuallyExclusiveCallbackGroup()
+        callback_gp2 = MutuallyExclusiveCallbackGroup()
+        callback_gp3 = MutuallyExclusiveCallbackGroup()
+        callback_gp4 = MutuallyExclusiveCallbackGroup()
+
+        self.footprint_sub_ = self.create_subscription(
+            PolygonStamped, 
+            self.topic_name_footprint,
+            self.footprint_sub_callback,
+            1,
+            callback_group=callback_gp4)
 
         self.robot_pose = PoseStamped()
         # 创建一个timer，用于实时获取机器人的位姿
@@ -28,11 +52,7 @@ class CarAvoidancePointActionServer(Node):
         self.polygons = []
         self.verties = []
         # 创建一个timer,用于实时得到距离机器人最近的通道位姿。
-        # self.get_verties_timer = self.create_timer(timer_period_sec=0.5, callback=self.get_verties_callback)
-
-        callback_gp1 = MutuallyExclusiveCallbackGroup()
-        callback_gp2 = MutuallyExclusiveCallbackGroup()
-        callback_gp3 = MutuallyExclusiveCallbackGroup()
+        # self.get_verties_timer = self.create_timer(timer_period_sec=0.5, callback=self.get_verties_callback)        
         
         # action
         action_server_feedback_qos = QoSProfile(depth=1)
@@ -46,40 +66,50 @@ class CarAvoidancePointActionServer(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.global_costmap_sub = self.create_subscription(
             OccupancyGrid,
-            '/global_costmap/costmap',
+            self.topic_name_global_costmap,
             self.global_costmap_callback,
             10,
             callback_group=callback_gp2)
         self.global_costmap = None
         # 检查pose能否避让的服务
         self.check_avoidance_service = self.create_client(IsCarPassable, '/check_car_passable',callback_group=callback_gp3)
-            
-        self.robot_width = 1.0
-        self.vehicle_width = 2.0
-        self.redundancy_distance = 0.5
-        self.search_interval = 0.5
-        self.action_goal_handle_msg = None
-        self.search_radius = 4.0
 
     def init_params(self):
         self.declare_parameter("topic_name_global_costmap", "")
         self.declare_parameter("service_name_check_car_passble", "")
-        self.declare_parameter("redundancy_distance", "")
-        self.declare_parameter("search_interval", "")
-        self.declare_parameter("search_radius", "")
+        self.declare_parameter("topic_name_footprint", "")
+        self.declare_parameter("redundancy_distance", 0.3)
+        self.declare_parameter("search_interval", 0.3)
+        self.declare_parameter("search_radius", 2.0)
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
+        self.topic_name_footprint = self.get_parameter("topic_name_footprint").value
         self.redundancy_distance = self.get_parameter("redundancy_distance").value
         self.search_interval = self.get_parameter("search_interval").value
         self.search_radius = self.get_parameter("search_radius").value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
+        self.get_logger().info(f'topic_name_footprint: {self.topic_name_footprint}')
         self.get_logger().info(f'redundancy_distance: {self.redundancy_distance}')
         self.get_logger().info(f'search_interval: {self.search_interval}')
         self.get_logger().info(f'search_radius: {self.search_radius}')
     
+    def footprint_sub_callback(self, msg):
+        points = msg.polygon.points
+        edges_distance = np.array([
+            round(np.linalg.norm(
+                np.array([points[i].x, points[i].y]) - 
+                np.array([points[(i+1)%4].x, points[(i+1)%4].y])
+            ), 2)
+            for i in range(4)
+        ])
+        self.robot_width = np.min(edges_distance)
+        self.get_logger().info(f"robot_width: {self.robot_width}")
+        # 取消订阅
+        self.destroy_subscription(self.footprint_sub_)
+
     def global_costmap_callback(self, msg):
         self.global_costmap = msg
     
@@ -94,6 +124,8 @@ class CarAvoidancePointActionServer(Node):
             self.robot_pose.pose.orientation = trans.transform.rotation
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
             self.get_logger().error(f'{e}')
+        
+        self.get_logger().info(f'机器人当前位姿: [{self.robot_pose.pose.position.x}, {self.robot_pose.pose.position.y}]', throttle_duration_sec=2)
 
     def get_verties_callback(self):
         if len(self.polygons == 0):
@@ -109,68 +141,21 @@ class CarAvoidancePointActionServer(Node):
 
     def action_goal_callback(self, goal_handle):
         self.get_logger().info('开始寻找避让点...')
-        self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
+        # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
         self.action_goal_handle_msg = goal_handle.request
         self.vehicle_width = self.action_goal_handle_msg.car_size.y
         self.polygons = self.action_goal_handle_msg.polygons
         
+        # 获取清洁区域信息
         # 每次需要用到self.verties时，调用一下 get_verties_callback()
+        self.get_logger().info('寻找当前通行区域...')
+        self.verties.clear()
         self.get_verties_callback()
 
-        # 获取机器人当前位姿
-        robot_pose = None
-        start_get_tf2_time = time.time()
-        while robot_pose is None:
-            try:
-                trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-                robot_pose = PoseStamped()
-                robot_pose.header.stamp = self.get_clock().now().to_msg()
-                robot_pose.header.frame_id = 'map'
-                robot_pose.pose.position.x = trans.transform.translation.x
-                robot_pose.pose.position.y = trans.transform.translation.y
-                robot_pose.pose.orientation = trans.transform.rotation
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-                self.get_logger().error(f'{e}')
-            if time.time() - start_get_tf2_time > 10:
-                self.get_logger().error('获取机器人位姿超时。')
-                goal_handle.abort()
-                return FindCarAvoidancePoint.Result()
-
-        # 获取清洁区域信息
-        # 判断机器人当前在哪一个清洁区域
-        self.get_logger().info('寻找当前通行区域...')
-        cleaning_area_vertices = []
-        for polygon in self.action_goal_handle_msg.polygons:
-            cleaning_area_vertice = np.array([[point.x,point.y] for point in polygon.points])
-            robot_is_in_area = self.is_point_inside_parallelogram(robot_pose.pose.position.x,robot_pose.pose.position.y,cleaning_area_vertice)
-            if robot_is_in_area:
-                cleaning_area_vertices = cleaning_area_vertice
-                break
-            
-        if len(cleaning_area_vertices) == 0:
-            self.get_logger().error('机器人不在任何一个区域内。')
-            avoidance_pose = PoseStamped()
-            avoidance_pose.header.stamp = self.get_clock().now().to_msg()
-            avoidance_pose.header.frame_id = 'map'
-            avoidance_pose.pose.position.x = robot_pose.pose.position.x
-            avoidance_pose.pose.position.y = robot_pose.pose.position.y
-            avoidance_pose.pose.orientation = robot_pose.pose.orientation
-            
-            avoidance_pose_msg = IsCarPassable.Request()
-            avoidance_pose_msg.robot_pose = avoidance_pose
-            avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
-            avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
-            check_avoidance_result = self.check_avoidance(avoidance_pose_msg)
-            if check_avoidance_result:
-                self.get_logger().info(f'机器人当前位姿可以避让：{avoidance_pose}')
-                goal_handle.succeed()
-                result = FindCarAvoidancePoint.Result()
-                result.pose = avoidance_pose
-                return result
-            else:
-                self.get_logger().info(f'机器人当前位姿无法避让。')
-                goal_handle.abort()
-                return FindCarAvoidancePoint.Result()
+        if len(self.verties) == 0:
+            self.get_logger().error('未找到用于寻找停靠点的通道')
+            goal_handle.abort()
+            return FindCarAvoidancePoint.Result()
         
         # 计算总通行宽度
         self.get_logger().info('计算当前通行区域宽度...')
@@ -267,6 +252,7 @@ class CarAvoidancePointActionServer(Node):
             robot_car_k = math.pi /2
         else:
             robot_car_k = y_ / x_
+            robot_car_k = np.arctan(robot_car_k)
         k_diff = self.angle_diff(k,robot_car_k)
         if k_diff < math.pi/2:
             k = self.add_angles(k,math.pi)
@@ -419,7 +405,8 @@ class CarAvoidancePointActionServer(Node):
             xj, yj = vertices[j][0], vertices[j][1]
 
             intersect = ((yi > robot_y) != (yj > robot_y)) and \
-                        (robot_x < (xj - xi) * (robot_y - yi) / (yj - yi) + xi)
+                        (xj - xi) * (robot_y - yi) - (yj - yi) * (robot_x - xi) # 使用向量法，避免分母为0的情况
+                        # (robot_x < (xj - xi) * (robot_y - yi) / (yj - yi) + xi)
             if intersect:
                 inside = not inside
 
@@ -542,7 +529,7 @@ class CarAvoidancePointActionServer(Node):
         if error < -math.pi:
                 error = error + 2*math.pi #小于-pi加2pi
         elif error >= math.pi:
-                error = 2*math.pi - error #大于pi减2pi
+                error = error - 2*math.pi #大于pi减2pi
         else:
                 pass
         if use_abs:
