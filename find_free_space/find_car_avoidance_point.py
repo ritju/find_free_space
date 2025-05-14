@@ -353,22 +353,58 @@ class CarAvoidancePointActionServer(Node):
         return None
 
     # 寻找最近的边界
-    def find_nearest_boundary(self, robot_pose, cleaning_area_vertices):
+    def find_nearest_boundary(robot_pose, vertices):
+        """
+        找到距离机器人位置最近的矩形长边
+        
+        参数:
+            robot_pose: 包含机器人位置信息的对象
+            vertices: 矩形四个顶点坐标列表，按顺序排列
+            
+        返回:
+            距离机器人最近的边界线段（由两个端点坐标组成的元组）
+        """
+        # 构建四条边（假设顶点已按顺序排列）
+        edges = [
+            (vertices[0], vertices[1]),
+            (vertices[1], vertices[2]), 
+            (vertices[2], vertices[3]),
+            (vertices[3], vertices[0])
+        ]
+        
+        # 计算各边长度
+        def calc_edge_length(edge):
+            p1, p2 = edge
+            return np.linalg.norm(np.array(p2) - np.array(p1))
+        
+        edge_lengths = [calc_edge_length(edge) for edge in edges]
+        
+        # 按长度排序并获取两条最长边
+        sorted_edges = sorted(zip(edges, edge_lengths), key=lambda x: -x[1])
+        long_edges = [edge for edge, _ in sorted_edges[:2]]
+        
+        # 机器人当前位置
         robot_point = np.array([robot_pose.pose.position.x, robot_pose.pose.position.y])
+        
         min_distance = float('inf')
         nearest_boundary = None
-        for i in range(4):
-            p1 = np.array([cleaning_area_vertices[i][0], cleaning_area_vertices[i][1]])
-            p2 = np.array([cleaning_area_vertices[(i + 1) % 4][0], cleaning_area_vertices[(i + 1) % 4][1]])
-            # ax+by+c=0
+        
+        # 计算到每条长边的距离
+        for edge in long_edges:
+            p1, p2 = np.array(edge[0]), np.array(edge[1])
+            
+            # 计算直线方程参数 ax + by + c = 0
             a = p1[1] - p2[1]
-            b = p2[0] - p1[0]
-            c = p1[0] * p2[1] - p2[0] * p1[1]
-            # point to line dist
+            b = p2[0] - p1[0] 
+            c = p1[0]*p2[1] - p2[0]*p1[1]
+            
+            # 计算点到直线距离
             distance = abs(a*robot_point[0] + b*robot_point[1] + c) / math.sqrt(a**2 + b**2)
+            
             if distance < min_distance:
                 min_distance = distance
                 nearest_boundary = (p1, p2)
+                
         return nearest_boundary
 
     # 发送服务，判断避让点是否能够让车通过
