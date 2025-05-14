@@ -471,26 +471,45 @@ class CarAvoidancePointActionServer(Node):
         return points
     
     # 对四边形的四个顶点进行排序，按左上角、右上角、右下角、左下角的顺序返回
-    def sort_quadrilateral_vertices(self, vertices):
+    def sort_quadrilateral_vertices(self, points):
         """
-        对四边形的四个顶点进行排序，按左上角、右上角、右下角、左下角的顺序返回
-        :param vertices: 四边形的四个顶点列表，每个顶点是一个二元组 (x, y)
-        :return: 排序后的顶点列表
+        对矩形的四个顶点进行排序，返回顺序为 [左上, 右上, 右下, 左下]
+        
+        参数:
+            points (np.ndarray or list): 四个点的坐标，形状为 (4, 2)
+        
+        返回:
+            np.ndarray: 排序后的四个点，形状为 (4, 2)
         """
-        # 按 y 坐标从小到大排序，如果 y 坐标相同，则按 x 坐标从小到大排序
-        sorted_vertices = sorted(vertices, key=lambda point: (point[1], point[0]))
-
-        # 前两个点是上方的点，后两个点是下方的点
-        top_points = sorted_vertices[:2]
-        bottom_points = sorted_vertices[2:]
-
-        # 对上方的点按 x 坐标从小到大排序，得到左上角和右上角的点
-        top_left, top_right = sorted(top_points, key=lambda point: point[0])
-
-        # 对下方的点按 x 坐标从小到大排序，得到左下角和右下角的点
-        bottom_left, bottom_right = sorted(bottom_points, key=lambda point: point[0])
-
-        return [top_left, top_right, bottom_right, bottom_left]
+        points = np.array(points)
+        
+        # 1. 计算中心点
+        center = np.mean(points, axis=0)
+        
+        # 2. 计算每个点相对于中心的角度（使用反正切函数）
+        angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+        
+        # 3. 按角度排序（顺时针方向）
+        sorted_indices = np.argsort(angles)
+        sorted_points = points[sorted_indices]
+        
+        # 4. 确保顺序是 [左上, 右上, 右下, 左下]
+        # 找到 y 值最小的两个点（顶部点）
+        top_points = sorted_points[np.argsort(sorted_points[:, 1])[:2]]
+        
+        # 在顶部点中，x 较小的为左上，较大的为右上
+        if top_points[0][0] > top_points[1][0]:
+            top_points = top_points[::-1]
+        
+        # 剩下的两个点是底部点，x 较大的为右下，较小的为左下
+        bottom_points = sorted_points[np.argsort(sorted_points[:, 1])[2:]]
+        if bottom_points[0][0] < bottom_points[1][0]:
+            bottom_points = bottom_points[::-1]
+        
+        # 组合最终顺序
+        ordered_points = np.vstack([top_points, bottom_points])
+        
+        return ordered_points
     
     # 将角度转换为机器人坐标系下的角度
     def convert_angle_to_ros2(self, angle, input_in_degrees=False):
