@@ -81,6 +81,7 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter("redundancy_distance", 0.3)
         self.declare_parameter("search_interval", 0.3)
         self.declare_parameter("search_radius", 2.0)
+        self.declare_parameter("check_service_max_time", 0.5)
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -88,6 +89,7 @@ class CarAvoidancePointActionServer(Node):
         self.redundancy_distance = self.get_parameter("redundancy_distance").value
         self.search_interval = self.get_parameter("search_interval").value
         self.search_radius = self.get_parameter("search_radius").value
+        self.check_service_max_time = self.get_parameter("check_service_max_time").value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
@@ -95,6 +97,7 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'redundancy_distance: {self.redundancy_distance}')
         self.get_logger().info(f'search_interval: {self.search_interval}')
         self.get_logger().info(f'search_radius: {self.search_radius}')
+        self.get_logger().info(f'check_service_max_time: {self.check_service_max_time}')
     
     def footprint_sub_callback(self, msg):
         points = msg.polygon.points
@@ -319,9 +322,11 @@ class CarAvoidancePointActionServer(Node):
                         avoidance_pose_msg.robot_pose = avoidance_pose
                         avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
                         avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
+                        start_time = time.time()
                         check_avoidance_result = self.check_avoidance(avoidance_pose_msg)
+                        end_time = time.time()
                         print('check_avoidance_result  ',check_avoidance_result)
-                        if check_avoidance_result:
+                        if check_avoidance_result and (end_time - start_time) < self.check_service_max_time:
                             robot_point = np.array([robot_x,robot_y])
                             robot_point_pixel = (robot_point - np.array([origin_x,origin_y])) / resolution
                             robot_point_pixel[1] = height - robot_point_pixel[1]

@@ -6,6 +6,7 @@ find_free_space_action_server:
     redundancy_distance: 0.5
     search_interval: 0.5
     search_radius: 4.0
+    check_service_max_time: 1.0
 
 
 
