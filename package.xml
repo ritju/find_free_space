@@ -16,6 +16,7 @@
   <depend>nav_msgs</depend>
   <depend>capella_ros_msg</depend>
   <depend>tf_transformations</depend>
+  <depend>nav2_costmap_2d</depend>
 
 
   <export>

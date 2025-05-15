@@ -19,7 +19,6 @@ from tf_transformations import quaternion_from_euler
 from geometry_msgs.msg import PolygonStamped
 from collections import defaultdict
 import matplotlib.pyplot as plt
-# from nav2_costmap_2d import Costmap2D
 
 
 class CarAvoidancePointActionServer(Node):
@@ -173,10 +172,21 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().error('未找到用于寻找停靠点的通道')
             goal_handle.abort()
             return FindCarAvoidancePoint.Result()
+        
+        # 计算总通行宽度
+        self.get_logger().info('计算当前通行区域宽度...')
+        total_passage_width = self.calculate_total_passage_width(self.verties)
+
+        # 判断是否需要在通行区域外寻找
+        required_width = self.robot_width + self.vehicle_width + self.redundancy_distance
+        if required_width > total_passage_width:
+            search_outside = True
+        else:
+            search_outside = False
 
         # 寻找停靠点
         self.get_logger().info('寻找停靠点...')
-        avoidance_point = self.find_avoidance_point(self.robot_pose, self.verties)
+        avoidance_point = self.find_avoidance_point(self.robot_pose, self.verties, search_outside)
         self.get_logger().info(f'avoidance_point:{avoidance_point}')
         if avoidance_point is not None:
             self.get_logger().info(f'成功找到避让点{avoidance_point}')
@@ -205,7 +215,7 @@ class CarAvoidancePointActionServer(Node):
         return distance
 
     # 寻找距离机器人最近的长边
-    def find_min_long_sides(self, cleaning_area_vertices, robot_position):
+    def find_min_long_sides(cleaning_area_vertices, robot_position):
         # 计算相邻顶点之间的距离
         distances = []
         for i in range(4):
@@ -266,9 +276,8 @@ class CarAvoidancePointActionServer(Node):
                 closest_side = side
         
         return closest_side
-    
     # 计算点与直线垂直且向外延申的点的点
-    def findIntersection(self, a, b, c, distance):
+    def findIntersection(a, b, c, distance):
         # 计算线段ab的向量
         ab_x = b[0] - a[0]
         ab_y = b[1] - a[1]
@@ -312,7 +321,7 @@ class CarAvoidancePointActionServer(Node):
         return (target_x, target_y)
     
     # 寻找所有的避让点
-    def find_avoidance_point(self, robot_pose, cleaning_area_vertices):
+    def find_avoidance_point(self, robot_pose, cleaning_area_vertices, search_outside):
         if self.global_costmap is None:
             self.get_logger().error('全局代价地图未收到')
             return None
@@ -321,28 +330,25 @@ class CarAvoidancePointActionServer(Node):
         origin_x = map_info.origin.position.x
         origin_y = map_info.origin.position.y
         resolution = map_info.resolution
-        width = map_info.size_x
-        height = map_info.size_y
-        self.get_logger().info(f'origin_x: {origin_x}')
-        self.get_logger().info(f'origin_y: {origin_y}')
-        self.get_logger().info(f'resolution: {resolution}')
-        self.get_logger().info(f'width: {width}')
-        self.get_logger().info(f'height: {height}')
+        width = map_info.size_y
+        height = map_info.size_x
+        self.get_logger().error(f'origin_x: {origin_x}')
+        self.get_logger().error(f'origin_y: {origin_y}')
+        self.get_logger().error(f'resolution: {resolution}')
+        self.get_logger().error(f'width: {width}')
+        self.get_logger().error(f'height: {height}')
         
         map = np.array(self.global_costmap.data)
         # map[map == -1] = 50
         # map = (100 - map) / 100 * 255
         # map[map != 0] = 255
-        costmap = np.ascontiguousarray(map.reshape((height,width)).astype(np.uint8))
+        costmap = np.ascontiguousarray(map.reshape((height,width)).astype(np.uint8)[::-1])
 
         robot_x = robot_pose.pose.position.x
         robot_y = robot_pose.pose.position.y
 
         # 计算最近的边界
-        
         self.get_logger().info('寻找最近的边界...')
-        # 寻找距离最近的长边
-        # nearest_boundary = self.find_min_long_sides(cleaning_area_vertices,[robot_x1,robot_y1])
         nearest_boundary = self.find_nearest_boundary(robot_pose, cleaning_area_vertices)
         y_ = (nearest_boundary[0][1] - nearest_boundary[1][1])
         x_ = (nearest_boundary[0][0] - nearest_boundary[1][0])
@@ -367,31 +373,37 @@ class CarAvoidancePointActionServer(Node):
         c = p2[0] * p1[1] - p1[0] * p2[1]
         # 计算汽车和机器人之间的角度
         car_pose= self.action_goal_handle_msg.car_pose.pose.position
-        y_ = robot_y - car_pose.y
-        x_ = robot_x - car_pose.x
+        y_ = (car_pose.y - robot_y)
+        x_ = (car_pose.x - robot_x)
         if x_ == 0.0:
             robot_car_k = math.pi /2
         else:
             robot_car_k = y_ / x_
             robot_car_k = np.arctan(robot_car_k)
-        self.get_logger().info(f"k: {k}, robot_car_k: {robot_car_k}")
         k_diff = self.angle_diff(k,robot_car_k)
-        self.get_logger().info(f'k_diff: {k_diff}')
-        if k_diff > math.pi/2:
+        if k_diff < math.pi/2:
             k = self.add_angles(k,math.pi)
             
-
-        robot_x1 = robot_x + math.cos(k) * self.search_radius
-        robot_y1 = robot_y + math.sin(k) * self.search_radius
-        robot_x2 = robot_x
-        robot_y2 = robot_y
+        if not search_outside:
+            # 计算搜索范围
+            robot_x1 = robot_x + math.cos(k) * self.search_radius
+            robot_y1 = robot_y + math.sin(k) * self.search_radius
+            robot_x2 = robot_x
+            robot_y2 = robot_y
+        else:
+            robot_x_opposite,robot_y_opposite = self.find_symmetric_point([robot_x,robot_y],[a,b,c])
+            # 计算搜索范围
+            robot_x1 = robot_x_opposite + math.cos(k) * self.search_radius
+            robot_y1 = robot_y_opposite + math.sin(k) * self.search_radius
+            robot_x2 = robot_x_opposite
+            robot_y2 = robot_y_opposite
         # x = -(c+by)/a
         
         # 寻找距离最近的长边
-        # min_border_long_side = self.find_min_long_sides(cleaning_area_vertices,[robot_x1,robot_y1])
+        min_border_long_side = self.find_min_long_sides(cleaning_area_vertices,[robot_x1,robot_y1])
         # 寻找与长边垂直且相交的点
-        vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1],self.distance_extend_outside)
-        vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2],self.distance_extend_outside)
+        vertical_border_x1, vertical_border_y1 = self.findIntersection(min_border_long_side[0],min_border_long_side[1],[robot_x1,robot_y1],self.distance_extend_outside)
+        vertical_border_x2, vertical_border_y2 = self.findIntersection(min_border_long_side[0],min_border_long_side[1],[robot_x2,robot_y2],self.distance_extend_outside)
         
         
         # 在区域内搜索，往边界靠近
@@ -399,16 +411,14 @@ class CarAvoidancePointActionServer(Node):
         find_vertices = self.sort_quadrilateral_vertices([(robot_x1,robot_y1),(vertical_border_x1,vertical_border_y1),(vertical_border_x2, vertical_border_y2),(robot_x2,robot_y2)])
         
         self.get_logger().info('生成所有停靠点...')
-        self.get_logger().info(f"find_vertices: {find_vertices}")
-        search_posestamped_list = self.select_points_in_parallelogram(find_vertices,0.5)
-        self.get_logger().info(f'search_posestamped length: {len(search_posestamped_list)}')
+        search_posestamped_list = self.select_points_in_parallelogram(find_vertices,0.5,0.0)
         # 判断每个点是否里障碍物太近
         # 首先将位姿转换到map的像素点
         if len(search_posestamped_list) > 0:
             boundary_points = [(pose.pose.position.x, pose.pose.position.y) for pose in search_posestamped_list]
             boundary_points = np.array(boundary_points)
             boundary_points_pixel = (boundary_points - np.array([origin_x,origin_y])) / resolution
-            # boundary_points_pixel[:,1] = height - boundary_points_pixel[:,1]
+            boundary_points_pixel[:,1] = height - boundary_points_pixel[:,1]
             boundary_points_pixel[:,0] = np.clip(boundary_points_pixel[:,0],0,width-1)
             boundary_points_pixel[:,1] = np.clip(boundary_points_pixel[:,1],0,height-1)
             self.get_logger().info(f'一共{len(boundary_points)}个避障...')
@@ -416,35 +426,37 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info('排除障碍物点...')
             is_obstacle_index = [True if self.check_point_is_free(costmap,(x,y),5) else False for x,y in boundary_points_pixel]
             boundary_points = boundary_points[is_obstacle_index]
-            search_posestamped_list = np.array(search_posestamped_list)
             search_posestamped_list = search_posestamped_list[is_obstacle_index]
-            self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个避障...')
+            self.get_logger().info(f'排除障碍物点后还剩{len(boundary_points)}个避障...')
+            if len(boundary_points) > 0:
+                # 对所有点进行排序，从近到远
+                # 计算所有点到机器人的距离
+                point_dist = np.array([math.dist(p,[robot_x,robot_y]) for p in boundary_points])
+                print(boundary_points)
+                boundary_points = sorted(boundary_points,key=lambda x:point_dist[(boundary_points==x).all(1)])
             
             for avoidance_pose in search_posestamped_list:    
                 avoidance_pose_msg = IsCarPassable.Request()
                 avoidance_pose_msg.robot_pose = avoidance_pose
                 avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
                 avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
-                self.get_logger().info(f'避让点: ({avoidance_pose.pose.position.x}, {avoidance_pose.pose.position.y})')
                 start_time = time.time()
                 check_avoidance_result = self.check_avoidance(avoidance_pose_msg)
                 end_time = time.time()
-                delta_time = end_time - start_time
-                self.get_logger().info(f'check_avoidance_result: {check_avoidance_result}')
-                self.get_logger().info(f'delta_time: {delta_time}')
-                if check_avoidance_result and delta_time < self.check_service_max_time:
+                print('check_avoidance_result  ',check_avoidance_result)
+                if check_avoidance_result and (end_time - start_time) < self.check_service_max_time:
                     robot_point = np.array([robot_x,robot_y])
                     robot_point_pixel = (robot_point - np.array([origin_x,origin_y])) / resolution
-                    # robot_point_pixel[1] = height - robot_point_pixel[1]
+                    robot_point_pixel[1] = height - robot_point_pixel[1]
                     robot_point_pixel[0] = np.clip(robot_point_pixel[0],0,width-1)
                     robot_point_pixel[1] = np.clip(robot_point_pixel[1],0,height-1)
                     # robot_x_p,robot_y_p = robot_point_pixel
                     robot_x_p = int(robot_point_pixel[0])
                     robot_y_p = int(robot_point_pixel[1])
 
-                    point = np.array([avoidance_pose.pose.position.x, avoidance_pose.pose.position.y])
+                    point = np.array([avoidance_pose.pose.postion.x, avoidance_pose.pose.postion.y])
                     point_pixel = (point - np.array([origin_x,origin_y])) / resolution
-                    # point_pixel[1] = height - point_pixel[1]
+                    point_pixel[1] = height - point_pixel[1]
                     point_pixel[0] = np.clip(point_pixel[0],0,width-1)
                     point_pixel[1] = np.clip(point_pixel[1],0,height-1)
                     # point_x_p,point_y_p = point_pixel
@@ -452,21 +464,17 @@ class CarAvoidancePointActionServer(Node):
                     point_y_p = int(point_pixel[1])
                     bresenham_point = self.bresenham(robot_x_p,robot_y_p,point_x_p,point_y_p,costmap)
                     bresenham_point_value = np.array([costmap[x[1],x[0]] for x in bresenham_point])
-                    self.get_logger().info(f"costmap values: {bresenham_point_value}")
                     
-                    if (bresenham_point_value == 0).all():
-                        self.get_logger().info('机器人到当前点的连线满足')
+                    if (bresenham_point_value < 253).all():
                         return avoidance_pose
-                    else:
-                        self.get_logger().info('机器人到当前点的连线不满足')
-        else:
-            self.get_logger().info('用于搜索的点，数量为0')
-            return None
-        self.get_logger().info('所有点都不满足')
+                return None
+            else:
+                return None
+        
         return None
 
     # 寻找最近的边界
-    def find_nearest_boundary(self, robot_pose, vertices):
+    def find_nearest_boundary(robot_pose, vertices):
         """
         找到距离机器人位置最近的矩形长边
         
@@ -570,17 +578,16 @@ class CarAvoidancePointActionServer(Node):
         generate_search_points_without_directions = self.generate_all_serach_points(vertices, interval)
         generate_search_points_with_directions = self.process_points(self.robot_pose, vertices, generate_search_points_without_directions)
         search_posetampd_list = []
-        for point_with_direction in generate_search_points_with_directions:
+        for point_wit_direction in generate_search_points_with_directions:
             pose_with_direction = PoseStamped()
             pose_with_direction.header.stamp = self.get_clock().now().to_msg()
             pose_with_direction.header.frame_id = 'map'
-            pose_with_direction.pose.position.x = point_with_direction[0][0]
-            pose_with_direction.pose.position.y = point_with_direction[0][1]
+            pose_with_direction.pose.position.x = point_wit_direction[0][0]
+            pose_with_direction.pose.position.x = point_wit_direction[0][1]
             quat = Quaternion()
-            quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, point_with_direction[1])
+            quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, point_wit_direction[1])
             pose_with_direction.pose.orientation = quat
-            search_posetampd_list.append(pose_with_direction)
-        # self.show(generate_search_points_with_directions)
+        # show(generate_search_points_with_directions)
         return search_posetampd_list
     
     def generate_all_serach_points(self,vertices, interval):
@@ -837,7 +844,7 @@ class CarAvoidancePointActionServer(Node):
                 distance = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2)
                 if distance <= radius:
                     # 检查像素值是否大于 1
-                    if image[y, x] == 0:
+                    if image[y, x] >= 253:
                         return True
         return False
 
@@ -900,7 +907,7 @@ class CarAvoidancePointActionServer(Node):
         x, y = current_x, current_y
         self.get_logger().info(f'x: {current_x}, y: {current_y}')
         self.get_logger().info(f't_x: {target_x}, t_y: {target_y}')
-        # self.get_logger().info(f'm_x: {len(map_array[0])}, y: {len(map_array)}')
+        self.get_logger().info(f'm_x: {len(map_array[0])}, y: {len(map_array)}')
         while True:
             # 检查点是否在地图范围内
             if 0 <= x < len(map_array[0]) and 0 <= y < len(map_array):
