@@ -205,14 +205,14 @@ class CarAvoidancePointActionServer(Node):
         return distance
 
     # 寻找距离机器人最近的长边
-    def find_min_long_sides(self, cleaning_area_vertices, robot_position):
-        # 计算相邻顶点之间的距离
-        distances = []
-        for i in range(4):
-            x1, y1 = cleaning_area_vertices[i]
-            x2, y2 = cleaning_area_vertices[(i+1)%4]
-            distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-            distances.append(distance)
+    # def find_min_long_sides(self, cleaning_area_vertices, robot_position):
+    #     # 计算相邻顶点之间的距离
+    #     distances = []
+    #     for i in range(4):
+    #         x1, y1 = cleaning_area_vertices[i]
+    #         x2, y2 = cleaning_area_vertices[(i+1)%4]
+    #         distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    #         distances.append(distance)
         
         # 判断长边对
         if distances[0] > distances[1]:

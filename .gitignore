@@ -1,3 +1,2 @@
-__pycache__/
-*.pyc
-find_free_space/__pycache__/
+/*.pyc
+find_free_space/__pycache__/*
