@@ -35,6 +35,7 @@ class CarAvoidancePointActionServer(Node):
         self.action_goal_handle_msg = None
         self.search_radius = 4.0
         self.distance_extend_outside = 1.0
+        self.cv_window_name = 'Global Costmap Raw Colored'
 
         self.init_params()
 
@@ -88,6 +89,8 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter("search_radius", 2.0)
         self.declare_parameter("check_service_max_time", 0.5)
         self.declare_parameter("distance_extend_outside", 1.0)
+        self.declare_parameter('show_global_costmap_raw_cv2', False)
+        self.declare_parameter('show_global_costmap_raw_colored_cv2', False)
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -97,6 +100,8 @@ class CarAvoidancePointActionServer(Node):
         self.search_radius = self.get_parameter("search_radius").value
         self.check_service_max_time = self.get_parameter("check_service_max_time").value
         self.distance_extend_outside = self.get_parameter("distance_extend_outside").value
+        self.show_global_costmap_raw_cv2 = self.get_parameter('show_global_costmap_raw_cv2').value
+        self.show_global_costmap_raw_colored_cv2 = self.get_parameter('show_global_costmap_raw_colored_cv2').value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
@@ -106,6 +111,8 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'search_radius: {self.search_radius}')
         self.get_logger().info(f'check_service_max_time: {self.check_service_max_time}')
         self.get_logger().info(f'distance_extend_outside: {self.distance_extend_outside}')
+        self.get_logger().info(f'show_global_costmap_raw_cv2: {self.show_global_costmap_raw_cv2}')
+        self.get_logger().info(f'show_global_costmap_raw_colored_cv2: {self.show_global_costmap_raw_colored_cv2}')
     
     def footprint_sub_callback(self, msg):
         points = msg.polygon.points
@@ -124,6 +131,31 @@ class CarAvoidancePointActionServer(Node):
     def global_costmap_callback(self, msg):
         # self.get_logger().info('获取全局代价图')
         self.global_costmap = msg
+
+        if self.show_global_costmap_raw_colored_cv2 or self.show_global_costmap_raw_cv2:
+            width = msg.metadata.size_x
+            height = msg.metadata.size_y
+            costmap_data = np.array(msg.data, dtype=np.uint8).reshape((height, width))
+        
+            count0 = np.count_nonzero(costmap_data == 0)
+            count254 = np.count_nonzero(costmap_data == 254)
+            count255 = np.count_nonzero(costmap_data == 255)
+
+            self.get_logger().info(f'count0: {count0}', once=True)
+            self.get_logger().info(f'count254: {count254}', once=True)
+            self.get_logger().info(f'count255: {count255}', once=True)
+        
+        if self.show_global_costmap_raw_colored_cv2:
+            # 应用颜色映射（障碍物显示为红色）
+            colored_map = cv2.applyColorMap(costmap_data, cv2.COLORMAP_JET)        
+            # 显示图像
+            cv2.imshow(self.cv_window_name, colored_map)
+        
+        if self.show_global_costmap_raw_cv2:
+            cv2.imshow('Global Costmap Raw', costmap_data)
+        
+        if self.show_global_costmap_raw_colored_cv2 or self.show_global_costmap_raw_cv2:
+            cv2.waitKey(1)
     
     # 用于实时获取机器人的位姿
     def get_robot_pose_timer_callback(self):
@@ -469,7 +501,7 @@ class CarAvoidancePointActionServer(Node):
                     bresenham_point_value = np.array([costmap[x[1],x[0]] for x in bresenham_point])
                     self.get_logger().info(f"costmap values: {bresenham_point_value}")
                     
-                    if (bresenham_point_value == 0).all():
+                    if (bresenham_point_value < 253).all():
                         self.get_logger().info('机器人到当前点的连线满足')
                         return avoidance_pose
                     else:
@@ -859,7 +891,7 @@ class CarAvoidancePointActionServer(Node):
                 distance = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2)
                 if distance <= radius:
                     # 检查像素值是否大于 1
-                    if image[y, x] == 0:
+                    if image[y, x] < 253:
                         return True
         return False
 

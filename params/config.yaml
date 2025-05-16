@@ -8,6 +8,8 @@ find_free_space_action_server:
     search_radius: 4.0
     check_service_max_time: 1.0
     distance_extend_outside: 1.1
+    show_global_costmap_raw_cv2: false
+    show_global_costmap_raw_colored_cv2: false
 
 
 
