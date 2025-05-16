@@ -57,7 +57,7 @@ class CarAvoidancePointActionServer(Node):
         self.polygons = []
         self.verties = []
         # 创建一个timer,用于实时得到距离机器人最近的通道位姿。
-        self.get_verties_timer = self.create_timer(timer_period_sec=0.5, callback=self.get_verties_callback)        
+        # self.get_verties_timer = self.create_timer(timer_period_sec=0.5, callback=self.get_verties_callback)        
         
         # action
         action_server_feedback_qos = QoSProfile(depth=1)
@@ -147,9 +147,15 @@ class CarAvoidancePointActionServer(Node):
             for polygon in self.polygons:
                 current_polygon_verties = np.array([[point.x,point.y] for point in polygon.points])
                 robot_is_in_area = self.is_point_inside_parallelogram(self.robot_pose.pose.position.x,self.robot_pose.pose.position.y,current_polygon_verties)
+                self.get_logger().info(f"robot: ({self.robot_pose.pose.position.x}, {self.robot_pose.pose.position.y})")
+                self.get_logger().info(f'polygons: \n{current_polygon_verties}')
                 if robot_is_in_area:
                     self.verties = current_polygon_verties
-                    break   
+                    self.get_logger().info('inside: True')
+                    break
+                else:
+                    self.get_logger().info('inside: False')
+
 
     def action_goal_callback(self, goal_handle):
         self.get_logger().info('开始寻找避让点...')
@@ -165,6 +171,8 @@ class CarAvoidancePointActionServer(Node):
         self.verties = list(self.verties)
         self.verties.clear()
         self.get_verties_callback()
+        v1, v2, v3, v4 = self.verties
+        self.get_logger().info(f'当前通行区域: [({v1[0]}, {v1[1]}),({v2[0]}, {v2[1]}),({v3[0]}, {v3[1]}),({v4[0]}, {v4[1]})]')
 
 
         # self.get_logger().info(f'self.get_verties_callback():{len(self.verties)}')
@@ -346,13 +354,20 @@ class CarAvoidancePointActionServer(Node):
         nearest_boundary = self.find_nearest_boundary(robot_pose, cleaning_area_vertices)
         y_ = (nearest_boundary[0][1] - nearest_boundary[1][1])
         x_ = (nearest_boundary[0][0] - nearest_boundary[1][0])
-        if x_ == 0.0:
+        self.get_logger().info(f'nearest_boundary: [({nearest_boundary[0][0]}, {nearest_boundary[0][1]}), ({nearest_boundary[1][0]}, {nearest_boundary[1][1]})]')
+        self.get_logger().info(f'delta_y: {y_}')
+        self.get_logger().info(f'delta_x: {x_}')
+        if abs(x_) < 1e-3:
+            self.get_logger().info(f'delta_x == 0: true')
             k = math.pi /2
         else:
+            self.get_logger().info(f'delta_x == 0: false')
             k = y_ / x_
-        p1,p2 = nearest_boundary
-        k = np.arctan(k)
-        self.get_logger().error(f'k: {k/math.pi*180}')
+            self.get_logger().info(f'k: {k}')
+            k = np.arctan(k)
+        p1,p2 = nearest_boundary        
+        self.get_logger().info(f'k_radian: {k}')
+        self.get_logger().info(f'k_degree: {k/math.pi*180}')
         # 计算四个方向
         directions_ = [self.convert_angle_to_ros2(k+x) for x in [0.0,math.pi]]
         self.get_logger().info(f'kdirections_: {directions_}')
@@ -557,10 +572,17 @@ class CarAvoidancePointActionServer(Node):
             # 判断边是否与从(robot_x, robot_y)出发的水平射线相交
             intersect = ((yi > robot_y) != (yj > robot_y)) and \
                         (robot_x < (xj - xi) * (robot_y - yi) / (yj - yi) + xi)
+                        # ((xj - xi) * (robot_y - yi) - (yj - yi) * (robot_x - xi)) > 0  # error
             
+            self.get_logger().info(f'i: {i}, j: {j}')
+            self.get_logger().info(f'robot_x: {robot_x}, robot_y: {robot_y}')
+            self.get_logger().info(f'xi: {xi}, yi: {yi}')
+            self.get_logger().info(f'xj: {xj}, yi: {yj}')
             if intersect:
+                self.get_logger().info(f'intersect: True')
                 inside = not inside
-            
+            else:
+                self.get_logger().info(f'intersect: False')
             j = i  # 更新j为当前i，用于下一次迭代
         
         return inside

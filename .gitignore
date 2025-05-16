@@ -1,2 +1,4 @@
-/*.pyc
-find_free_space/__pycache__/*
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
