@@ -396,7 +396,7 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info(f'delta_x == 0: false')
             k = y_ / x_
             self.get_logger().info(f'k: {k}')
-            k = np.arctan(k)
+            k = np.arctan2(k)
         p1,p2 = nearest_boundary        
         self.get_logger().info(f'k_radian: {k}')
         self.get_logger().info(f'k_degree: {k/math.pi*180}')
@@ -414,15 +414,17 @@ class CarAvoidancePointActionServer(Node):
         c = p2[0] * p1[1] - p1[0] * p2[1]
         # 计算汽车和机器人之间的角度
         car_pose= self.action_goal_handle_msg.car_pose.pose.position
+        self.get_logger().info(f'robot: ({robot_x}, {robot_y})')
+        self.get_logger().info(f'car: ({car_pose.x}, {car_pose.y})')
         y_ = robot_y - car_pose.y
         x_ = robot_x - car_pose.x
         if x_ == 0.0:
-            robot_car_k = math.pi /2
+            car_robot_k = math.pi /2
         else:
-            robot_car_k = y_ / x_
-            robot_car_k = np.arctan(robot_car_k)
-        self.get_logger().info(f"k: {k}, robot_car_k: {robot_car_k}")
-        k_diff = self.angle_diff(k,robot_car_k)
+            car_robot_k = y_ / x_
+            car_robot_k = np.arctan2(car_robot_k)
+        self.get_logger().info(f"k: {k}, car_robot_k: {car_robot_k}")
+        k_diff = self.angle_diff(k,car_robot_k)
         self.get_logger().info(f'k_diff: {k_diff}')
         if k_diff > math.pi/2:
             k = self.add_angles(k,math.pi)
