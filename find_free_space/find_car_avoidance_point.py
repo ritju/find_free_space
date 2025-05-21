@@ -389,14 +389,15 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'nearest_boundary: [({nearest_boundary[0][0]}, {nearest_boundary[0][1]}), ({nearest_boundary[1][0]}, {nearest_boundary[1][1]})]')
         self.get_logger().info(f'delta_y: {y_}')
         self.get_logger().info(f'delta_x: {x_}')
-        if abs(x_) < 1e-3:
-            self.get_logger().info(f'delta_x == 0: true')
-            k = math.pi /2
-        else:
-            self.get_logger().info(f'delta_x == 0: false')
-            k = y_ / x_
-            self.get_logger().info(f'k: {k}')
-            k = np.arctan2(k)
+        # if abs(x_) < 1e-3:
+        #     self.get_logger().info(f'delta_x == 0: true')
+        #     k = math.pi /2
+        # else:
+        #     self.get_logger().info(f'delta_x == 0: false')
+        #     k = y_ / x_
+        #     self.get_logger().info(f'k: {k}')
+        #     k = np.arctan2(k)
+        k = np.arctan2(y_, x_)
         p1,p2 = nearest_boundary        
         self.get_logger().info(f'k_radian: {k}')
         self.get_logger().info(f'k_degree: {k/math.pi*180}')
@@ -418,11 +419,12 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'car: ({car_pose.x}, {car_pose.y})')
         y_ = robot_y - car_pose.y
         x_ = robot_x - car_pose.x
-        if x_ == 0.0:
-            car_robot_k = math.pi /2
-        else:
-            car_robot_k = y_ / x_
-            car_robot_k = np.arctan2(car_robot_k)
+        # if x_ == 0.0:
+        #     car_robot_k = math.pi /2
+        # else:
+        #     car_robot_k = y_ / x_
+        #     car_robot_k = np.arctan2(car_robot_k)
+        car_robot_k = np.arctan2(y_, x_)
         self.get_logger().info(f"k: {k}, car_robot_k: {car_robot_k}")
         k_diff = self.angle_diff(k,car_robot_k)
         self.get_logger().info(f'k_diff: {k_diff}')
