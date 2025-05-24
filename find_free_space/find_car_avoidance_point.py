@@ -18,7 +18,7 @@ from capella_ros_msg.action import FindCarAvoidancePoint
 from tf_transformations import quaternion_from_euler
 from geometry_msgs.msg import PolygonStamped
 from collections import defaultdict
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 # from nav2_costmap_2d import Costmap2D
 
 
@@ -742,61 +742,61 @@ class CarAvoidancePointActionServer(Node):
         
         return results
     
-    def show(self, points, arrow_length=0.5):
-        plt.figure(figsize=(10, 8))
-        ax = plt.gca()
+    # def show(self, points, arrow_length=0.5):
+    #     plt.figure(figsize=(10, 8))
+    #     ax = plt.gca()
         
-        # 提取所有坐标点
-        coordinates = np.array([p[0] for p in points])
-        x_min, x_max = coordinates[:,0].min(), coordinates[:,0].max()
-        y_min, y_max = coordinates[:,1].min(), coordinates[:,1].max()
+    #     # 提取所有坐标点
+    #     coordinates = np.array([p[0] for p in points])
+    #     x_min, x_max = coordinates[:,0].min(), coordinates[:,0].max()
+    #     y_min, y_max = coordinates[:,1].min(), coordinates[:,1].max()
         
-        # 计算动态箭头长度（基于坐标范围）
-        axis_range = max(x_max-x_min, y_max-y_min) * 0.2
-        scale_factor = arrow_length * axis_range
+    #     # 计算动态箭头长度（基于坐标范围）
+    #     axis_range = max(x_max-x_min, y_max-y_min) * 0.2
+    #     scale_factor = arrow_length * axis_range
 
-        # 绘制每个点及角度箭头
-        for (x, y), alpha in points:
-            # 绘制坐标点[5](@ref)
-            plt.scatter(x, y, c='red', s=80, edgecolor='black', zorder=3)
+    #     # 绘制每个点及角度箭头
+    #     for (x, y), alpha in points:
+    #         # 绘制坐标点[5](@ref)
+    #         plt.scatter(x, y, c='red', s=80, edgecolor='black', zorder=3)
             
-            # 计算箭头方向向量[2,8](@ref)
-            dx = scale_factor * np.cos(np.deg2rad(alpha))
-            dy = scale_factor * np.sin(np.deg2rad(alpha))
+    #         # 计算箭头方向向量[2,8](@ref)
+    #         dx = scale_factor * np.cos(np.deg2rad(alpha))
+    #         dy = scale_factor * np.sin(np.deg2rad(alpha))
             
-            # 绘制角度箭头[1,6](@ref)
-            ax.annotate(
-                '', 
-                xytext=(x, y),  # 起点
-                xy=(x+dx, y+dy),  # 终点
-                arrowprops=dict(
-                    arrowstyle='->',
-                    linewidth=2,
-                    color='blue',
-                    mutation_scale=20,
-                    shrinkA=0,  # 取消起点收缩
-                    shrinkB=0   # 取消终点收缩
-                ),
-                zorder=2
-            )
+    #         # 绘制角度箭头[1,6](@ref)
+    #         ax.annotate(
+    #             '', 
+    #             xytext=(x, y),  # 起点
+    #             xy=(x+dx, y+dy),  # 终点
+    #             arrowprops=dict(
+    #                 arrowstyle='->',
+    #                 linewidth=2,
+    #                 color='blue',
+    #                 mutation_scale=20,
+    #                 shrinkA=0,  # 取消起点收缩
+    #                 shrinkB=0   # 取消终点收缩
+    #             ),
+    #             zorder=2
+    #         )
             
-            # 添加角度文本标注[3,8](@ref)
-            text_x = x + dx * 1.2
-            text_y = y + dy * 1.2
-            plt.text(text_x, text_y, 
-                    f'{alpha}°', 
-                    fontsize=10, 
-                    color='darkgreen',
-                    ha='center', 
-                    va='center')
+    #         # 添加角度文本标注[3,8](@ref)
+    #         text_x = x + dx * 1.2
+    #         text_y = y + dy * 1.2
+    #         plt.text(text_x, text_y, 
+    #                 f'{alpha}°', 
+    #                 fontsize=10, 
+    #                 color='darkgreen',
+    #                 ha='center', 
+    #                 va='center')
 
-        # 设置坐标轴
-        plt.grid(linestyle='--', alpha=0.7)
-        plt.xlabel('X Axis')
-        plt.ylabel('Y Axis')
-        plt.title('Points with Directional Arrows')
-        plt.axis('equal')  # 等比例坐标轴
-        plt.show()
+    #     # 设置坐标轴
+    #     plt.grid(linestyle='--', alpha=0.7)
+    #     plt.xlabel('X Axis')
+    #     plt.ylabel('Y Axis')
+    #     plt.title('Points with Directional Arrows')
+    #     plt.axis('equal')  # 等比例坐标轴
+    #     plt.show()
 
     # 对四边形的四个顶点进行排序，按左上角、右上角、右下角、左下角的顺序返回
     def sort_quadrilateral_vertices(self, points):
