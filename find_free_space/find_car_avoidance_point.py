@@ -56,9 +56,9 @@ class CarAvoidancePointActionServer(Node):
         self.get_robot_pose_timer_ = self.create_timer(timer_period_sec=0.1, callback=self.get_robot_pose_timer_callback)
 
         self.polygons = []
-        self.verties = []
+        self.vertices = []
         # 创建一个timer,用于实时得到距离机器人最近的通道位姿。
-        # self.get_verties_timer = self.create_timer(timer_period_sec=0.5, callback=self.get_verties_callback)        
+        # self.get_verties_timer = self.create_timer(timer_period_sec=0.5, callback=self.get_vertices_callback)        
         
         # action
         action_server_feedback_qos = QoSProfile(depth=1)
@@ -171,7 +171,7 @@ class CarAvoidancePointActionServer(Node):
         
         # self.get_logger().info(f'机器人当前位姿: [{self.robot_pose.pose.position.x}, {self.robot_pose.pose.position.y}]', throttle_duration_sec=2)
 
-    def get_verties_callback(self):
+    def get_vertices_callback(self):
         if len(self.polygons) == 0:
             pass
         else:
@@ -182,7 +182,7 @@ class CarAvoidancePointActionServer(Node):
                 self.get_logger().info(f"robot: ({self.robot_pose.pose.position.x}, {self.robot_pose.pose.position.y})")
                 self.get_logger().info(f'polygons: \n{current_polygon_verties}')
                 if robot_is_in_area:
-                    self.verties = current_polygon_verties
+                    self.vertices = current_polygon_verties
                     self.get_logger().info('inside: True')
                     break
                 else:
@@ -197,26 +197,29 @@ class CarAvoidancePointActionServer(Node):
         self.polygons = self.action_goal_handle_msg.polygons
         
         # 获取清洁区域信息
-        # 每次需要用到self.verties时，调用一下 get_verties_callback()
+        # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
         self.get_logger().info('寻找当前通行区域...')
         # 改
-        self.verties = list(self.verties)
-        self.verties.clear()
-        self.get_verties_callback()
-        v1, v2, v3, v4 = self.verties
-        self.get_logger().info(f'当前通行区域: [({v1[0]}, {v1[1]}),({v2[0]}, {v2[1]}),({v3[0]}, {v3[1]}),({v4[0]}, {v4[1]})]')
+        self.vertices = list(self.vertices)
+        self.vertices.clear()
+        self.get_vertices_callback()
 
-
-        # self.get_logger().info(f'self.get_verties_callback():{len(self.verties)}')
-        # self.get_logger().info(f'self.verties:{self.verties}')
-        if len(self.verties) == 0:
+        if len(self.vertices) == 0:
             self.get_logger().error('未找到用于寻找停靠点的通道')
             goal_handle.abort()
             return FindCarAvoidancePoint.Result()
 
+        v1, v2, v3, v4 = self.vertices
+        self.get_logger().info(f'当前通行区域: [({v1[0]}, {v1[1]}),({v2[0]}, {v2[1]}),({v3[0]}, {v3[1]}),({v4[0]}, {v4[1]})]')
+
+
+        # self.get_logger().info(f'self.get_vertices_callback():{len(self.vertices)}')
+        # self.get_logger().info(f'self.vertices:{self.vertices}')
+        
+
         # 寻找停靠点
         self.get_logger().info('寻找停靠点...')
-        avoidance_point = self.find_avoidance_point(self.robot_pose, self.verties)
+        avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
         self.get_logger().info(f'avoidance_point:{avoidance_point}')
         if avoidance_point is not None:
             self.get_logger().info(f'成功找到避让点{avoidance_point}')
