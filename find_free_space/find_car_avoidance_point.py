@@ -635,7 +635,7 @@ class CarAvoidancePointActionServer(Node):
             pose_with_direction.pose.position.x = point_with_direction[0][0]
             pose_with_direction.pose.position.y = point_with_direction[0][1]
             quat = Quaternion()
-            quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, point_with_direction[1])
+            quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, math.radians(point_with_direction[1]))
             pose_with_direction.pose.orientation = quat
             search_posetampd_list.append(pose_with_direction)
         # self.show(generate_search_points_with_directions)
