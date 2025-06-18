@@ -468,7 +468,7 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info(f'一共{len(boundary_points)}个避障...')
             # # 判断目标点附近是否有障碍物
             self.get_logger().info('排除障碍物点...')
-            is_obstacle_index = [True if self.check_point_is_free(costmap,(x,y),5) else False for x,y in boundary_points_pixel]
+            is_obstacle_index = [True if self.check_point_is_free(costmap,(x,y),15) else False for x,y in boundary_points_pixel]
             boundary_points = boundary_points[is_obstacle_index]
             search_posestamped_list = np.array(search_posestamped_list)
             search_posestamped_list = search_posestamped_list[is_obstacle_index]
@@ -883,11 +883,11 @@ class CarAvoidancePointActionServer(Node):
     # 检查点附近是否有障碍物
     def check_point_is_free(self, image, center, radius=20):
         """
-        判断以指定像素点为中心、半径为 x 像素的圆形区域内所有像素值是否都大于 0
+        判断以指定像素点为中心、半径为radius 像素的圆形区域内所有像素值是否都等于0
         :param image: 输入的单通道图像（灰度图）
         :param center: 中心像素点的坐标 (x, y)
-        :param x: 圆形区域的半径
-        :return: 如果圆形区域内所有像素值都大于 0 返回 True，否则返回 False
+        :param radius: 圆形区域的半径
+        :return: 如果圆形区域内所有像素值都等于 0 返回 True，否则返回 False
         """
         height, width = image.shape
 
@@ -897,10 +897,10 @@ class CarAvoidancePointActionServer(Node):
                 # 计算当前像素到中心像素的距离
                 distance = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2)
                 if distance <= radius:
-                    # 检查像素值是否大于 1
-                    if image[y, x] < 253:
-                        return True
-        return False
+                    # 检查像素值是否等于 0
+                    if image[y, x] != 0:
+                        return False
+        return True
 
     # 判断两个点之间的角度差
     def angle_diff(self, a, b, use_abs=True):
