@@ -447,6 +447,9 @@ class CarAvoidancePointActionServer(Node):
         vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1],self.distance_extend_outside)
         vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2],self.distance_extend_outside)
         
+        # 修改成从长边的边界上开始往外生成矩形，而不是机器人的当前位置
+        robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], 0.0)
+        robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], 0.0)
         
         # 在区域内搜索，往边界靠近
         # 四个点按照顺序排序
