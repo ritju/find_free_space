@@ -471,7 +471,7 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info(f'一共{len(boundary_points)}个避障...')
             # # 判断目标点附近是否有障碍物
             self.get_logger().info('排除障碍物点...')
-            is_obstacle_index = [True if self.check_point_is_free(costmap,(x,y),15) else False for x,y in boundary_points_pixel]
+            is_obstacle_index = [True if self.check_point_is_free(costmap,(x,y),2) else False for x,y in boundary_points_pixel]
             boundary_points = boundary_points[is_obstacle_index]
             search_posestamped_list = np.array(search_posestamped_list)
             search_posestamped_list = search_posestamped_list[is_obstacle_index]
