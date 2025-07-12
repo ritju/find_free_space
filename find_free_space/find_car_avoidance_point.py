@@ -231,6 +231,7 @@ class CarAvoidancePointActionServer(Node):
         self.action_goal_handle_msg = goal_handle.request
         self.vehicle_width = self.action_goal_handle_msg.car_size.y
         self.polygons = self.action_goal_handle_msg.polygons
+        self.get_logger().info(f'polygons: {self.polygons}')
         
         # 获取清洁区域信息
         # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
@@ -266,12 +267,14 @@ class CarAvoidancePointActionServer(Node):
             msg_marker_parking_point.id = 5
             msg_marker_parking_point.type = Marker.ARROW
             msg_marker_parking_point.action = Marker.ADD
-            msg_marker_parking_point.scale.x = 0.1
-            msg_marker_parking_point.color.r = 1.0
+            msg_marker_parking_point.scale.x = 0.5
+            msg_marker_parking_point.scale.y = 0.2
+            msg_marker_parking_point.scale.z = 0.4
+            msg_marker_parking_point.color.r = 0.0
             msg_marker_parking_point.color.g = 0.0
-            msg_marker_parking_point.color.b = 0.0
+            msg_marker_parking_point.color.b = 1.0
             msg_marker_parking_point.color.a = 1.0
-            msg_marker_parking_point.pose = avoidance_point
+            msg_marker_parking_point.pose = avoidance_point.pose
             self.marker_parking_point_publisher.publish(msg_marker_parking_point)
 
             goal_handle.succeed()
@@ -438,7 +441,9 @@ class CarAvoidancePointActionServer(Node):
         msg_marker_robot_pose.id = 2
         msg_marker_robot_pose.type = Marker.SPHERE
         msg_marker_robot_pose.action = Marker.ADD
-        msg_marker_robot_pose.scale.x = 0.1
+        msg_marker_robot_pose.scale.x = 0.2
+        msg_marker_robot_pose.scale.y = 0.2
+        msg_marker_robot_pose.scale.z = 0.2
         msg_marker_robot_pose.color.r = 0.0
         msg_marker_robot_pose.color.g = 1.0
         msg_marker_robot_pose.color.b = 0.0
@@ -466,7 +471,7 @@ class CarAvoidancePointActionServer(Node):
         msg_marker_avoidance_side.id = 3
         msg_marker_avoidance_side.type = Marker.LINE_LIST
         msg_marker_avoidance_side.action = Marker.ADD
-        msg_marker_avoidance_side.scale.x = 0.1
+        msg_marker_avoidance_side.scale.x = 0.2
         msg_marker_avoidance_side.color.r = 0.0
         msg_marker_avoidance_side.color.g = 1.0
         msg_marker_avoidance_side.color.b = 0.0
@@ -517,13 +522,15 @@ class CarAvoidancePointActionServer(Node):
         msg_marker_car_pose.id = 1
         msg_marker_car_pose.type = Marker.CUBE
         msg_marker_car_pose.action = Marker.ADD
-        msg_marker_car_pose.scale.x = 0.1
+        msg_marker_car_pose.scale.x = 0.5
+        msg_marker_car_pose.scale.y = 0.5
+        msg_marker_car_pose.scale.z = 0.5
         msg_marker_car_pose.color.r = 1.0
         msg_marker_car_pose.color.g = 0.0
         msg_marker_car_pose.color.b = 0.0
         msg_marker_car_pose.color.a = 1.0
-        msg_marker_car_pose.pose.position.x = robot_x
-        msg_marker_car_pose.pose.position.y = robot_y
+        msg_marker_car_pose.pose.position.x = car_pose.x
+        msg_marker_car_pose.pose.position.y = car_pose.y
         msg_marker_car_pose.pose.orientation.w = 1.0
         self.marker_car_pose_publisher.publish(msg_marker_car_pose)
 
@@ -556,7 +563,7 @@ class CarAvoidancePointActionServer(Node):
         
         # 修改成从长边的边界上开始往外生成矩形，而不是机器人的当前位置
         robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], 0.9)
-        robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], 1.0)
+        robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], 0.9)
         
         # 在区域内搜索，往边界靠近
         # 四个点按照顺序排序
@@ -571,16 +578,21 @@ class CarAvoidancePointActionServer(Node):
         msg_marker_searching_rect.id = 4
         msg_marker_searching_rect.type = Marker.LINE_LIST
         msg_marker_searching_rect.action = Marker.ADD
-        msg_marker_searching_rect.scale.x = 0.1
+        msg_marker_searching_rect.scale.x = 0.02
         msg_marker_searching_rect.color.r = 1.0
         msg_marker_searching_rect.color.g = 0.0
         msg_marker_searching_rect.color.b = 0.0
         msg_marker_searching_rect.color.a = 1.0
-        for point in find_vertices:
-            p = Point()
-            p.x = point[0]
-            p.y = point[1]
-            msg_marker_searching_rect.points.append(p)
+        size_tmp = len(find_vertices)
+        for i in range(size_tmp):
+            p_start = Point()
+            p_start.x = find_vertices[i][0]
+            p_start.y = find_vertices[i][1]
+            msg_marker_searching_rect.points.append(p_start)
+            p_end = Point()
+            p_end.x = find_vertices[(i+1)%size_tmp][0]
+            p_end.y = find_vertices[(i+1)%size_tmp][1]
+            msg_marker_searching_rect.points.append(p_end)
         self.marker_searching_rect_publisher.publish(msg_marker_searching_rect)
 
         search_posestamped_list = self.select_points_in_parallelogram(find_vertices,0.5)
