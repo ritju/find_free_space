@@ -562,8 +562,8 @@ class CarAvoidancePointActionServer(Node):
         vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2],self.distance_extend_outside)
         
         # 修改成从长边的边界上开始往外生成矩形，而不是机器人的当前位置
-        robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], 0.9)
-        robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], 0.9)
+        robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], 0.3)
+        robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], 0.3)
         
         # 在区域内搜索，往边界靠近
         # 四个点按照顺序排序
@@ -847,8 +847,11 @@ class CarAvoidancePointActionServer(Node):
         else:
                 target_angle_2 = 180 + target_angle
 
-        v_target_angle = (math.cos(target_angle), math.sin(target_angle))
-        v_target_angle_2 = (math.cos(target_angle_2), math.sin(target_angle_2))
+        v_target_angle =   (math.cos(math.radians(target_angle)),   math.sin(math.radians(target_angle)))
+        v_target_angle_2 = (math.cos(math.radians(target_angle_2)), math.sin(math.radians(target_angle_2)))
+
+        # v_target_angle =   (math.cos(target_angle),   math.sin(target_angle))
+        # v_target_angle_2 = (math.cos(target_angle_2), math.sin(target_angle_2))
 
         direction_vec = np.array(direction_vec)
         v_target_angle = np.array(v_target_angle)
@@ -863,6 +866,13 @@ class CarAvoidancePointActionServer(Node):
 
         cos_theta_2 = np.dot(direction_vec, v_target_angle_2) / (np.linalg.norm(direction_vec)*np.linalg.norm(v_target_angle_2))
         cos_theta_2 = np.clip(cos_theta_2, -1.0, 1.0)  
+
+        angle_ret = target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
+        self.get_logger().info(f'target_angle: {target_angle}')
+        self.get_logger().info(f'target_angle2: {target_angle_2}')
+        self.get_logger().info(f'np.arccos(cos_theta_1): {np.arccos(cos_theta_1)}')
+        self.get_logger().info(f'np.arccos(cos_theta_2: {np.arccos(cos_theta_2)}')
+        self.get_logger().info(f'angle_ret: {angle_ret}')
 
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
