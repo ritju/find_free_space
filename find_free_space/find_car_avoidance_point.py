@@ -15,7 +15,7 @@ import cv2
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.msg import Costmap
 from capella_ros_msg.action import FindCarAvoidancePoint
-from tf_transformations import quaternion_from_euler
+from tf_transformations import quaternion_from_euler, euler_from_quaternion
 from geometry_msgs.msg import PolygonStamped
 from collections import defaultdict
 # import matplotlib.pyplot as plt
@@ -211,18 +211,94 @@ class CarAvoidancePointActionServer(Node):
         if len(self.polygons) == 0:
             pass
         else:
-            current_polygon_verties = []
+            current_polygon_vertices = []
+            min_dis_robot_to_polygon = 1000.0
             for polygon in self.polygons:
-                current_polygon_verties = np.array([[point.x,point.y] for point in polygon.points])
-                robot_is_in_area = self.is_point_inside_parallelogram(self.robot_pose.pose.position.x,self.robot_pose.pose.position.y,current_polygon_verties)
+                current_polygon_vertices = np.array([[point.x,point.y] for point in polygon.points])
+                robot_is_in_area = self.is_point_inside_parallelogram(self.robot_pose.pose.position.x,self.robot_pose.pose.position.y,current_polygon_vertices)
                 self.get_logger().info(f"robot: ({self.robot_pose.pose.position.x}, {self.robot_pose.pose.position.y})")
-                self.get_logger().info(f'polygons: \n{current_polygon_verties}')
+                self.get_logger().info(f'polygons: \n{current_polygon_vertices}')
                 if robot_is_in_area:
-                    self.vertices = current_polygon_verties
-                    self.get_logger().info('inside: True')
+                    self.vertices = current_polygon_vertices
+                    self.get_logger().info('inside polygon: True')
                     break
                 else:
-                    self.get_logger().info('inside: False')
+                    self.get_logger().info('inside polygon: False')
+                    robot_x = self.robot_pose.pose.position.x
+                    robot_y = self.robot_pose.pose.position.y
+                    dis = self.dis_point_to_rect(robot_x, robot_y, current_polygon_vertices)
+                    if dis < min_dis_robot_to_polygon and dis < 2.0:
+                        min_dis_robot_to_polygon = dis
+                        self.vertices = current_polygon_vertices
+                        self.get_logger().info(f'robot_to_polygon dis: {min_dis_robot_to_polygon}')
+                        self.get_logger().info(f'update self.vertices: {self.vertices}')
+
+
+    def dis_point_to_point(self, p1_x, p1_y, p2_x, p2_y):
+        return math.sqrt(math.pow(p1_x - p2_x, 2) + math.pow(p1_y - p2_y, 2))
+    
+    def dis_point_to_line(self, x, y, p1_x, p1_y, p2_x, p2_y):
+        """
+        计算点到直线的垂直距离
+        参数：
+        p1_x, p1_y: 直线第一个点坐标
+        p2_x, p2_y: 直线第二个点坐标
+        x, y: 直线外点坐标
+        返回：点到直线的距离
+        """
+        # 处理直线为垂直线的情况
+        if p1_x == p2_x:
+            return abs(x - p1_x)
+        
+        # 计算直线方程参数 (Ax + By + C = 0)
+        A = p2_y - p1_y
+        B = p1_x - p2_x
+        C = p2_x * p1_y - p1_x * p2_y
+        
+        # 计算距离
+        numerator = abs(A * x + B * y + C)
+        denominator = math.sqrt(A**2 + B**2)
+
+        dis1 = numerator / denominator
+        dis2 = self.dis_point_to_point(x, y, p1_x, p1_y)
+        dis3 = self.dis_point_to_point(x, y, p2_x, p2_y)
+        
+        return min([dis1, dis2, dis3])
+    
+    def dis_point_to_line2(self, x, y, p1_x, p1_y, p2_x, p2_y):
+        """
+        计算点到直线的垂直距离
+        参数：
+        p1_x, p1_y: 直线第一个点坐标
+        p2_x, p2_y: 直线第二个点坐标
+        x, y: 直线外点坐标
+        返回：点到直线的距离
+        """
+        # 处理直线为垂直线的情况
+        if p1_x == p2_x:
+            return abs(x - p1_x)
+        
+        # 计算直线方程参数 (Ax + By + C = 0)
+        A = p2_y - p1_y
+        B = p1_x - p2_x
+        C = p2_x * p1_y - p1_x * p2_y
+        
+        # 计算距离
+        numerator = abs(A * x + B * y + C)
+        denominator = math.sqrt(A**2 + B**2)
+
+        return numerator / denominator
+
+    def dis_point_to_rect(self, x, y, rect):
+        length = len(rect)
+        min_dis = 1000.0
+        for i in range(length):
+            p1 = rect[i]
+            p2 = rect[(i+1)%length]
+            dis = self.dis_point_to_line(x, y, p1[0], p1[1], p2[0], p2[1])
+            if dis < min_dis:
+                min_dis = dis
+        return min_dis
 
 
     def action_goal_callback(self, goal_handle):
@@ -549,21 +625,48 @@ class CarAvoidancePointActionServer(Node):
             k = self.add_angles(k,math.pi)
             
 
-        robot_x1 = robot_x + math.cos(k) * 5.0
-        robot_y1 = robot_y + math.sin(k) * 5.0
-        robot_x2 = robot_x + math.cos(k) * 4.0
-        robot_y2 = robot_y + math.sin(k) * 4.0
-        # x = -(c+by)/a
+        robot_x1 = robot_x + math.cos(k) * 2.0
+        robot_y1 = robot_y + math.sin(k) * 2.0
+        robot_x2 = robot_x + math.cos(k) * 1.0
+        robot_y2 = robot_y + math.sin(k) * 1.0
+
+        vertical_border_x1 = 0.0
+        vertical_border_y1 = 0.0        
         
-        # 寻找距离最近的长边
-        # min_border_long_side = self.find_min_long_sides(cleaning_area_vertices,[robot_x1,robot_y1])
-        # 寻找与长边垂直且相交的点
-        vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1],self.distance_extend_outside)
-        vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2],self.distance_extend_outside)
+        outside_min = 0.5
+        outside_max = 1.0
         
-        # 修改成从长边的边界上开始往外生成矩形，而不是机器人的当前位置
-        robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], 0.3)
-        robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], 0.3)
+        if (self.is_point_inside_parallelogram(robot_x, robot_y, self.vertices)):
+            vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], outside_max)
+            vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], outside_max)
+            
+            robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], outside_min)
+            robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], outside_min)
+        else:
+            dis_robot_to_nearest_bound = self.dis_point_to_line2(robot_x, robot_y, nearest_boundary[0][0], nearest_boundary[0][1], nearest_boundary[1][0], nearest_boundary[1][1])
+            if dis_robot_to_nearest_bound > outside_min and dis_robot_to_nearest_bound < outside_max:
+                outside_min = dis_robot_to_nearest_bound
+            elif dis_robot_to_nearest_bound >= outside_max:
+                self.get_logger().info("返回机器人当前点为停靠点")
+                ret_pose = PoseStamped()
+                ret_pose.header.stamp = self.get_clock().now().to_msg()
+                ret_pose.header.frame_id = "map"
+                ret_pose.pose.position.x = robot_x
+                ret_pose.pose.position.y = robot_y
+                target_angle = math.degrees(math.atan2(nearest_boundary[1][1] - nearest_boundary[0][1], nearest_boundary[1][0] - nearest_boundary[0][0]))
+                yaw = self.get_yaw_from_pose(robot_pose)
+                ret_pose_yaw = math.radians(self.adjust_angle((math.cos(yaw), math.sin(yaw)), target_angle))
+                quat = Quaternion()
+                quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, ret_pose_yaw)
+                ret_pose.pose.orientation = quat
+                return ret_pose
+
+
+            vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], -outside_max)
+            vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], -outside_max)
+            
+            robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], -outside_min)
+            robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], -outside_min)
         
         # 在区域内搜索，往边界靠近
         # 四个点按照顺序排序
@@ -578,7 +681,7 @@ class CarAvoidancePointActionServer(Node):
         msg_marker_searching_rect.id = 4
         msg_marker_searching_rect.type = Marker.LINE_LIST
         msg_marker_searching_rect.action = Marker.ADD
-        msg_marker_searching_rect.scale.x = 0.02
+        msg_marker_searching_rect.scale.x = 0.1
         msg_marker_searching_rect.color.r = 1.0
         msg_marker_searching_rect.color.g = 0.0
         msg_marker_searching_rect.color.b = 0.0
@@ -616,49 +719,57 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个避障...')
             
             for avoidance_pose in search_posestamped_list:    
-                avoidance_pose_msg = IsCarPassable.Request()
-                avoidance_pose_msg.robot_pose = avoidance_pose
-                avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
-                avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
-                self.get_logger().info(f'避让点: ({avoidance_pose.pose.position.x}, {avoidance_pose.pose.position.y})')
-                start_time = time.time()
-                check_avoidance_result = self.check_avoidance(avoidance_pose_msg)
-                end_time = time.time()
-                delta_time = end_time - start_time
-                self.get_logger().info(f'check_avoidance_result: {check_avoidance_result}')
-                self.get_logger().info(f'delta_time: {delta_time}')
-                if check_avoidance_result and delta_time < self.check_service_max_time:
-                    robot_point = np.array([robot_x,robot_y])
-                    robot_point_pixel = (robot_point - np.array([origin_x,origin_y])) / resolution
-                    # robot_point_pixel[1] = height - robot_point_pixel[1]
-                    robot_point_pixel[0] = np.clip(robot_point_pixel[0],0,width-1)
-                    robot_point_pixel[1] = np.clip(robot_point_pixel[1],0,height-1)
-                    # robot_x_p,robot_y_p = robot_point_pixel
-                    robot_x_p = int(robot_point_pixel[0])
-                    robot_y_p = int(robot_point_pixel[1])
+                # avoidance_pose_msg = IsCarPassable.Request()
+                # avoidance_pose_msg.robot_pose = avoidance_pose
+                # avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
+                # avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
+                # self.get_logger().info(f'避让点: ({avoidance_pose.pose.position.x}, {avoidance_pose.pose.position.y})')
+                # start_time = time.time()
+                # check_avoidance_result = self.check_avoidance(avoidance_pose_msg)
+                # end_time = time.time()
+                # delta_time = end_time - start_time
+                # self.get_logger().info(f'check_avoidance_result: {check_avoidance_result}')
+                # self.get_logger().info(f'delta_time: {delta_time}')
+                # if check_avoidance_result and delta_time < self.check_service_max_time:
 
-                    point = np.array([avoidance_pose.pose.position.x, avoidance_pose.pose.position.y])
-                    point_pixel = (point - np.array([origin_x,origin_y])) / resolution
-                    # point_pixel[1] = height - point_pixel[1]
-                    point_pixel[0] = np.clip(point_pixel[0],0,width-1)
-                    point_pixel[1] = np.clip(point_pixel[1],0,height-1)
-                    # point_x_p,point_y_p = point_pixel
-                    point_x_p = int(point_pixel[0])
-                    point_y_p = int(point_pixel[1])
-                    bresenham_point = self.bresenham(robot_x_p,robot_y_p,point_x_p,point_y_p,costmap)
-                    bresenham_point_value = np.array([costmap[x[1],x[0]] for x in bresenham_point])
-                    self.get_logger().info(f"costmap values: {bresenham_point_value}")
-                    
-                    if (bresenham_point_value < 253).all():
-                        self.get_logger().info('机器人到当前点的连线满足')
-                        return avoidance_pose
-                    else:
-                        self.get_logger().info('机器人到当前点的连线不满足')
+                robot_point = np.array([robot_x,robot_y])
+                robot_point_pixel = (robot_point - np.array([origin_x,origin_y])) / resolution
+                # robot_point_pixel[1] = height - robot_point_pixel[1]
+                robot_point_pixel[0] = np.clip(robot_point_pixel[0],0,width-1)
+                robot_point_pixel[1] = np.clip(robot_point_pixel[1],0,height-1)
+                # robot_x_p,robot_y_p = robot_point_pixel
+                robot_x_p = int(robot_point_pixel[0])
+                robot_y_p = int(robot_point_pixel[1])
+
+                point = np.array([avoidance_pose.pose.position.x, avoidance_pose.pose.position.y])
+                point_pixel = (point - np.array([origin_x,origin_y])) / resolution
+                # point_pixel[1] = height - point_pixel[1]
+                point_pixel[0] = np.clip(point_pixel[0],0,width-1)
+                point_pixel[1] = np.clip(point_pixel[1],0,height-1)
+                # point_x_p,point_y_p = point_pixel
+                point_x_p = int(point_pixel[0])
+                point_y_p = int(point_pixel[1])
+                bresenham_point = self.bresenham(robot_x_p,robot_y_p,point_x_p,point_y_p,costmap)
+                bresenham_point_value = np.array([costmap[x[1],x[0]] for x in bresenham_point])
+                self.get_logger().info(f"costmap values: {bresenham_point_value}")
+                
+                if (bresenham_point_value <= 253).all():
+                    self.get_logger().info('机器人到当前点的连线满足')
+                    return avoidance_pose
+                else:
+                    self.get_logger().info('机器人到当前点的连线不满足')
         else:
             self.get_logger().info('用于搜索的点，数量为0')
             return None
         self.get_logger().info('所有点都不满足')
         return None
+
+    def get_yaw_from_pose(pose_stamped):
+        """从PoseStamped消息中提取yaw角"""
+        orientation = pose_stamped.pose.orientation
+        quaternion = [orientation.x, orientation.y, orientation.z, orientation.w]
+        (roll, pitch, yaw) = euler_from_quaternion(quaternion)
+        return yaw
 
     # 寻找最近的边界
     def find_nearest_boundary(self, robot_pose, vertices):
