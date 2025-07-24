@@ -625,16 +625,16 @@ class CarAvoidancePointActionServer(Node):
             k = self.add_angles(k,math.pi)
             
 
-        robot_x1 = robot_x + math.cos(k) * 2.0
-        robot_y1 = robot_y + math.sin(k) * 2.0
-        robot_x2 = robot_x + math.cos(k) * 1.0
-        robot_y2 = robot_y + math.sin(k) * 1.0
+        robot_x1 = robot_x + math.cos(k) * 4.0
+        robot_y1 = robot_y + math.sin(k) * 4.0
+        robot_x2 = robot_x + math.cos(k) * 3.0
+        robot_y2 = robot_y + math.sin(k) * 3.0
 
         vertical_border_x1 = 0.0
         vertical_border_y1 = 0.0        
         
-        outside_min = 0.5
-        outside_max = 1.0
+        outside_min = 0.0
+        outside_max = 0.5
         
         if (self.is_point_inside_parallelogram(robot_x, robot_y, self.vertices)):
             vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], outside_max)
@@ -698,7 +698,7 @@ class CarAvoidancePointActionServer(Node):
             msg_marker_searching_rect.points.append(p_end)
         self.marker_searching_rect_publisher.publish(msg_marker_searching_rect)
 
-        search_posestamped_list = self.select_points_in_parallelogram(find_vertices,0.5)
+        search_posestamped_list = self.select_points_in_parallelogram(find_vertices,0.05, k)
         self.get_logger().info(f'search_posestamped length: {len(search_posestamped_list)}')
         # 判断每个点是否里障碍物太近
         # 首先将位姿转换到map的像素点
@@ -879,9 +879,9 @@ class CarAvoidancePointActionServer(Node):
         return inside
     
     # 选择平行四边形区域内的点
-    def select_points_in_parallelogram(self, vertices, interval):
-        generate_search_points_without_directions = self.generate_all_serach_points(vertices, interval)
-        generate_search_points_with_directions = self.process_points(self.robot_pose, vertices, generate_search_points_without_directions)
+    def select_points_in_parallelogram(self, vertices, interval, direction):
+        generate_search_points_without_directions = self.generate_all_search_points(vertices, interval)
+        generate_search_points_with_directions = self.process_points(self.robot_pose, vertices, generate_search_points_without_directions, direction)
         search_posetampd_list = []
         for point_with_direction in generate_search_points_with_directions:
             pose_with_direction = PoseStamped()
@@ -896,7 +896,7 @@ class CarAvoidancePointActionServer(Node):
         # self.show(generate_search_points_with_directions)
         return search_posetampd_list
     
-    def generate_all_serach_points(self,vertices, interval):
+    def generate_all_search_points(self,vertices, interval):
         A = np.array(vertices[0])
         B = np.array(vertices[1])
         D = np.array(vertices[3])
@@ -987,7 +987,7 @@ class CarAvoidancePointActionServer(Node):
 
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
-    def process_points(self, robot_pose, vertices, points):
+    def process_points(self, robot_pose, vertices, points, direction):
         edge1, edge2 = self.calculate_long_edges(vertices)
         line1, line2 = edge1[2], edge2[2]
         angle1, angle2 = edge1[1], edge2[1]
@@ -1000,7 +1000,8 @@ class CarAvoidancePointActionServer(Node):
             
             dist1 = self.distance_point_to_line(point, line1)
             dist2 = self.distance_point_to_line(point, line2)
-            target_angle = angle1 if dist1 < dist2 else angle2
+            # target_angle = angle1 if dist1 < dist2 else angle2
+            target_angle = math.degrees(direction)
             direction_vec = (dx, dy)
             alpha = self.adjust_angle(direction_vec, target_angle)
             results.append((point, alpha))
