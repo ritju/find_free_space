@@ -51,9 +51,9 @@ def generate_launch_description():
                         output='screen',
                         respawn_delay=2.0,
                         parameters=[params_file,
-                                    {'search_radius_min': search_radius_min[0],
-                                    'search_radius_max': search_radius_max[0],
-                                    'outside_min': outside_min[0],
-                                    'outside_max': outside_max[0]}],
+                                    {'search_radius_min': float(search_radius_min[0]),
+                                    'search_radius_max': float(search_radius_max[0]),
+                                    'outside_min': float(outside_min[0]),
+                                    'outside_max': float(outside_max[0])}],
                 ),
         ])
