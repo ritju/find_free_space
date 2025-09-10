@@ -33,11 +33,12 @@ class CarAvoidancePointActionServer(Node):
         # 初始化参数
         self.robot_width = 1.0
         self.vehicle_width = 2.0
-        self.redundancy_distance = 0.5
         self.search_interval = 0.5
         self.action_goal_handle_msg = None
-        self.search_radius = 4.0
-        self.distance_extend_outside = 1.0
+        self.search_radius_min = 3.0
+        self.search_radius_max = 4.0
+        self.outside_min = 0.0
+        self.outside_max = 0.5
         self.cv_window_name = 'Global Costmap Raw Colored'
 
         self.init_params()
@@ -120,33 +121,36 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter("topic_name_global_costmap", "")
         self.declare_parameter("service_name_check_car_passble", "")
         self.declare_parameter("topic_name_footprint", "")
-        self.declare_parameter("redundancy_distance", 0.3)
         self.declare_parameter("search_interval", 0.3)
-        self.declare_parameter("search_radius", 2.0)
+        self.declare_parameter("search_radius_min", 3.0)
+        self.declare_parameter("search_radius_max", 4.0)
+        self.declare_parameter("outside_min", 0.0)
+        self.declare_parameter("outside_max", 0.5)
         self.declare_parameter("check_service_max_time", 0.5)
-        self.declare_parameter("distance_extend_outside", 1.0)
         self.declare_parameter('show_global_costmap_raw_cv2', False)
         self.declare_parameter('show_global_costmap_raw_colored_cv2', False)
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
         self.topic_name_footprint = self.get_parameter("topic_name_footprint").value
-        self.redundancy_distance = self.get_parameter("redundancy_distance").value
         self.search_interval = self.get_parameter("search_interval").value
-        self.search_radius = self.get_parameter("search_radius").value
+        self.search_radius_min = self.get_parameter("search_radius_min").value
+        self.search_radius_max = self.get_parameter("search_radius_max").value
+        self.outside_min = self.get_parameter("outside_min").value
+        self.outside_max = self.get_parameter("outside_max").value
         self.check_service_max_time = self.get_parameter("check_service_max_time").value
-        self.distance_extend_outside = self.get_parameter("distance_extend_outside").value
         self.show_global_costmap_raw_cv2 = self.get_parameter('show_global_costmap_raw_cv2').value
         self.show_global_costmap_raw_colored_cv2 = self.get_parameter('show_global_costmap_raw_colored_cv2').value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
         self.get_logger().info(f'topic_name_footprint: {self.topic_name_footprint}')
-        self.get_logger().info(f'redundancy_distance: {self.redundancy_distance}')
         self.get_logger().info(f'search_interval: {self.search_interval}')
-        self.get_logger().info(f'search_radius: {self.search_radius}')
+        self.get_logger().info(f'search_radius_min: {self.search_radius_min}')
+        self.get_logger().info(f'search_radius_max: {self.search_radius_max}')
+        self.get_logger().info(f'outside_min: {self.outside_min}')
+        self.get_logger().info(f'outside_max: {self.outside_max}')
         self.get_logger().info(f'check_service_max_time: {self.check_service_max_time}')
-        self.get_logger().info(f'distance_extend_outside: {self.distance_extend_outside}')
         self.get_logger().info(f'show_global_costmap_raw_cv2: {self.show_global_costmap_raw_cv2}')
         self.get_logger().info(f'show_global_costmap_raw_colored_cv2: {self.show_global_costmap_raw_colored_cv2}')
     
@@ -625,28 +629,23 @@ class CarAvoidancePointActionServer(Node):
             k = self.add_angles(k,math.pi)
             
 
-        robot_x1 = robot_x + math.cos(k) * 4.0
-        robot_y1 = robot_y + math.sin(k) * 4.0
-        robot_x2 = robot_x + math.cos(k) * 3.0
-        robot_y2 = robot_y + math.sin(k) * 3.0
+        robot_x1 = robot_x + math.cos(k) * self.search_radius_max
+        robot_y1 = robot_y + math.sin(k) * self.search_radius_max
+        robot_x2 = robot_x + math.cos(k) * self.search_radius_min
+        robot_y2 = robot_y + math.sin(k) * self.search_radius_min    
 
-        vertical_border_x1 = 0.0
-        vertical_border_y1 = 0.0        
-        
-        outside_min = 0.0
-        outside_max = 0.5
         
         if (self.is_point_inside_parallelogram(robot_x, robot_y, self.vertices)):
-            vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], outside_max)
-            vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], outside_max)
+            vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], self.outside_max)
+            vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], self.outside_max)
             
-            robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], outside_min)
-            robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], outside_min)
+            robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], self.outside_min)
+            robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], self.outside_min)
         else:
             dis_robot_to_nearest_bound = self.dis_point_to_line2(robot_x, robot_y, nearest_boundary[0][0], nearest_boundary[0][1], nearest_boundary[1][0], nearest_boundary[1][1])
-            if dis_robot_to_nearest_bound > outside_min and dis_robot_to_nearest_bound < outside_max:
-                outside_min = dis_robot_to_nearest_bound
-            elif dis_robot_to_nearest_bound >= outside_max:
+            if dis_robot_to_nearest_bound > self.outside_min and dis_robot_to_nearest_bound < self.outside_max:
+                self.outside_min = dis_robot_to_nearest_bound
+            elif dis_robot_to_nearest_bound >= self.outside_max:
                 self.get_logger().info("返回机器人当前点为停靠点")
                 ret_pose = PoseStamped()
                 ret_pose.header.stamp = self.get_clock().now().to_msg()
@@ -662,11 +661,11 @@ class CarAvoidancePointActionServer(Node):
                 return ret_pose
 
 
-            vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], -outside_max)
-            vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], -outside_max)
+            vertical_border_x1, vertical_border_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], -self.outside_max)
+            vertical_border_x2, vertical_border_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], -self.outside_max)
             
-            robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], -outside_min)
-            robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], -outside_min)
+            robot_x1, robot_y1 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x1,robot_y1], -self.outside_min)
+            robot_x2, robot_y2 = self.findIntersection(nearest_boundary[0],nearest_boundary[1],[robot_x2,robot_y2], -self.outside_min)
         
         # 在区域内搜索，往边界靠近
         # 四个点按照顺序排序

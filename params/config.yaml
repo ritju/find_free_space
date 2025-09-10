@@ -3,9 +3,13 @@ find_free_space_action_server:
     topic_name_global_costmap: '/global_costmap/costmap_raw'
     service_name_check_car_passble: '/check_car_passable'
     topic_name_footprint: '/global_costmap/published_footprint'
-    redundancy_distance: 0.5
     search_interval: 0.5
-    search_radius: 4.0
+
+    # search_radius_min: 3.0  # 改成从docker-compose.yaml文件动态获取
+    # search_radius_max: 4.0
+    # outside_min: 0.0
+    # outside_max: 0.5
+    
     check_service_max_time: 1.0
     distance_extend_outside: 1.1
     show_global_costmap_raw_cv2: false
