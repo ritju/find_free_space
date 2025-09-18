@@ -763,7 +763,7 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info('所有点都不满足')
         return None
 
-    def get_yaw_from_pose(pose_stamped):
+    def get_yaw_from_pose(self, pose_stamped):
         """从PoseStamped消息中提取yaw角"""
         orientation = pose_stamped.pose.orientation
         quaternion = [orientation.x, orientation.y, orientation.z, orientation.w]
