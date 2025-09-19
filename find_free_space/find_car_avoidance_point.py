@@ -37,6 +37,7 @@ class CarAvoidancePointActionServer(Node):
         self.action_goal_handle_msg = None
         self.search_radius_min = 3.0
         self.search_radius_max = 4.0
+        self.search_radius_extra_dis = 2.5
         self.outside_min = 0.0
         self.outside_max = 0.5
         self.cv_window_name = 'Global Costmap Raw Colored'
@@ -124,6 +125,7 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter("search_interval", 0.3)
         self.declare_parameter("search_radius_min", 3.0)
         self.declare_parameter("search_radius_max", 4.0)
+        self.declare_parameter("search_radius_extra_dis", 2.5)
         self.declare_parameter("outside_min", 0.0)
         self.declare_parameter("outside_max", 0.5)
         self.declare_parameter("check_service_max_time", 0.5)
@@ -136,6 +138,7 @@ class CarAvoidancePointActionServer(Node):
         self.search_interval = self.get_parameter("search_interval").value
         self.search_radius_min = self.get_parameter("search_radius_min").value
         self.search_radius_max = self.get_parameter("search_radius_max").value
+        self.search_radius_extra_dis = self.get_parameter("search_radius_extra_dis").value
         self.outside_min = self.get_parameter("outside_min").value
         self.outside_max = self.get_parameter("outside_max").value
         self.check_service_max_time = self.get_parameter("check_service_max_time").value
@@ -148,6 +151,7 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'search_interval: {self.search_interval}')
         self.get_logger().info(f'search_radius_min: {self.search_radius_min}')
         self.get_logger().info(f'search_radius_max: {self.search_radius_max}')
+        self.get_logger().info(f'search_radius_extra_dis: {self.search_radius_extra_dis}')
         self.get_logger().info(f'outside_min: {self.outside_min}')
         self.get_logger().info(f'outside_max: {self.outside_max}')
         self.get_logger().info(f'check_service_max_time: {self.check_service_max_time}')
@@ -627,7 +631,16 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'k_diff: {k_diff}')
         if k_diff > math.pi/2:
             k = self.add_angles(k,math.pi)
-            
+
+        # 计算避让方向k和机器人方向的夹角大小 => 夹角小于pi/2.0,认为二者方向相同;大于pi/2.0,认为二者方向不同。
+        k_robot = np.arctan2(robot_y, robot_x)
+        k_diff2 = self.angle_diff(k, k_robot)
+        if k_diff2 < math.pi / 2:
+            self.get_logger().info(f'在机器人前方避车, 额外增加{self.search_radius_extra_dis}米搜索距离')
+            self.search_radius_min = self.search_radius_min + self.search_radius_extra_dis
+            self.search_radius_max = self.search_radius_max + self.search_radius_extra_dis
+        else:
+            self.get_logger().info(f'在机器人后方避车')
 
         robot_x1 = robot_x + math.cos(k) * self.search_radius_max
         robot_y1 = robot_y + math.sin(k) * self.search_radius_max

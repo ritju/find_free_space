@@ -9,6 +9,7 @@ find_free_space_action_server:
     # search_radius_max: 4.0
     # outside_min: 0.0
     # outside_max: 0.5
+    search_radius_extra_dis: 2.0 # 前避车时额外增加的寻找距离
     
     check_service_max_time: 1.0
     distance_extend_outside: 1.1
