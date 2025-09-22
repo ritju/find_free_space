@@ -633,8 +633,20 @@ class CarAvoidancePointActionServer(Node):
             k = self.add_angles(k,math.pi)
 
         # 计算避让方向k和机器人方向的夹角大小 => 夹角小于pi/2.0,认为二者方向相同;大于pi/2.0,认为二者方向不同。
-        k_robot = np.arctan2(robot_y, robot_x)
+        # k_robot = np.arctan2(robot_y, robot_x)  # error
+        orientation = robot_pose.pose.orientation
+        quaternion = (
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w
+        )
+    
+        # 将四元数转换为欧拉角(roll, pitch, yaw)
+        (roll, pitch, yaw) = euler_from_quaternion(quaternion)
+        k_robot = yaw
         k_diff2 = self.angle_diff(k, k_robot)
+        self.get_logger().info(f'k: {k}, k_robot: {k_robot}, k_diff2: {k_diff2}')
         if k_diff2 < math.pi / 2:
             self.get_logger().info(f'在机器人前方避车, 额外增加{self.search_radius_extra_dis}米搜索距离')
             self.search_radius_min = self.search_radius_min + self.search_radius_extra_dis
