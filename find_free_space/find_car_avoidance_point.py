@@ -647,17 +647,27 @@ class CarAvoidancePointActionServer(Node):
         k_robot = yaw
         k_diff2 = self.angle_diff(k, k_robot)
         self.get_logger().info(f'k: {k}, k_robot: {k_robot}, k_diff2: {k_diff2}')
+        robot_x1 = 0.0
+        robot_y1 = 0.0
+        robot_x2 = 0.0
+        robot_y2 = 0.0
         if k_diff2 < math.pi / 2:
             self.get_logger().info(f'在机器人前方避车, 额外增加{self.search_radius_extra_dis}米搜索距离')
-            self.search_radius_min = self.search_radius_min + self.search_radius_extra_dis
-            self.search_radius_max = self.search_radius_max + self.search_radius_extra_dis
+            robot_x1 = robot_x + math.cos(k) * (self.search_radius_max + self.search_radius_extra_dis)
+            robot_y1 = robot_y + math.sin(k) * (self.search_radius_max + self.search_radius_extra_dis)
+            robot_x2 = robot_x + math.cos(k) * (self.search_radius_min + self.search_radius_extra_dis)
+            robot_y2 = robot_y + math.sin(k) * (self.search_radius_min + self.search_radius_extra_dis)
         else:
             self.get_logger().info(f'在机器人后方避车')
+            robot_x1 = robot_x + math.cos(k) * self.search_radius_max
+            robot_y1 = robot_y + math.sin(k) * self.search_radius_max
+            robot_x2 = robot_x + math.cos(k) * self.search_radius_min
+            robot_y2 = robot_y + math.sin(k) * self.search_radius_min
 
-        robot_x1 = robot_x + math.cos(k) * self.search_radius_max
-        robot_y1 = robot_y + math.sin(k) * self.search_radius_max
-        robot_x2 = robot_x + math.cos(k) * self.search_radius_min
-        robot_y2 = robot_y + math.sin(k) * self.search_radius_min    
+        # robot_x1 = robot_x + math.cos(k) * self.search_radius_max
+        # robot_y1 = robot_y + math.sin(k) * self.search_radius_max
+        # robot_x2 = robot_x + math.cos(k) * self.search_radius_min
+        # robot_y2 = robot_y + math.sin(k) * self.search_radius_min    
 
         
         if (self.is_point_inside_parallelogram(robot_x, robot_y, self.vertices)):
