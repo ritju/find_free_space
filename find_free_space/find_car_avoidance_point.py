@@ -1013,11 +1013,11 @@ class CarAvoidancePointActionServer(Node):
         cos_theta_2 = np.clip(cos_theta_2, -1.0, 1.0)  
 
         angle_ret = target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
-        self.get_logger().info(f'target_angle: {target_angle}')
-        self.get_logger().info(f'target_angle2: {target_angle_2}')
-        self.get_logger().info(f'np.arccos(cos_theta_1): {np.arccos(cos_theta_1)}')
-        self.get_logger().info(f'np.arccos(cos_theta_2: {np.arccos(cos_theta_2)}')
-        self.get_logger().info(f'angle_ret: {angle_ret}')
+        # self.get_logger().info(f'target_angle: {target_angle}')
+        # self.get_logger().info(f'target_angle2: {target_angle_2}')
+        # self.get_logger().info(f'np.arccos(cos_theta_1): {np.arccos(cos_theta_1)}')
+        # self.get_logger().info(f'np.arccos(cos_theta_2: {np.arccos(cos_theta_2)}')
+        # self.get_logger().info(f'angle_ret: {angle_ret}')
 
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
