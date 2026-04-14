@@ -1,0 +1,1152 @@
+#!/usr/bin/env python3
+"""
+test_car_avoidance_v6_diag.py
+诊断脚本：基于实际代码参数 (radius=2, interval=0.05) 测试各版本
+新增v6: 纯Python直接遍历(r=2最优) + numpy生成 + early-exit bresenham
+"""
+
+import math
+import time
+import cProfile
+import pstats
+import io
+import tracemalloc
+import numpy as np
+from collections import defaultdict
+
+
+# ============================================================
+#                  模拟数据（与实际一致）
+# ============================================================
+
+ROBOT_X = -5.687
+ROBOT_Y = 25.072
+ROBOT_YAW = -0.076
+
+CAR_X = 9.0
+CAR_Y = 25.0
+CAR_SIZE_Y = 2.0
+
+POLYGON = [
+    (-16.0, 22.5),
+    (14.0, 22.5),
+    (14.0, 27.5),
+    (-16.0, 27.5),
+]
+
+COSTMAP_ORIGIN_X = -28.63
+COSTMAP_ORIGIN_Y = -14.2
+COSTMAP_RESOLUTION = 0.1
+COSTMAP_WIDTH = 851
+COSTMAP_HEIGHT = 616
+
+ROBOT_WIDTH = 1.32
+SEARCH_RADIUS_MIN = 3.0
+SEARCH_RADIUS_MAX = 4.0
+SEARCH_RADIUS_EXTRA_DIS = 2.0
+OUTSIDE_MIN = 0.0
+OUTSIDE_MAX = 0.5
+
+
+def generate_fake_costmap():
+    np.random.seed(42)
+    costmap = np.zeros((COSTMAP_HEIGHT, COSTMAP_WIDTH), dtype=np.uint8)
+    num_obstacles = int(COSTMAP_WIDTH * COSTMAP_HEIGHT * 0.05)
+    obs_x = np.random.randint(0, COSTMAP_WIDTH, num_obstacles)
+    obs_y = np.random.randint(0, COSTMAP_HEIGHT, num_obstacles)
+    costmap[obs_y, obs_x] = 254
+    num_inflated = int(COSTMAP_WIDTH * COSTMAP_HEIGHT * 0.03)
+    inf_x = np.random.randint(0, COSTMAP_WIDTH, num_inflated)
+    inf_y = np.random.randint(0, COSTMAP_HEIGHT, num_inflated)
+    costmap[inf_y, inf_x] = 253
+    return costmap
+
+
+FAKE_COSTMAP = generate_fake_costmap()
+
+
+# ============================================================
+#                  公共函数
+# ============================================================
+
+def world_to_map(wx, wy):
+    mx = int((wx - COSTMAP_ORIGIN_X) / COSTMAP_RESOLUTION)
+    my = int((wy - COSTMAP_ORIGIN_Y) / COSTMAP_RESOLUTION)
+    return mx, my
+
+
+def is_point_in_polygon(x, y, polygon):
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def find_current_polygon(robot_x, robot_y, polygons_list):
+    for polygon in polygons_list:
+        if is_point_in_polygon(robot_x, robot_y, polygon):
+            return polygon
+    return None
+
+
+def calculate_edge_lengths(polygon):
+    edges = []
+    n = len(polygon)
+    for i in range(n):
+        p1 = polygon[i]
+        p2 = polygon[(i + 1) % n]
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        length = math.hypot(dx, dy)
+        edges.append((length, p1, p2))
+    return edges
+
+
+def find_nearest_long_edge(robot_x, robot_y, polygon):
+    edges = calculate_edge_lengths(polygon)
+    edges_sorted = sorted(edges, key=lambda e: -e[0])
+    long_edges = edges_sorted[:2]
+    min_dist = float('inf')
+    nearest_edge = None
+    for length, p1, p2 in long_edges:
+        dist = distance_point_to_line_segment(robot_x, robot_y, p1, p2)
+        if dist < min_dist:
+            min_dist = dist
+            nearest_edge = (p1, p2)
+    return nearest_edge
+
+
+def distance_point_to_line_segment(px, py, p1, p2):
+    x1, y1 = p1
+    x2, y2 = p2
+    dx = x2 - x1
+    dy = y2 - y1
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0:
+        return math.hypot(px - x1, py - y1)
+    t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return math.hypot(px - proj_x, py - proj_y)
+
+
+def calculate_avoidance_direction(robot_x, robot_y, car_x, car_y, nearest_edge):
+    p1, p2 = nearest_edge
+    delta_x = p2[0] - p1[0]
+    delta_y = p2[1] - p1[1]
+    k_radian = math.atan2(delta_y, delta_x)
+    k_directions = [k_radian, k_radian + math.pi if k_radian <= 0 else k_radian - math.pi]
+    car_robot_k = math.atan2(car_y - robot_y, car_x - robot_x)
+    best_k = None
+    max_diff = -1
+    for k in k_directions:
+        diff = abs(k - car_robot_k)
+        if diff > math.pi:
+            diff = 2 * math.pi - diff
+        if diff > max_diff:
+            max_diff = diff
+            best_k = k
+    return best_k
+
+
+def generate_search_rectangle(robot_x, robot_y, direction, nearest_edge,
+                               search_radius_min, search_radius_max,
+                               robot_width, car_size_y,
+                               outside_min, outside_max):
+    p1, p2 = nearest_edge
+    edge_dx = p2[0] - p1[0]
+    edge_dy = p2[1] - p1[1]
+    edge_len = math.hypot(edge_dx, edge_dy)
+    nx = -edge_dy / edge_len
+    ny = edge_dx / edge_len
+    to_robot_x = robot_x - p1[0]
+    to_robot_y = robot_y - p1[1]
+    if nx * to_robot_x + ny * to_robot_y < 0:
+        nx, ny = -nx, -ny
+    dir_x = math.cos(direction)
+    dir_y = math.sin(direction)
+    center_start_x = robot_x + dir_x * search_radius_min
+    center_start_y = robot_y + dir_y * search_radius_min
+    center_end_x = robot_x + dir_x * (search_radius_max + SEARCH_RADIUS_EXTRA_DIS)
+    center_end_y = robot_y + dir_y * (search_radius_max + SEARCH_RADIUS_EXTRA_DIS)
+    half_width = (robot_width + car_size_y) / 2 + outside_max
+    vertices = [
+        (center_start_x - nx * outside_min, center_start_y - ny * outside_min),
+        (center_end_x - nx * outside_min, center_end_y - ny * outside_min),
+        (center_end_x - nx * half_width, center_end_y - ny * half_width),
+        (center_start_x - nx * half_width, center_start_y - ny * half_width),
+    ]
+    return vertices
+
+
+# ============================================================
+#       版本1: 原始版本
+# ============================================================
+
+def generate_candidate_points_original(search_vertices, interval):
+    A = np.array(search_vertices[0])
+    B = np.array(search_vertices[1])
+    D = np.array(search_vertices[3])
+    u = B - A
+    v = D - A
+    u_length = np.linalg.norm(u)
+    v_length = np.linalg.norm(v)
+    steps_u = max(1, int(u_length / interval))
+    steps_v = max(1, int(v_length / interval))
+    grid_points = defaultdict(list)
+    for i in range(steps_u + 1):
+        for j in range(steps_v + 1):
+            point = A + u * (i / steps_u) + v * (j / steps_v)
+            grid_points[(i, j)] = tuple(np.round(point, 6))
+    generate_points = list(grid_points.values())
+    generate_points = sorted(generate_points, key=lambda p: (p[0] - ROBOT_X) ** 2 + (p[1] - ROBOT_Y) ** 2)
+    return generate_points
+
+
+def check_point_is_free_original(costmap, center_mx, center_my, radius=20):
+    h, w = costmap.shape
+    for y in range(max(0, int(center_my - radius)), min(h, int(center_my + radius + 1))):
+        for x in range(max(0, int(center_mx - radius)), min(w, int(center_mx + radius + 1))):
+            distance = math.sqrt((x - center_mx) ** 2 + (y - center_my) ** 2)
+            if distance <= radius:
+                if costmap[y, x] == 254:
+                    return False
+    return True
+
+
+def bresenham_original(x0, y0, x1, y1, costmap):
+    pixels = []
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    h, w = costmap.shape
+    x, y = x0, y0
+    while True:
+        if 0 <= x < w and 0 <= y < h:
+            pixels.append((x, y))
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+    return pixels
+
+
+def bresenham_check_original(x0, y0, x1, y1, costmap):
+    pixels = bresenham_original(x0, y0, x1, y1, costmap)
+    if len(pixels) == 0:
+        return False
+    values = np.array([costmap[p[1], p[0]] for p in pixels])
+    return bool(np.all(values <= 253))
+
+
+# ============================================================
+#     版本2: downcpu
+# ============================================================
+
+def generate_candidate_points_downcpu(search_vertices, interval):
+    A = np.array(search_vertices[0])
+    B = np.array(search_vertices[1])
+    D = np.array(search_vertices[3])
+    u = B - A
+    v = D - A
+    u_length = np.linalg.norm(u)
+    v_length = np.linalg.norm(v)
+    steps_u = max(1, int(u_length / interval))
+    steps_v = max(1, int(v_length / interval))
+    i_vals = np.arange(steps_u + 1) / steps_u
+    j_vals = np.arange(steps_v + 1) / steps_v
+    ii, jj = np.meshgrid(i_vals, j_vals, indexing='ij')
+    points_x = A[0] + u[0] * ii + v[0] * jj
+    points_y = A[1] + u[1] * ii + v[1] * jj
+    points_x_flat = points_x.ravel()
+    points_y_flat = points_y.ravel()
+    dx = points_x_flat - ROBOT_X
+    dy = points_y_flat - ROBOT_Y
+    dist_sq = dx ** 2 + dy ** 2
+    sorted_indices = np.argsort(dist_sq)
+    generate_points = [(round(points_x_flat[i], 6), round(points_y_flat[i], 6))
+                       for i in sorted_indices]
+    return generate_points
+
+
+def check_point_is_free_downcpu(costmap, center_mx, center_my, radius=20):
+    height, width = costmap.shape
+    cx, cy = int(center_mx), int(center_my)
+    y_min = max(0, cy - radius)
+    y_max = min(height, cy + radius + 1)
+    x_min = max(0, cx - radius)
+    x_max = min(width, cx + radius + 1)
+    roi = costmap[y_min:y_max, x_min:x_max]
+    ys = np.arange(y_min, y_max)
+    xs = np.arange(x_min, x_max)
+    xx, yy = np.meshgrid(xs, ys)
+    dist_sq = (xx - center_mx) ** 2 + (yy - center_my) ** 2
+    mask = dist_sq <= radius * radius
+    if np.any(roi[mask] == 254):
+        return False
+    return True
+
+
+def bresenham_check_downcpu(x0, y0, x1, y1, costmap):
+    pixels = bresenham_original(x0, y0, x1, y1, costmap)
+    total = len(pixels)
+    if total == 0:
+        return False
+    step = max(1, total // 20)
+    sample_indices = list(range(0, total, step))
+    if total - 1 not in sample_indices:
+        sample_indices.append(total - 1)
+    sampled = [pixels[i] for i in sample_indices]
+    values = np.array([costmap[p[1], p[0]] for p in sampled])
+    return bool(np.all(values <= 253))
+
+
+# ============================================================
+#     版本3: fixed
+# ============================================================
+
+def generate_candidate_points_fixed(search_vertices, interval):
+    A = np.array(search_vertices[0])
+    B = np.array(search_vertices[1])
+    D = np.array(search_vertices[3])
+    u = B - A
+    v = D - A
+    u_length = np.linalg.norm(u)
+    v_length = np.linalg.norm(v)
+    steps_u = max(1, int(u_length / interval))
+    steps_v = max(1, int(v_length / interval))
+    i_vals = np.arange(steps_u + 1) / steps_u
+    j_vals = np.arange(steps_v + 1) / steps_v
+    ii, jj = np.meshgrid(i_vals, j_vals, indexing='ij')
+    px = (A[0] + u[0] * ii + v[0] * jj).ravel()
+    py = (A[1] + u[1] * ii + v[1] * jj).ravel()
+    dist_sq = (px - ROBOT_X) ** 2 + (py - ROBOT_Y) ** 2
+    idx = np.argsort(dist_sq)
+    return [(float(px[i]), float(py[i])) for i in idx]
+
+
+def check_point_is_free_fixed(costmap, center_mx, center_my, radius=20):
+    height, width = costmap.shape
+    cx, cy = int(center_mx), int(center_my)
+    y_min = max(0, cy - radius)
+    y_max = min(height, cy + radius + 1)
+    x_min = max(0, cx - radius)
+    x_max = min(width, cx + radius + 1)
+    roi = costmap[y_min:y_max, x_min:x_max]
+    ys, xs = np.ogrid[y_min - cy:y_max - cy, x_min - cx:x_max - cx]
+    mask = xs ** 2 + ys ** 2 <= radius * radius
+    return not np.any(roi[mask] == 254)
+
+
+def bresenham_check_fixed(x0, y0, x1, y1, costmap):
+    pixels = bresenham_original(x0, y0, x1, y1, costmap)
+    total = len(pixels)
+    if total == 0:
+        return False
+    coords = np.array(pixels)
+    values = costmap[coords[:, 1], coords[:, 0]]
+    return bool(np.all(values <= 253))
+
+
+# ============================================================
+#     版本4: v5 混合最优版
+# ============================================================
+
+def generate_candidate_points_v5(search_vertices, interval):
+    A = np.array(search_vertices[0])
+    B = np.array(search_vertices[1])
+    D = np.array(search_vertices[3])
+    u = B - A
+    v = D - A
+    u_length = np.linalg.norm(u)
+    v_length = np.linalg.norm(v)
+    steps_u = max(1, int(u_length / interval))
+    steps_v = max(1, int(v_length / interval))
+    i_vals = np.arange(steps_u + 1) / steps_u
+    j_vals = np.arange(steps_v + 1) / steps_v
+    ii, jj = np.meshgrid(i_vals, j_vals, indexing='ij')
+    px = (A[0] + u[0] * ii + v[0] * jj).ravel()
+    py = (A[1] + u[1] * ii + v[1] * jj).ravel()
+    dist_sq = (px - ROBOT_X) ** 2 + (py - ROBOT_Y) ** 2
+    idx = np.argsort(dist_sq)
+    return [(float(px[i]), float(py[i])) for i in idx]
+
+
+def check_point_is_free_v5(costmap, center_mx, center_my, radius=20):
+    height, width = costmap.shape
+    cx, cy = int(center_mx), int(center_my)
+    y_min = max(0, cy - radius)
+    y_max = min(height, cy + radius + 1)
+    x_min = max(0, cx - radius)
+    x_max = min(width, cx + radius + 1)
+    roi = costmap[y_min:y_max, x_min:x_max]
+    if not np.any(roi == 254):
+        return True
+    ys, xs = np.ogrid[y_min - cy:y_max - cy, x_min - cx:x_max - cx]
+    mask = xs * xs + ys * ys <= radius * radius
+    return not np.any(roi[mask] == 254)
+
+
+def bresenham_check_v5(x0, y0, x1, y1, costmap):
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    h, w = costmap.shape
+    x, y = x0, y0
+    while True:
+        if 0 <= x < w and 0 <= y < h:
+            if costmap[y, x] > 253:
+                return False
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+    return True
+
+
+# ============================================================
+#     版本5: v6 — 针对实际参数的最优版
+#     策略：
+#       generate: fixed方案（纯numpy）
+#       check_free: 纯Python直接遍历（r=2时只有13像素，避免numpy开销）
+#       bresenham: v5 early-exit（内联，边走边查）
+# ============================================================
+
+def generate_candidate_points_v6(search_vertices, interval):
+    """与fixed相同"""
+    A = np.array(search_vertices[0])
+    B = np.array(search_vertices[1])
+    D = np.array(search_vertices[3])
+    u = B - A
+    v = D - A
+    u_length = np.linalg.norm(u)
+    v_length = np.linalg.norm(v)
+    steps_u = max(1, int(u_length / interval))
+    steps_v = max(1, int(v_length / interval))
+    i_vals = np.arange(steps_u + 1) / steps_u
+    j_vals = np.arange(steps_v + 1) / steps_v
+    ii, jj = np.meshgrid(i_vals, j_vals, indexing='ij')
+    px = (A[0] + u[0] * ii + v[0] * jj).ravel()
+    py = (A[1] + u[1] * ii + v[1] * jj).ravel()
+    dist_sq = (px - ROBOT_X) ** 2 + (py - ROBOT_Y) ** 2
+    idx = np.argsort(dist_sq)
+    return [(float(px[i]), float(py[i])) for i in idx]
+
+
+def check_point_is_free_v6(costmap, center_mx, center_my, radius=2):
+    """
+    v6: 纯Python直接遍历，适合小radius(r<=5)
+    r=2时只有13个像素需要检查，纯Python比numpy更快
+    - 无numpy array创建开销
+    - 支持early-exit（发现254立即返回）
+    """
+    h, w = costmap.shape
+    cx = int(center_mx)
+    cy = int(center_my)
+    r_sq = radius * radius
+    y_start = cy - radius
+    y_end = cy + radius
+    x_start = cx - radius
+    x_end = cx + radius
+
+    # 边界裁剪
+    if y_start < 0:
+        y_start = 0
+    if y_end >= h:
+        y_end = h - 1
+    if x_start < 0:
+        x_start = 0
+    if x_end >= w:
+        x_end = w - 1
+
+    for y in range(y_start, y_end + 1):
+        dy = y - cy
+        dy_sq = dy * dy
+        for x in range(x_start, x_end + 1):
+            dx = x - cx
+            if dx * dx + dy_sq <= r_sq:
+                if costmap[y, x] == 254:
+                    return False
+    return True
+
+
+def bresenham_check_v6(x0, y0, x1, y1, costmap):
+    """与v5相同：内联early-exit"""
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    h, w = costmap.shape
+    x, y = x0, y0
+    while True:
+        if 0 <= x < w and 0 <= y < h:
+            if costmap[y, x] > 253:
+                return False
+        if x == x1 and y == y1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+    return True
+
+
+# ============================================================
+#                  完整流程
+# ============================================================
+
+def full_pipeline(costmap, version='original', search_interval=0.5, check_radius=20):
+    current_polygon = find_current_polygon(ROBOT_X, ROBOT_Y, [POLYGON])
+    if current_polygon is None:
+        return None, "机器人不在通道内"
+
+    nearest_edge = find_nearest_long_edge(ROBOT_X, ROBOT_Y, current_polygon)
+    direction = calculate_avoidance_direction(ROBOT_X, ROBOT_Y, CAR_X, CAR_Y, nearest_edge)
+    search_vertices = generate_search_rectangle(
+        ROBOT_X, ROBOT_Y, direction, nearest_edge,
+        SEARCH_RADIUS_MIN, SEARCH_RADIUS_MAX,
+        ROBOT_WIDTH, CAR_SIZE_Y, OUTSIDE_MIN, OUTSIDE_MAX,
+    )
+
+    if version == 'original':
+        gen_fn = generate_candidate_points_original
+        check_fn = check_point_is_free_original
+        bres_fn = bresenham_check_original
+    elif version == 'downcpu':
+        gen_fn = generate_candidate_points_downcpu
+        check_fn = check_point_is_free_downcpu
+        bres_fn = bresenham_check_downcpu
+    elif version == 'fixed':
+        gen_fn = generate_candidate_points_fixed
+        check_fn = check_point_is_free_fixed
+        bres_fn = bresenham_check_fixed
+    elif version == 'v5':
+        gen_fn = generate_candidate_points_v5
+        check_fn = check_point_is_free_v5
+        bres_fn = bresenham_check_v5
+    elif version == 'v6':
+        gen_fn = generate_candidate_points_v6
+        check_fn = check_point_is_free_v6
+        bres_fn = bresenham_check_v6
+    else:
+        raise ValueError(f"Unknown version: {version}")
+
+    candidate_points = gen_fn(search_vertices, search_interval)
+    robot_mx, robot_my = world_to_map(ROBOT_X, ROBOT_Y)
+
+    passed_obstacle_filter = 0
+    for point in candidate_points:
+        mx, my = world_to_map(point[0], point[1])
+        if not check_fn(costmap, mx, my, radius=check_radius):
+            continue
+        passed_obstacle_filter += 1
+        if bres_fn(robot_mx, robot_my, mx, my, costmap):
+            pt = (float(point[0]), float(point[1]))
+            return pt, f"找到避让点！筛选了 {passed_obstacle_filter} 个点"
+
+    count = len(candidate_points)
+    return None, f"无可用避让点，共 {count} 个候选，{passed_obstacle_filter} 个通过障碍检查"
+
+
+# ============================================================
+#        cProfile 用的全局函数
+# ============================================================
+
+def run_version_50(version, interval=0.5, radius=20):
+    for _ in range(50):
+        full_pipeline(FAKE_COSTMAP, version=version, search_interval=interval, check_radius=radius)
+
+
+# ============================================================
+#                    性能测试
+# ============================================================
+
+def run_tests():
+    versions = [
+        ("原始版本", "original"),
+        ("downcpu版本", "downcpu"),
+        ("fixed版本", "fixed"),
+        ("v5版本", "v5"),
+        ("v6版本", "v6"),
+    ]
+    labels = ["原始", "downcpu", "fixed", "v5", "v6"]
+
+    print("=" * 90)
+    print("    find_car_avoidance_point 性能诊断 V6")
+    print("    重点：测试 实际代码参数 (radius=2, interval=0.05)")
+    print("=" * 90)
+
+    print(f"\n模拟环境：")
+    print(f"  机器人位置:    ({ROBOT_X}, {ROBOT_Y})")
+    print(f"  汽车位置:      ({CAR_X}, {CAR_Y})")
+    print(f"  通道:          {POLYGON}")
+    print(f"  costmap 尺寸:  {COSTMAP_WIDTH} x {COSTMAP_HEIGHT}")
+
+    print("\n  v6优化策略（针对实际代码 radius=2）：")
+    print("    generate: fixed方案（纯numpy向量化）")
+    print("    check_free: 纯Python直接遍历（r=2仅13像素，跳过numpy开销）")
+    print("    bresenham: 内联early-exit（与v5相同）")
+
+    # 准备公共数据
+    nearest_edge = find_nearest_long_edge(ROBOT_X, ROBOT_Y, POLYGON)
+    direction = calculate_avoidance_direction(ROBOT_X, ROBOT_Y, CAR_X, CAR_Y, nearest_edge)
+    search_verts = generate_search_rectangle(
+        ROBOT_X, ROBOT_Y, direction, nearest_edge,
+        SEARCH_RADIUS_MIN, SEARCH_RADIUS_MAX,
+        ROBOT_WIDTH, CAR_SIZE_Y, OUTSIDE_MIN, OUTSIDE_MAX
+    )
+    candidates_05 = generate_candidate_points_original(search_verts, 0.5)
+    candidates_005 = generate_candidate_points_original(search_verts, 0.05)
+    test_mx, test_my = world_to_map(candidates_05[0][0], candidates_05[0][1])
+    robot_mx, robot_my = world_to_map(ROBOT_X, ROBOT_Y)
+
+    # ==================== 测试1 ====================
+    print("\n" + "=" * 90)
+    print("【测试1】关键发现：实际代码参数 vs 测试脚本参数")
+    print("-" * 90)
+    print(f"  实际代码: search_interval=0.05, check_radius=2")
+    print(f"  旧测试:   search_interval=0.5,  check_radius=20")
+    print(f"  候选点数: interval=0.5 → {len(candidates_05)}点, interval=0.05 → {len(candidates_005)}点")
+    print(f"  check_free像素数: r=2 → ~13像素, r=20 → ~1257像素")
+
+    # ==================== 测试2 ====================
+    print("\n" + "=" * 90)
+    print("【测试2】check_free 小radius对比（r=2, 实际使用参数）")
+    print("-" * 90)
+    print(f"  {'版本':<15} | {'1000次耗时(ms)':>15} | {'单次(μs)':>12}")
+    print(f"  {'-'*15}-+-{'-'*15}-+-{'-'*12}")
+
+    check_fns = [
+        ("原始", check_point_is_free_original),
+        ("downcpu", check_point_is_free_downcpu),
+        ("fixed", check_point_is_free_fixed),
+        ("v5", check_point_is_free_v5),
+        ("v6(纯Python)", check_point_is_free_v6),
+    ]
+
+    for name, fn in check_fns:
+        t0 = time.perf_counter()
+        for _ in range(1000):
+            fn(FAKE_COSTMAP, test_mx, test_my, radius=2)
+        t1 = time.perf_counter()
+        total_ms = (t1 - t0) * 1000
+        per_call_us = total_ms  # 1000次的ms ≈ 单次的μs
+        print(f"  {name:<15} | {total_ms:>15.3f} | {per_call_us:>12.3f}")
+
+    # ==================== 测试3 ====================
+    print("\n" + "=" * 90)
+    print("【测试3】check_free 各radius对比（含v6）")
+    print("-" * 110)
+    header = f"  {'radius':>6}"
+    for name, _ in check_fns:
+        header += f" | {name:>12}"
+    header += f" | {'最快':>12}"
+    print(header)
+    print(f"  {'-'*6}" + ("-+-" + "-" * 12) * len(check_fns) + "-+-" + "-" * 12)
+
+    for radius in [1, 2, 3, 5, 10, 20, 30]:
+        times = []
+        for _, fn in check_fns:
+            t0 = time.perf_counter()
+            for _ in range(1000):
+                fn(FAKE_COSTMAP, test_mx, test_my, radius=radius)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000)
+        best_idx = times.index(min(times))
+        row = f"  {radius:>6}"
+        for t in times:
+            row += f" | {t:>12.3f}"
+        row += f" | {check_fns[best_idx][0]:>12}"
+        print(row)
+
+    # ==================== 测试4 ====================
+    print("\n" + "=" * 90)
+    print("【测试4】完整流程：实际参数 (interval=0.05, r=2)")
+    print("-" * 90)
+
+    for label, ver in versions:
+        t0 = time.perf_counter()
+        result, msg = full_pipeline(FAKE_COSTMAP, version=ver, search_interval=0.05, check_radius=2)
+        t1 = time.perf_counter()
+        print(f"  {label:>14}: {(t1-t0)*1000:.4f} ms  |  {msg}")
+
+    # ==================== 测试5 ====================
+    print("\n" + "=" * 90)
+    print("【测试5】完整流程压测：实际参数 (interval=0.05, r=2)")
+    print("-" * 90)
+
+    for label, ver in versions:
+        for count in [10, 50, 100]:
+            t0 = time.perf_counter()
+            for _ in range(count):
+                full_pipeline(FAKE_COSTMAP, version=ver, search_interval=0.05, check_radius=2)
+            t1 = time.perf_counter()
+            total_ms = (t1 - t0) * 1000
+            avg_ms = total_ms / count
+            print(f"  {label:>14} x {count:>4}次 | 总: {total_ms:>10.1f} ms | 平均: {avg_ms:>8.3f} ms/次")
+
+    # ==================== 测试6 ====================
+    print("\n" + "=" * 90)
+    print("【测试6】完整流程压测：旧参数 (interval=0.5, r=20) 作为对照")
+    print("-" * 90)
+
+    for label, ver in versions:
+        for count in [10, 50, 100]:
+            t0 = time.perf_counter()
+            for _ in range(count):
+                full_pipeline(FAKE_COSTMAP, version=ver, search_interval=0.5, check_radius=20)
+            t1 = time.perf_counter()
+            total_ms = (t1 - t0) * 1000
+            avg_ms = total_ms / count
+            print(f"  {label:>14} x {count:>4}次 | 总: {total_ms:>10.1f} ms | 平均: {avg_ms:>8.3f} ms/次")
+
+    # ==================== 测试7 ====================
+    print("\n" + "=" * 90)
+    print("【测试7】generate_candidate_points 不同interval对比")
+    print("-" * 110)
+    gen_fns = [
+        ("原始", generate_candidate_points_original),
+        ("downcpu", generate_candidate_points_downcpu),
+        ("fixed", generate_candidate_points_fixed),
+        ("v5", generate_candidate_points_v5),
+        ("v6", generate_candidate_points_v6),
+    ]
+
+    header = f"  {'间隔':>6} | {'点数':>6}"
+    for name, _ in gen_fns:
+        header += f" | {name:>10}"
+    header += f" | {'最快':>8}"
+    print(header)
+    print(f"  {'-'*6}-+-{'-'*6}" + ("-+-" + "-" * 10) * len(gen_fns) + "-+-" + "-" * 8)
+
+    for interval in [0.5, 0.3, 0.2, 0.1, 0.05]:
+        pts = generate_candidate_points_original(search_verts, interval)
+        times = []
+        for _, fn in gen_fns:
+            t0 = time.perf_counter()
+            for _ in range(100):
+                fn(search_verts, interval)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000)
+        best_idx = times.index(min(times))
+        row = f"  {interval:>6.2f} | {len(pts):>6}"
+        for t in times:
+            row += f" | {t:>10.3f}"
+        row += f" | {gen_fns[best_idx][0]:>8}"
+        print(row)
+
+    # ==================== 测试8 ====================
+    print("\n" + "=" * 90)
+    print("【测试8】bresenham 准确性验证（含v6）")
+    print("-" * 70)
+
+    np.random.seed(123)
+    mismatch_counts = {"downcpu": 0, "fixed": 0, "v5": 0, "v6": 0}
+    total_tests = 500
+    for _ in range(total_tests):
+        rx = np.random.randint(50, COSTMAP_WIDTH - 50)
+        ry = np.random.randint(50, COSTMAP_HEIGHT - 50)
+        tx = np.random.randint(50, COSTMAP_WIDTH - 50)
+        ty = np.random.randint(50, COSTMAP_HEIGHT - 50)
+
+        result_orig = bresenham_check_original(rx, ry, tx, ty, FAKE_COSTMAP)
+        result_downcpu = bresenham_check_downcpu(rx, ry, tx, ty, FAKE_COSTMAP)
+        result_fixed = bresenham_check_fixed(rx, ry, tx, ty, FAKE_COSTMAP)
+        result_v5 = bresenham_check_v5(rx, ry, tx, ty, FAKE_COSTMAP)
+        result_v6 = bresenham_check_v6(rx, ry, tx, ty, FAKE_COSTMAP)
+
+        if result_orig != result_downcpu:
+            mismatch_counts["downcpu"] += 1
+        if result_orig != result_fixed:
+            mismatch_counts["fixed"] += 1
+        if result_orig != result_v5:
+            mismatch_counts["v5"] += 1
+        if result_orig != result_v6:
+            mismatch_counts["v6"] += 1
+
+    print(f"  总测试: {total_tests} 对")
+    for name, cnt in mismatch_counts.items():
+        acc = (total_tests - cnt) / total_tests * 100
+        status = "✅" if cnt == 0 else "⚠️"
+        print(f"  {name:>10}: {cnt} 次不一致 ({acc:.1f}% 准确) {status}")
+
+    # ==================== 测试9 ====================
+    print("\n" + "=" * 90)
+    print("【测试9】bresenham early-exit 效果测试（含v6）")
+    print("-" * 80)
+    print("  测试500条随机线段：")
+
+    np.random.seed(456)
+    test_lines = []
+    for _ in range(500):
+        rx = np.random.randint(50, COSTMAP_WIDTH - 50)
+        ry = np.random.randint(50, COSTMAP_HEIGHT - 50)
+        tx = np.random.randint(50, COSTMAP_WIDTH - 50)
+        ty = np.random.randint(50, COSTMAP_HEIGHT - 50)
+        test_lines.append((rx, ry, tx, ty))
+
+    bres_fns = [
+        (bresenham_check_original, "原始"),
+        (bresenham_check_downcpu, "downcpu(跳跃)"),
+        (bresenham_check_fixed, "fixed(numpy)"),
+        (bresenham_check_v5, "v5(early-exit)"),
+        (bresenham_check_v6, "v6(early-exit)"),
+    ]
+
+    for fn, name in bres_fns:
+        t0 = time.perf_counter()
+        for x0, y0, x1, y1 in test_lines:
+            fn(x0, y0, x1, y1, FAKE_COSTMAP)
+        t1 = time.perf_counter()
+        print(f"    {name:>20}: {(t1-t0)*1000:.3f} ms  (500线段)")
+
+    # ==================== 测试10 ====================
+    print("\n" + "=" * 90)
+    print("【测试10】check_free 有/无障碍详细对比（r=2, 实际参数）")
+    print("-" * 80)
+
+    clean_costmap = np.zeros((COSTMAP_HEIGHT, COSTMAP_WIDTH), dtype=np.uint8)
+    clean_mx, clean_my = 400, 300
+
+    for scene_name, scene_costmap, scene_mx, scene_my in [
+        ("干净(无障碍)", clean_costmap, clean_mx, clean_my),
+        ("密集(5%障碍)", FAKE_COSTMAP, test_mx, test_my),
+    ]:
+        print(f"\n  场景: {scene_name}, radius=2, 循环5000次")
+        for name, fn in check_fns:
+            t0 = time.perf_counter()
+            for _ in range(5000):
+                fn(scene_costmap, scene_mx, scene_my, radius=2)
+            t1 = time.perf_counter()
+            print(f"    {name:>15}: {(t1-t0)*1000:.3f} ms")
+
+    # ==================== 测试11 ====================
+    print("\n" + "=" * 90)
+    print("【测试11】不同障碍密度下完整流程：实际参数 (interval=0.05, r=2)")
+    print("-" * 110)
+    header = f"  {'密度':>8}"
+    for name in labels:
+        header += f" | {name:>10}"
+    header += f" | {'最快':>8}"
+    print(header)
+    print(f"  {'-'*8}" + ("-+-" + "-" * 10) * len(labels) + "-+-" + "-" * 8)
+
+    for density in [0.0, 0.001, 0.005, 0.01, 0.05, 0.1]:
+        np.random.seed(42)
+        test_cm = np.zeros((COSTMAP_HEIGHT, COSTMAP_WIDTH), dtype=np.uint8)
+        num = int(COSTMAP_WIDTH * COSTMAP_HEIGHT * density)
+        if num > 0:
+            ox = np.random.randint(0, COSTMAP_WIDTH, num)
+            oy = np.random.randint(0, COSTMAP_HEIGHT, num)
+            test_cm[oy, ox] = 254
+
+        times = []
+        for _, ver in versions:
+            t0 = time.perf_counter()
+            for _ in range(50):
+                full_pipeline(test_cm, version=ver, search_interval=0.05, check_radius=2)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000 / 50)
+        best_idx = times.index(min(times))
+        row = f"  {density:>8.3f}"
+        for t in times:
+            row += f" | {t:>10.3f}"
+        row += f" | {labels[best_idx]:>8}"
+        print(row)
+
+    # ==================== 测试12 ====================
+    print("\n" + "=" * 90)
+    print("【测试12】内存占用测试")
+    print("-" * 60)
+    for label, ver in versions:
+        tracemalloc.start()
+        full_pipeline(FAKE_COSTMAP, version=ver, search_interval=0.05, check_radius=2)
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        print(f"  {label:>14} - 当前: {current/1024:.1f} KB | 峰值: {peak/1024:.1f} KB")
+    print(f"  costmap 占用:    {FAKE_COSTMAP.nbytes/1024:.1f} KB")
+
+    # ==================== 测试13 ====================
+    print("\n" + "=" * 90)
+    print("【测试13】cProfile 详细分析（v6 x 50, interval=0.05, r=2）")
+    print("-" * 60)
+    profiler = cProfile.Profile()
+    profiler.enable()
+    run_version_50('v6', interval=0.05, radius=2)
+    profiler.disable()
+    stream = io.StringIO()
+    stats = pstats.Stats(profiler, stream=stream)
+    stats.sort_stats('tottime')
+    stats.print_stats(20)
+    print(stream.getvalue())
+
+    # ==================== 测试14 ====================
+    print("\n" + "=" * 90)
+    print("【测试14】cProfile 详细分析（fixed x 50, interval=0.05, r=2 对照）")
+    print("-" * 60)
+    profiler = cProfile.Profile()
+    profiler.enable()
+    run_version_50('fixed', interval=0.05, radius=2)
+    profiler.disable()
+    stream = io.StringIO()
+    stats = pstats.Stats(profiler, stream=stream)
+    stats.sort_stats('tottime')
+    stats.print_stats(20)
+    print(stream.getvalue())
+
+
+
+if __name__ == '__main__':
+    run_tests()
+
+
+==========================================================================================
+
+模拟环境：
+  机器人位置:    (-5.687, 25.072)
+  汽车位置:      (9.0, 25.0)
+  通道:          [(-16.0, 22.5), (14.0, 22.5), (14.0, 27.5), (-16.0, 27.5)]
+  costmap 尺寸:  851 x 616
+
+  v6优化策略（针对实际代码 radius=2）：
+    generate: fixed方案（纯numpy向量化）
+    check_free: 纯Python直接遍历（r=2仅13像素，跳过numpy开销）
+    bresenham: 内联early-exit（与v5相同）
+
+==========================================================================================
+【测试1】关键发现：实际代码参数 vs 测试脚本参数
+------------------------------------------------------------------------------------------
+  实际代码: search_interval=0.05, check_radius=2
+  旧测试:   search_interval=0.5,  check_radius=20
+  候选点数: interval=0.5 → 35点, interval=0.05 → 2684点
+  check_free像素数: r=2 → ~13像素, r=20 → ~1257像素
+
+==========================================================================================
+【测试2】check_free 小radius对比（r=2, 实际使用参数）
+------------------------------------------------------------------------------------------
+  版本              |     1000次耗时(ms) |       单次(μs)
+  ----------------+-----------------+-------------
+  原始              |         117.930 |      117.930
+  downcpu         |          76.369 |       76.369
+  fixed           |          31.628 |       31.628
+  v5              |          10.297 |       10.297
+  v6(纯Python)     |          32.236 |       32.236
+
+==========================================================================================
+【测试3】check_free 各radius对比（含v6）
+--------------------------------------------------------------------------------------------------------------
+  radius |           原始 |      downcpu |        fixed |           v5 |  v6(纯Python) |           最快
+  -------+--------------+--------------+--------------+--------------+--------------+-------------
+       1 |       21.974 |       50.165 |       33.111 |        8.163 |       11.387 |           v5
+       2 |       52.347 |       41.531 |       31.049 |        9.059 |       25.977 |           v5
+       3 |      107.746 |       82.619 |       33.282 |        9.297 |       66.865 |           v5
+       5 |      298.197 |       42.617 |       30.899 |       48.062 |      290.832 |        fixed
+      10 |       97.419 |       72.635 |       47.585 |       53.413 |       38.550 |  v6(纯Python)
+      20 |      293.140 |       60.555 |       41.993 |       49.646 |      129.830 |        fixed
+      30 |      110.923 |       68.482 |       44.832 |       52.060 |       25.997 |  v6(纯Python)
+
+==========================================================================================
+【测试4】完整流程：实际参数 (interval=0.05, r=2)
+------------------------------------------------------------------------------------------
+            原始版本: 41.4998 ms  |  找到避让点！筛选了 48 个点
+       downcpu版本: 38.2640 ms  |  找到避让点！筛选了 48 个点
+         fixed版本: 7.0824 ms  |  找到避让点！筛选了 48 个点
+            v5版本: 7.0071 ms  |  找到避让点！筛选了 48 个点
+            v6版本: 6.3128 ms  |  找到避让点！筛选了 48 个点
+
+==========================================================================================
+【测试5】完整流程压测：实际参数 (interval=0.05, r=2)
+------------------------------------------------------------------------------------------
+            原始版本 x   10次 | 总:      766.7 ms | 平均:   76.674 ms/次
+            原始版本 x   50次 | 总:     2943.7 ms | 平均:   58.874 ms/次
+            原始版本 x  100次 | 总:     5789.5 ms | 平均:   57.895 ms/次
+       downcpu版本 x   10次 | 总:      536.5 ms | 平均:   53.645 ms/次
+       downcpu版本 x   50次 | 总:     2473.0 ms | 平均:   49.461 ms/次
+       downcpu版本 x  100次 | 总:     4482.8 ms | 平均:   44.828 ms/次
+         fixed版本 x   10次 | 总:      107.0 ms | 平均:   10.703 ms/次
+         fixed版本 x   50次 | 总:      411.1 ms | 平均:    8.222 ms/次
+         fixed版本 x  100次 | 总:      811.2 ms | 平均:    8.112 ms/次
+            v5版本 x   10次 | 总:       70.5 ms | 平均:    7.055 ms/次
+            v5版本 x   50次 | 总:      327.9 ms | 平均:    6.558 ms/次
+            v5版本 x  100次 | 总:      783.3 ms | 平均:    7.833 ms/次
+            v6版本 x   10次 | 总:       55.1 ms | 平均:    5.509 ms/次
+            v6版本 x   50次 | 总:      267.5 ms | 平均:    5.349 ms/次
+            v6版本 x  100次 | 总:      920.6 ms | 平均:    9.206 ms/次
+
+==========================================================================================
+【测试6】完整流程压测：旧参数 (interval=0.5, r=20) 作为对照
+------------------------------------------------------------------------------------------
+            原始版本 x   10次 | 总:       55.7 ms | 平均:    5.571 ms/次
+            原始版本 x   50次 | 总:      279.7 ms | 平均:    5.594 ms/次
+            原始版本 x  100次 | 总:      519.0 ms | 平均:    5.190 ms/次
+       downcpu版本 x   10次 | 总:       30.7 ms | 平均:    3.074 ms/次
+       downcpu版本 x   50次 | 总:      146.3 ms | 平均:    2.927 ms/次
+       downcpu版本 x  100次 | 总:      508.2 ms | 平均:    5.082 ms/次
+         fixed版本 x   10次 | 总:       17.8 ms | 平均:    1.781 ms/次
+         fixed版本 x   50次 | 总:       89.1 ms | 平均:    1.783 ms/次
+         fixed版本 x  100次 | 总:      189.6 ms | 平均:    1.896 ms/次
+            v5版本 x   10次 | 总:       20.0 ms | 平均:    2.002 ms/次
+            v5版本 x   50次 | 总:      121.6 ms | 平均:    2.432 ms/次
+            v5版本 x  100次 | 总:      211.1 ms | 平均:    2.111 ms/次
+            v6版本 x   10次 | 总:       17.1 ms | 平均:    1.711 ms/次
+            v6版本 x   50次 | 总:      120.5 ms | 平均:    2.409 ms/次
+            v6版本 x  100次 | 总:      171.0 ms | 平均:    1.710 ms/次
+
+==========================================================================================
+【测试7】generate_candidate_points 不同interval对比
+--------------------------------------------------------------------------------------------------------------
+      间隔 |     点数 |         原始 |    downcpu |      fixed |         v5 |         v6 |       最快
+  -------+--------+------------+------------+------------+------------+------------+---------
+    0.50 |     35 |     62.588 |    140.540 |     23.592 |     11.933 |     12.576 |       v5
+    0.30 |     88 |    162.476 |    138.942 |     13.313 |     13.706 |     17.256 |    fixed
+    0.20 |    176 |    293.391 |    225.306 |     19.765 |     13.526 |     16.749 |       v5
+    0.10 |    682 |   1041.331 |    776.899 |     49.396 |     42.178 |     44.038 |       v5
+    0.05 |   2684 |   4307.159 |   4684.795 |    149.859 |    154.513 |    151.564 |    fixed
+
+==========================================================================================
+【测试8】bresenham 准确性验证（含v6）
+----------------------------------------------------------------------
+  总测试: 500 对
+     downcpu: 167 次不一致 (66.6% 准确) ⚠️
+       fixed: 0 次不一致 (100.0% 准确) ✅
+          v5: 0 次不一致 (100.0% 准确) ✅
+          v6: 0 次不一致 (100.0% 准确) ✅
+
+==========================================================================================
+【测试9】bresenham early-exit 效果测试（含v6）
+--------------------------------------------------------------------------------
+  测试500条随机线段：
+                      原始: 105.397 ms  (500线段)
+             downcpu(跳跃): 73.541 ms  (500线段)
+            fixed(numpy): 151.114 ms  (500线段)
+          v5(early-exit): 24.342 ms  (500线段)
+          v6(early-exit): 29.966 ms  (500线段)
+
+==========================================================================================
+【测试10】check_free 有/无障碍详细对比（r=2, 实际参数）
+--------------------------------------------------------------------------------
+
+  场景: 干净(无障碍), radius=2, 循环5000次
+                 原始: 289.840 ms
+            downcpu: 324.170 ms
+              fixed: 162.118 ms
+                 v5: 50.881 ms
+        v6(纯Python): 148.012 ms
+
+  场景: 密集(5%障碍), radius=2, 循环5000次
+                 原始: 493.355 ms
+            downcpu: 290.642 ms
+              fixed: 199.554 ms
+                 v5: 54.383 ms
+        v6(纯Python): 167.642 ms
+
+==========================================================================================
+【测试11】不同障碍密度下完整流程：实际参数 (interval=0.05, r=2)
+--------------------------------------------------------------------------------------------------------------
+        密度 |         原始 |    downcpu |      fixed |         v5 |         v6 |       最快
+  ---------+------------+------------+------------+------------+------------+---------
+     0.000 |     37.035 |     39.609 |      1.997 |      1.779 |      1.721 |       v6
+     0.001 |     50.238 |     31.583 |      1.670 |      1.663 |      1.898 |       v5
+     0.005 |     44.261 |     37.486 |      1.893 |      1.715 |      1.559 |       v6
+     0.010 |     50.332 |     38.564 |      2.209 |      1.638 |      1.555 |       v6
+     0.050 |     45.572 |     42.120 |      7.615 |      5.793 |      5.125 |       v6
+     0.100 |    205.881 |    224.574 |    153.389 |    130.078 |     65.189 |       v6
+
+==========================================================================================
+【测试12】内存占用测试
+------------------------------------------------------------
+            原始版本 - 当前: 55.2 KB | 峰值: 512.4 KB
+       downcpu版本 - 当前: 58.9 KB | 峰值: 376.8 KB
+         fixed版本 - 当前: 42.1 KB | 峰值: 313.1 KB
+            v5版本 - 当前: 40.6 KB | 峰值: 313.1 KB
+            v6版本 - 当前: 40.3 KB | 峰值: 313.1 KB
+  costmap 占用:    511.9 KB
+
+==========================================================================================
+【测试13】cProfile 详细分析（v6 x 50, interval=0.05, r=2）
+------------------------------------------------------------
+         22502 function calls (22452 primitive calls) in 0.361 seconds
+
+   Ordered by: internal time
+   List reduced from 66 to 20 due to restriction <20>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+     4600    0.135    0.000    0.135    0.000 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:456(check_point_is_free_v6)
+     2400    0.083    0.000    0.083    0.000 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:493(bresenham_check_v6)
+       50    0.079    0.002    0.079    0.002 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:453(<listcomp>)
+        1    0.014    0.014    0.361    0.361 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:579(run_version_50)
+       50    0.009    0.000    0.009    0.000 {method 'argsort' of 'numpy.ndarray' objects}
+       50    0.009    0.000    0.348    0.007 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:522(full_pipeline)
+       50    0.008    0.000    0.112    0.002 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:435(generate_candidate_points_v6)
+      100    0.003    0.000    0.004    0.000 /usr/local/lib/python3.10/dist-packages/numpy/lib/stride_tricks.py:340(_broadcast_to)
+     4650    0.003    0.000    0.003    0.000 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:72(world_to_map)
+      100    0.001    0.000    0.003    0.000 /usr/local/lib/python3.10/dist-packages/numpy/linalg/linalg.py:2357(norm)
+       50    0.001    0.000    0.001    0.000 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:98(calculate_edge_lengths)
+      100    0.001    0.000    0.001    0.000 {method 'copy' of 'numpy.ndarray' objects}
+       50    0.001    0.000    0.001    0.000 /usr/local/lib/python3.10/dist-packages/numpy/lib/stride_tricks.py:416(_broadcast_shape)
+      100    0.001    0.000    0.001    0.000 {method 'dot' of 'numpy.ndarray' objects}
+      350    0.001    0.000    0.001    0.000 {built-in method numpy.array}
+       50    0.001    0.000    0.009    0.000 /usr/local/lib/python3.10/dist-packages/numpy/lib/function_base.py:4846(meshgrid)
+  250/200    0.001    0.000    0.023    0.000 {built-in method numpy.core._multiarray_umath.implement_array_function}
+       50    0.001    0.000    0.003    0.000 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:111(find_nearest_long_edge)
+       50    0.001    0.000    0.006    0.000 /usr/local/lib/python3.10/dist-packages/numpy/lib/stride_tricks.py:480(broadcast_arrays)
+     4900    0.001    0.000    0.001    0.000 {built-in method builtins.abs}
+
+
+
+
+==========================================================================================
+【测试14】cProfile 详细分析（fixed x 50, interval=0.05, r=2 对照）
+------------------------------------------------------------
+         277602 function calls (277552 primitive calls) in 0.628 seconds
+
+   Ordered by: internal time
+   List reduced from 81 to 20 due to restriction <20>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+     4600    0.110    0.000    0.147    0.000 /usr/local/lib/python3.10/dist-packages/numpy/lib/index_tricks.py:148(__getitem__)
+     4600    0.097    0.000    0.301    0.000 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:341(check_point_is_free_fixed)
+       50    0.085    0.002    0.085    0.002 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:338(<listcomp>)
+     2400    0.074    0.000    0.083    0.000 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:223(bresenham_original)
+     2750    0.041    0.000    0.041    0.000 {built-in method numpy.array}
+     2400    0.027    0.000    0.173    0.000 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:354(bresenham_check_fixed)
+     7000    0.018    0.000    0.041    0.000 /usr/local/lib/python3.10/dist-packages/numpy/core/fromnumeric.py:69(_wrapreduction)
+     7000    0.017    0.000    0.017    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+        1    0.016    0.016    0.628    0.628 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:579(run_version_50)
+    46000    0.015    0.000    0.015    0.000 {built-in method builtins.isinstance}
+       50    0.014    0.000    0.613    0.012 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:522(full_pipeline)
+7250/7200    0.012    0.000    0.084    0.000 {built-in method numpy.core._multiarray_umath.implement_array_function}
+     9300    0.010    0.000    0.010    0.000 {built-in method numpy.arange}
+    86300    0.010    0.000    0.010    0.000 {method 'append' of 'list' objects}
+       50    0.009    0.000    0.009    0.000 {method 'argsort' of 'numpy.ndarray' objects}
+       50    0.007    0.000    0.115    0.002 /capella/lib/python3.10/site-packages/find_free_space/src/find_free_space/test_generate_points.py:321(generate_candidate_points_fixed)
+     4600    0.007    0.000    0.016    0.000 /usr/local/lib/python3.10/dist-packages/numpy/lib/index_tricks.py:170(<listcomp>)
+     4600    0.006    0.000    0.034    0.000 /usr/local/lib/python3.10/dist-packages/numpy/core/fromnumeric.py:2307(any)
+     4600    0.006    0.000    0.051    0.000 <__array_function__ internals>:177(any)
+     7000    0.005    0.000    0.005    0.000 /usr/local/lib/python3.10/dist-packages/numpy/core/fromnumeric.py:70(<dictcomp>)
+
+
