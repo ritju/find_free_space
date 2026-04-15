@@ -91,8 +91,10 @@ class CarAvoidancePointActionServer(Node):
 
         self.robot_pose = PoseStamped()
         # 创建一个timer，用于实时获取机器人的位姿
-        self.get_robot_pose_timer_ = self.create_timer(timer_period_sec=0.1, callback=self.get_robot_pose_timer_callback)
-
+        self.get_robot_pose_timer_ = None
+        self.tf_buffer = None
+        self.tf_listener = None
+        
         self.polygons = []
         self.vertices = []
         # 创建一个timer,用于实时得到距离机器人最近的通道位姿。
@@ -105,9 +107,7 @@ class CarAvoidancePointActionServer(Node):
                                         self.action_goal_callback,
                                         callback_group=callback_gp1,
                                         feedback_pub_qos_profile=action_server_feedback_qos)#
-        # tf2
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
         self.global_costmap_sub = self.create_subscription(
             Costmap,
             self.topic_name_global_costmap,
@@ -200,9 +200,37 @@ class CarAvoidancePointActionServer(Node):
         
         if self.show_global_costmap_raw_colored_cv2 or self.show_global_costmap_raw_cv2:
             cv2.waitKey(1)
+
+    def start_tf_listening(self):
+        if self.tf_buffer is not None:
+            return
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.get_robot_pose_timer_ = self.create_timer(0.1, self.get_robot_pose_timer_callback)
+        self.get_logger().info('TF listener started')
+
+    def stop_tf_listening(self):
+        import gc
+        if self.get_robot_pose_timer_ is not None:
+            self.get_robot_pose_timer_.cancel()
+            self.destroy_timer(self.get_robot_pose_timer_)
+            self.get_robot_pose_timer_ = None
+        if self.tf_listener is not None:
+            if hasattr(self.tf_listener, 'subscription') and self.tf_listener.subscription is not None:
+                self.destroy_subscription(self.tf_listener.subscription)
+            if hasattr(self.tf_listener, '_tf_static_sub') and self.tf_listener._tf_static_sub is not None:
+                self.destroy_subscription(self.tf_listener._tf_static_sub)
+            self.tf_listener = None
+        if self.tf_buffer is not None:
+            del self.tf_buffer
+            self.tf_buffer = None
+        gc.collect()
+        self.get_logger().info('TF listener stopped')
     
     # 用于实时获取机器人的位姿
     def get_robot_pose_timer_callback(self):
+        if self.tf_buffer is None:
+            return
         try:
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             self.robot_pose.header.stamp = self.get_clock().now().to_msg()
@@ -310,67 +338,72 @@ class CarAvoidancePointActionServer(Node):
 
 
     def action_goal_callback(self, goal_handle):
-        self.get_logger().info('开始寻找避让点...')
-        # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
-        self.action_goal_handle_msg = goal_handle.request
-        self.vehicle_width = self.action_goal_handle_msg.car_size.y
-        self.polygons = self.action_goal_handle_msg.polygons
-        self.get_logger().info(f'polygons: {self.polygons}')
-        
-        # 获取清洁区域信息
-        # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
-        self.get_logger().info('寻找当前通行区域...')
-        # 改
-        self.vertices = list(self.vertices)
-        self.vertices.clear()
-        self.get_vertices_callback()
+        self.start_tf_listening()
+        time.sleep(1.0)
+        try:
+            self.get_logger().info('开始寻找避让点...')
+            # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
+            self.action_goal_handle_msg = goal_handle.request
+            self.vehicle_width = self.action_goal_handle_msg.car_size.y
+            self.polygons = self.action_goal_handle_msg.polygons
+            self.get_logger().info(f'polygons: {self.polygons}')
+            
+            # 获取清洁区域信息
+            # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
+            self.get_logger().info('寻找当前通行区域...')
+            # 改
+            self.vertices = list(self.vertices)
+            self.vertices.clear()
+            self.get_vertices_callback()
 
-        if len(self.vertices) == 0:
-            self.get_logger().error('未找到用于寻找停靠点的通道')
-            goal_handle.abort()
-            return FindCarAvoidancePoint.Result()
+            if len(self.vertices) == 0:
+                self.get_logger().error('未找到用于寻找停靠点的通道')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
 
-        v1, v2, v3, v4 = self.vertices
-        self.get_logger().info(f'当前通行区域: [({v1[0]}, {v1[1]}),({v2[0]}, {v2[1]}),({v3[0]}, {v3[1]}),({v4[0]}, {v4[1]})]')
+            v1, v2, v3, v4 = self.vertices
+            self.get_logger().info(f'当前通行区域: [({v1[0]}, {v1[1]}),({v2[0]}, {v2[1]}),({v3[0]}, {v3[1]}),({v4[0]}, {v4[1]})]')
 
 
-        # self.get_logger().info(f'self.get_vertices_callback():{len(self.vertices)}')
-        # self.get_logger().info(f'self.vertices:{self.vertices}')
-        
+            # self.get_logger().info(f'self.get_vertices_callback():{len(self.vertices)}')
+            # self.get_logger().info(f'self.vertices:{self.vertices}')
+            
 
-        # 寻找停靠点
-        self.get_logger().info('寻找停靠点...')
-        avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
-        self.get_logger().info(f'avoidance_point:{avoidance_point}')
-        if avoidance_point is not None:
-            self.get_logger().info(f'成功找到避让点{avoidance_point}')
+            # 寻找停靠点
+            self.get_logger().info('寻找停靠点...')
+            avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
+            self.get_logger().info(f'avoidance_point:{avoidance_point}')
+            if avoidance_point is not None:
+                self.get_logger().info(f'成功找到避让点{avoidance_point}')
 
-            msg_marker_parking_point = Marker()
-            msg_marker_parking_point.header.frame_id = "map"
-            msg_marker_parking_point.header.stamp = self.get_clock().now().to_msg()
-            msg_marker_parking_point.id = 5
-            msg_marker_parking_point.type = Marker.ARROW
-            msg_marker_parking_point.action = Marker.ADD
-            msg_marker_parking_point.scale.x = 0.5
-            msg_marker_parking_point.scale.y = 0.2
-            msg_marker_parking_point.scale.z = 0.4
-            msg_marker_parking_point.color.r = 0.0
-            msg_marker_parking_point.color.g = 0.0
-            msg_marker_parking_point.color.b = 1.0
-            msg_marker_parking_point.color.a = 1.0
-            msg_marker_parking_point.pose = avoidance_point.pose
-            self.marker_parking_point_publisher.publish(msg_marker_parking_point)
+                msg_marker_parking_point = Marker()
+                msg_marker_parking_point.header.frame_id = "map"
+                msg_marker_parking_point.header.stamp = self.get_clock().now().to_msg()
+                msg_marker_parking_point.id = 5
+                msg_marker_parking_point.type = Marker.ARROW
+                msg_marker_parking_point.action = Marker.ADD
+                msg_marker_parking_point.scale.x = 0.5
+                msg_marker_parking_point.scale.y = 0.2
+                msg_marker_parking_point.scale.z = 0.4
+                msg_marker_parking_point.color.r = 0.0
+                msg_marker_parking_point.color.g = 0.0
+                msg_marker_parking_point.color.b = 1.0
+                msg_marker_parking_point.color.a = 1.0
+                msg_marker_parking_point.pose = avoidance_point.pose
+                self.marker_parking_point_publisher.publish(msg_marker_parking_point)
 
-            goal_handle.succeed()
-            # goal_handle.abort()
-            result = FindCarAvoidancePoint.Result()
-            result.pose = avoidance_point
-            self.get_logger().info(f'成功找到避让点*****')
-            return result
-        else:
-            self.get_logger().info(f'无法找到避让点')
-            goal_handle.abort()
-            return FindCarAvoidancePoint.Result()
+                goal_handle.succeed()
+                # goal_handle.abort()
+                result = FindCarAvoidancePoint.Result()
+                result.pose = avoidance_point
+                self.get_logger().info(f'成功找到避让点*****')
+                return result
+            else:
+                self.get_logger().info(f'无法找到避让点')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
+        finally:
+            self.stop_tf_listening()
 
     def calculate_total_passage_width(self, vertices):
         # 假设为长方形，长边为通行方向，短边为通道宽度

@@ -15,7 +15,7 @@ setup(
         (os.path.join('share', package_name, 'params'), glob('params/*.yaml')),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py'))
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'psutil'],
     zip_safe=True,
     maintainer='ros',
     maintainer_email='1024988917@qq.com',
@@ -27,4 +27,5 @@ setup(
                 'find_parking_space=find_free_space.find_car_avoidance_point:main',
         ],
     },
-)
+)   
+
