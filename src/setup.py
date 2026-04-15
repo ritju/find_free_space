@@ -27,5 +27,4 @@ setup(
                 'find_parking_space=find_free_space.find_car_avoidance_point:main',
         ],
     },
-)   
-
+)
