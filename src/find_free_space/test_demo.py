@@ -160,9 +160,6 @@ class CarAvoidancePointActionServer(Node):
         # tf2
         self.tf_buffer = None
         self.tf_listener = None
-        self._tf_node = None
-        self._tf_executor = None
-        self._tf_spin_thread = None
         self.global_costmap_sub = self.create_subscription(
             Costmap,
             self.topic_name_global_costmap,
@@ -257,30 +254,40 @@ class CarAvoidancePointActionServer(Node):
             cv2.waitKey(1)
     
     def start_tf_listening(self):
-        if self._tf_node is None:
-            self._tf_node = rclpy.create_node('_tf_listener_temp')
-            self.tf_buffer = tf2_ros.Buffer()
-            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self._tf_node)
-            self._tf_executor = rclpy.executors.SingleThreadedExecutor()
-            self._tf_executor.add_node(self._tf_node)
-            self._tf_spin_thread = threading.Thread(target=self._tf_executor.spin, daemon=True)
-            self._tf_spin_thread.start()
-            self.get_robot_pose_timer_ = self.create_timer(0.1, self.get_robot_pose_timer_callback)
-            self.get_logger().info("TF listener started")
+        if self.tf_buffer is not None:
+            return  # 已经在运行，不重复创建
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.get_robot_pose_timer_ = self.create_timer(0.1, self.get_robot_pose_timer_callback)
+        self.get_logger().info('TF listener started')
 
     def stop_tf_listening(self):
+        # 1. 停止并销毁定时器
         if self.get_robot_pose_timer_ is not None:
             self.get_robot_pose_timer_.cancel()
             self.destroy_timer(self.get_robot_pose_timer_)
             self.get_robot_pose_timer_ = None
-        if self._tf_executor is not None:
-            self._tf_executor.shutdown()
-            self._tf_executor = None
-        if self._tf_node is not None:
-            self._tf_node.destroy_node()
-            self._tf_node = None
-        self.tf_listener = None
-        self.tf_buffer = None
+
+        # 2. 销毁 TransformListener 内部创建的订阅
+        if self.tf_listener is not None:
+            if hasattr(self.tf_listener, 'unregister'):
+                self.tf_listener.unregister()
+            else:
+                # ROS2 humble 的 TransformListener 会在 self 节点上创建订阅
+                # 需要手动销毁这些订阅
+                for sub in self.tf_listener._subscription_list if hasattr(self.tf_listener, '_subscription_list') else []:
+                    self.destroy_subscription(sub)
+                # 尝试直接销毁已知的订阅
+                if hasattr(self.tf_listener, 'subscription'):
+                    self.destroy_subscription(self.tf_listener.subscription)
+                if hasattr(self.tf_listener, 'static_subscription'):
+                    self.destroy_subscription(self.tf_listener.static_subscription)
+            self.tf_listener = None
+
+        # 3. 清空 buffer
+        if self.tf_buffer is not None:
+            self.tf_buffer = None
+
         self.get_logger().info("TF listener stopped")
 
     # 用于实时获取机器人的位姿
