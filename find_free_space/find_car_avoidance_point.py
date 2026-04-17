@@ -10,6 +10,8 @@ from capella_ros_msg.srv import IsCarPassable
 import tf2_ros
 import numpy as np
 import time
+import threading
+import psutil
 import math
 import cv2
 from nav_msgs.msg import OccupancyGrid
@@ -23,6 +25,54 @@ from collections import defaultdict
 
 from visualization_msgs.msg import Marker
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+
+
+class CPUMonitor:
+    def __init__(self, interval=0.02):
+        self.interval = interval
+        self._samples = []
+        self._running = False
+        self._thread = None
+        self._process = psutil.Process()
+        self._log_thread = threading.Thread(target=self._background_log, daemon=True)
+        self._log_thread.start()
+
+    def _background_log(self):
+        self._process.cpu_percent()  # 首次调用初始化
+        time.sleep(1.0)
+        while True:
+            try:
+                cpu = self._process.cpu_percent()
+                mem = self._process.memory_info().rss / 1024 / 1024
+                thread_count = len(self._process.threads())
+                num_fds = self._process.num_fds()
+                print(f"[CPU Monitor] cpu: {cpu:.1f}%, mem: {mem:.1f} MB, threads: {thread_count}, fds: {num_fds}")
+            except Exception as e:
+                print(f"[CPU Monitor] error: {e}")
+            time.sleep(2.0)
+
+    def start(self):
+        self._samples = []
+        self._running = True
+        self._process.cpu_percent()
+        self._thread = threading.Thread(target=self._sample, daemon=True)
+        self._thread.start()
+
+    def _sample(self):
+        while self._running:
+            cpu = self._process.cpu_percent()
+            self._samples.append(cpu)
+            time.sleep(self.interval)
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval * 2)
+        if not self._samples:
+            return 0.0, 0.0
+        avg_cpu = sum(self._samples) / len(self._samples)
+        peak_cpu = max(self._samples)
+        return avg_cpu, peak_cpu
 
 
 class CarAvoidancePointActionServer(Node):
@@ -43,6 +93,8 @@ class CarAvoidancePointActionServer(Node):
         self.cv_window_name = 'Global Costmap Raw Colored'
 
         self.init_params()
+
+        self.cpu_monitor = CPUMonitor()
 
         # publish markers for debug
         marker_qos = QoSProfile(depth=1,
@@ -91,7 +143,7 @@ class CarAvoidancePointActionServer(Node):
 
         self.robot_pose = PoseStamped()
         # 创建一个timer，用于实时获取机器人的位姿
-        self.get_robot_pose_timer_ = self.create_timer(timer_period_sec=0.1, callback=self.get_robot_pose_timer_callback)
+        self.get_robot_pose_timer_ = None
 
         self.polygons = []
         self.vertices = []
@@ -106,8 +158,11 @@ class CarAvoidancePointActionServer(Node):
                                         callback_group=callback_gp1,
                                         feedback_pub_qos_profile=action_server_feedback_qos)#
         # tf2
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_buffer = None
+        self.tf_listener = None
+        self._tf_node = None
+        self._tf_executor = None
+        self._tf_spin_thread = None
         self.global_costmap_sub = self.create_subscription(
             Costmap,
             self.topic_name_global_costmap,
@@ -201,8 +256,37 @@ class CarAvoidancePointActionServer(Node):
         if self.show_global_costmap_raw_colored_cv2 or self.show_global_costmap_raw_cv2:
             cv2.waitKey(1)
     
+    def start_tf_listening(self):
+        if self._tf_node is None:
+            self._tf_node = rclpy.create_node('_tf_listener_temp')
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self._tf_node)
+            self._tf_executor = rclpy.executors.SingleThreadedExecutor()
+            self._tf_executor.add_node(self._tf_node)
+            self._tf_spin_thread = threading.Thread(target=self._tf_executor.spin, daemon=True)
+            self._tf_spin_thread.start()
+            self.get_robot_pose_timer_ = self.create_timer(0.1, self.get_robot_pose_timer_callback)
+            self.get_logger().info("TF listener started")
+
+    def stop_tf_listening(self):
+        if self.get_robot_pose_timer_ is not None:
+            self.get_robot_pose_timer_.cancel()
+            self.destroy_timer(self.get_robot_pose_timer_)
+            self.get_robot_pose_timer_ = None
+        if self._tf_executor is not None:
+            self._tf_executor.shutdown()
+            self._tf_executor = None
+        if self._tf_node is not None:
+            self._tf_node.destroy_node()
+            self._tf_node = None
+        self.tf_listener = None
+        self.tf_buffer = None
+        self.get_logger().info("TF listener stopped")
+
     # 用于实时获取机器人的位姿
     def get_robot_pose_timer_callback(self):
+        if self.tf_buffer is None:
+            return
         try:
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             self.robot_pose.header.stamp = self.get_clock().now().to_msg()
@@ -310,67 +394,83 @@ class CarAvoidancePointActionServer(Node):
 
 
     def action_goal_callback(self, goal_handle):
-        self.get_logger().info('开始寻找避让点...')
-        # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
-        self.action_goal_handle_msg = goal_handle.request
-        self.vehicle_width = self.action_goal_handle_msg.car_size.y
-        self.polygons = self.action_goal_handle_msg.polygons
-        self.get_logger().info(f'polygons: {self.polygons}')
-        
-        # 获取清洁区域信息
-        # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
-        self.get_logger().info('寻找当前通行区域...')
-        # 改
-        self.vertices = list(self.vertices)
-        self.vertices.clear()
-        self.get_vertices_callback()
+        start_perf = time.perf_counter()
+        start_process = time.process_time()
+        self.cpu_monitor.start()
+        self.start_tf_listening()
+        time.sleep(1.0)
+        try:
+            self.get_logger().info('开始寻找避让点...')
+            # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
+            self.action_goal_handle_msg = goal_handle.request
+            self.vehicle_width = self.action_goal_handle_msg.car_size.y
+            self.polygons = self.action_goal_handle_msg.polygons
+            self.get_logger().info(f'polygons: {self.polygons}')
+            
+            # 获取清洁区域信息
+            # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
+            self.get_logger().info('寻找当前通行区域...')
+            # 改
+            self.vertices = list(self.vertices)
+            self.vertices.clear()
+            self.get_vertices_callback()
 
-        if len(self.vertices) == 0:
-            self.get_logger().error('未找到用于寻找停靠点的通道')
-            goal_handle.abort()
-            return FindCarAvoidancePoint.Result()
+            if len(self.vertices) == 0:
+                self.get_logger().error('未找到用于寻找停靠点的通道')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
 
-        v1, v2, v3, v4 = self.vertices
-        self.get_logger().info(f'当前通行区域: [({v1[0]}, {v1[1]}),({v2[0]}, {v2[1]}),({v3[0]}, {v3[1]}),({v4[0]}, {v4[1]})]')
+            v1, v2, v3, v4 = self.vertices
+            self.get_logger().info(f'当前通行区域: [({v1[0]}, {v1[1]}),({v2[0]}, {v2[1]}),({v3[0]}, {v3[1]}),({v4[0]}, {v4[1]})]')
 
 
-        # self.get_logger().info(f'self.get_vertices_callback():{len(self.vertices)}')
-        # self.get_logger().info(f'self.vertices:{self.vertices}')
-        
+            # self.get_logger().info(f'self.get_vertices_callback():{len(self.vertices)}')
+            # self.get_logger().info(f'self.vertices:{self.vertices}')
+            
 
-        # 寻找停靠点
-        self.get_logger().info('寻找停靠点...')
-        avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
-        self.get_logger().info(f'avoidance_point:{avoidance_point}')
-        if avoidance_point is not None:
-            self.get_logger().info(f'成功找到避让点{avoidance_point}')
+            # 寻找停靠点
+            self.get_logger().info('寻找停靠点...')
+            avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
+            self.get_logger().info(f'avoidance_point:{avoidance_point}')
+            if avoidance_point is not None:
+                self.get_logger().info(f'成功找到避让点{avoidance_point}')
 
-            msg_marker_parking_point = Marker()
-            msg_marker_parking_point.header.frame_id = "map"
-            msg_marker_parking_point.header.stamp = self.get_clock().now().to_msg()
-            msg_marker_parking_point.id = 5
-            msg_marker_parking_point.type = Marker.ARROW
-            msg_marker_parking_point.action = Marker.ADD
-            msg_marker_parking_point.scale.x = 0.5
-            msg_marker_parking_point.scale.y = 0.2
-            msg_marker_parking_point.scale.z = 0.4
-            msg_marker_parking_point.color.r = 0.0
-            msg_marker_parking_point.color.g = 0.0
-            msg_marker_parking_point.color.b = 1.0
-            msg_marker_parking_point.color.a = 1.0
-            msg_marker_parking_point.pose = avoidance_point.pose
-            self.marker_parking_point_publisher.publish(msg_marker_parking_point)
+                msg_marker_parking_point = Marker()
+                msg_marker_parking_point.header.frame_id = "map"
+                msg_marker_parking_point.header.stamp = self.get_clock().now().to_msg()
+                msg_marker_parking_point.id = 5
+                msg_marker_parking_point.type = Marker.ARROW
+                msg_marker_parking_point.action = Marker.ADD
+                msg_marker_parking_point.scale.x = 0.5
+                msg_marker_parking_point.scale.y = 0.2
+                msg_marker_parking_point.scale.z = 0.4
+                msg_marker_parking_point.color.r = 0.0
+                msg_marker_parking_point.color.g = 0.0
+                msg_marker_parking_point.color.b = 1.0
+                msg_marker_parking_point.color.a = 1.0
+                msg_marker_parking_point.pose = avoidance_point.pose
+                self.marker_parking_point_publisher.publish(msg_marker_parking_point)
 
-            goal_handle.succeed()
-            # goal_handle.abort()
-            result = FindCarAvoidancePoint.Result()
-            result.pose = avoidance_point
-            self.get_logger().info(f'成功找到避让点*****')
-            return result
-        else:
-            self.get_logger().info(f'无法找到避让点')
-            goal_handle.abort()
-            return FindCarAvoidancePoint.Result()
+                goal_handle.succeed()
+                # goal_handle.abort()
+                result = FindCarAvoidancePoint.Result()
+                result.pose = avoidance_point
+                self.get_logger().info(f'成功找到避让点*****')
+                return result
+            else:
+                self.get_logger().info(f'无法找到避让点')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
+        finally:
+            wall_time = time.perf_counter() - start_perf
+            cpu_time = time.process_time() - start_process
+            avg_cpu, peak_cpu = self.cpu_monitor.stop()
+            self.get_logger().info(
+                "=== 性能统计 === 总耗时: {:.4f}s, CPU时间: {:.4f}s, CPU平均: {:.1f}%, CPU峰值: {:.1f}%".format(
+                    wall_time, cpu_time, avg_cpu, peak_cpu
+                )
+            )
+            self.stop_tf_listening()
 
     def calculate_total_passage_width(self, vertices):
         # 假设为长方形，长边为通行方向，短边为通道宽度
@@ -385,15 +485,15 @@ class CarAvoidancePointActionServer(Node):
 
         return distance
 
-    # 寻找距离机器人最近的长边
-    # def find_min_long_sides(self, cleaning_area_vertices, robot_position):
-    #     # 计算相邻顶点之间的距离
-    #     distances = []
-    #     for i in range(4):
-    #         x1, y1 = cleaning_area_vertices[i]
-    #         x2, y2 = cleaning_area_vertices[(i+1)%4]
-    #         distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-    #         distances.append(distance)
+    # 寻找距离机器人最近的长边    
+    def find_min_long_sides(self, cleaning_area_vertices, robot_position):
+        # 计算相邻顶点之间的距离
+        distances = []
+        for i in range(4):
+            x1, y1 = cleaning_area_vertices[i]
+            x2, y2 = cleaning_area_vertices[(i+1)%4]
+            distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            distances.append(distance)
         
         # 判断长边对
         if distances[0] > distances[1]:
@@ -737,7 +837,7 @@ class CarAvoidancePointActionServer(Node):
         # 判断每个点是否里障碍物太近
         # 首先将位姿转换到map的像素点
         if len(search_posestamped_list) > 0:
-            boundary_points = [(pose.pose.position.x, pose.pose.position.y) for pose in search_posestamped_list]
+            boundary_points = [(x, y) for (x, y, _) in search_posestamped_list]
             boundary_points = np.array(boundary_points)
             boundary_points_pixel = (boundary_points - np.array([origin_x,origin_y])) / resolution
             # boundary_points_pixel[:,1] = height - boundary_points_pixel[:,1]
@@ -748,16 +848,24 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info('排除障碍物点...')
             is_obstacle_index = [True if self.check_point_is_free(costmap,(x,y),2) else False for x,y in boundary_points_pixel]
             boundary_points = boundary_points[is_obstacle_index]
-            search_posestamped_list = np.array(search_posestamped_list)
-            search_posestamped_list = search_posestamped_list[is_obstacle_index]
+            search_posestamped_list = [search_posestamped_list[i] for i in range(len(search_posestamped_list)) if is_obstacle_index[i]]
             self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个避障...')
             
+            robot_point = np.array([robot_x,robot_y])
+            robot_point_pixel = (robot_point - np.array([origin_x,origin_y])) / resolution
+            # robot_point_pixel[1] = height - robot_point_pixel[1]
+            robot_point_pixel[0] = np.clip(robot_point_pixel[0],0,width-1)
+            robot_point_pixel[1] = np.clip(robot_point_pixel[1],0,height-1)
+            # robot_x_p,robot_y_p = robot_point_pixel
+            robot_x_p = int(robot_point_pixel[0])
+            robot_y_p = int(robot_point_pixel[1])
+
             for avoidance_pose in search_posestamped_list:    
                 # avoidance_pose_msg = IsCarPassable.Request()
                 # avoidance_pose_msg.robot_pose = avoidance_pose
                 # avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
                 # avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
-                # self.get_logger().info(f'避让点: ({avoidance_pose.pose.position.x}, {avoidance_pose.pose.position.y})')
+                # self.get_logger().info(f'避让点: ({avoidance_pose[0]}, {avoidance_pose[1]})')
                 # start_time = time.time()
                 # check_avoidance_result = self.check_avoidance(avoidance_pose_msg)
                 # end_time = time.time()
@@ -766,16 +874,7 @@ class CarAvoidancePointActionServer(Node):
                 # self.get_logger().info(f'delta_time: {delta_time}')
                 # if check_avoidance_result and delta_time < self.check_service_max_time:
 
-                robot_point = np.array([robot_x,robot_y])
-                robot_point_pixel = (robot_point - np.array([origin_x,origin_y])) / resolution
-                # robot_point_pixel[1] = height - robot_point_pixel[1]
-                robot_point_pixel[0] = np.clip(robot_point_pixel[0],0,width-1)
-                robot_point_pixel[1] = np.clip(robot_point_pixel[1],0,height-1)
-                # robot_x_p,robot_y_p = robot_point_pixel
-                robot_x_p = int(robot_point_pixel[0])
-                robot_y_p = int(robot_point_pixel[1])
-
-                point = np.array([avoidance_pose.pose.position.x, avoidance_pose.pose.position.y])
+                point = np.array([avoidance_pose[0], avoidance_pose[1]])
                 point_pixel = (point - np.array([origin_x,origin_y])) / resolution
                 # point_pixel[1] = height - point_pixel[1]
                 point_pixel[0] = np.clip(point_pixel[0],0,width-1)
@@ -783,15 +882,23 @@ class CarAvoidancePointActionServer(Node):
                 # point_x_p,point_y_p = point_pixel
                 point_x_p = int(point_pixel[0])
                 point_y_p = int(point_pixel[1])
-                bresenham_point = self.bresenham(robot_x_p,robot_y_p,point_x_p,point_y_p,costmap)
-                bresenham_point_value = np.array([costmap[x[1],x[0]] for x in bresenham_point])
-                self.get_logger().info(f"costmap values: {bresenham_point_value}")
                 
-                if (bresenham_point_value <= 253).all():
+                # ========== 改动3b：修改 bresenham 调用方式 ==========
+                bresenham_result = self.bresenham_check(robot_x_p, robot_y_p, point_x_p, point_y_p, costmap)
+                if bresenham_result:
                     self.get_logger().info('机器人到当前点的连线满足')
-                    return avoidance_pose
+                    ret_pose = PoseStamped()
+                    ret_pose.header.stamp = self.get_clock().now().to_msg()
+                    ret_pose.header.frame_id = 'map'
+                    ret_pose.pose.position.x = avoidance_pose[0]
+                    ret_pose.pose.position.y = avoidance_pose[1]
+                    quat = Quaternion()
+                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, math.radians(avoidance_pose[2]))
+                    ret_pose.pose.orientation = quat
+                    return ret_pose
                 else:
                     self.get_logger().info('机器人到当前点的连线不满足')
+                # ========== 改动3b结束 ==========
         else:
             self.get_logger().info('用于搜索的点，数量为0')
             return None
@@ -918,19 +1025,15 @@ class CarAvoidancePointActionServer(Node):
         generate_search_points_with_directions = self.process_points(self.robot_pose, vertices, generate_search_points_without_directions, direction)
         search_posetampd_list = []
         for point_with_direction in generate_search_points_with_directions:
-            pose_with_direction = PoseStamped()
-            pose_with_direction.header.stamp = self.get_clock().now().to_msg()
-            pose_with_direction.header.frame_id = 'map'
-            pose_with_direction.pose.position.x = point_with_direction[0][0]
-            pose_with_direction.pose.position.y = point_with_direction[0][1]
-            quat = Quaternion()
-            quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, math.radians(point_with_direction[1]))
-            pose_with_direction.pose.orientation = quat
-            search_posetampd_list.append(pose_with_direction)
+            x = point_with_direction[0][0]
+            y = point_with_direction[0][1]
+            angle = point_with_direction[1]
+            search_posetampd_list.append((x, y, angle))
         # self.show(generate_search_points_with_directions)
         return search_posetampd_list
-    
-    def generate_all_search_points(self,vertices, interval):
+
+    # ========== 改动1：优化 generate_all_search_points 方法 ==========
+    def generate_all_search_points(self, vertices, interval):
         A = np.array(vertices[0])
         B = np.array(vertices[1])
         D = np.array(vertices[3])
@@ -943,17 +1046,25 @@ class CarAvoidancePointActionServer(Node):
         steps_u = max(1, int(u_length / interval))
         steps_v = max(1, int(v_length / interval))
         
-        grid_points = defaultdict(list)
-        for i in range(steps_u + 1):
-            for j in range(steps_v + 1):
-                point = A + u*(i/steps_u) + v*(j/steps_v)
-                grid_points[(i, j)] = tuple(np.round(point, 6))
+        # 向量化生成网格点
+        i_vals = np.arange(steps_u + 1)
+        j_vals = np.arange(steps_v + 1)
+        ii, jj = np.meshgrid(i_vals, j_vals, indexing='ij')
         
+        # 向量化计算所有点坐标
+        px = (A[0] + u[0] * ii / steps_u + v[0] * jj / steps_v).ravel()
+        py = (A[1] + u[1] * ii / steps_u + v[1] * jj / steps_v).ravel()
         
-        generate_points = list(grid_points.values())
-        generate_points = sorted(generate_points, key=self.distance_sq)
-        return generate_points
-    
+        # 向量化计算距离并排序
+        robot_x = self.robot_pose.pose.position.x
+        robot_y = self.robot_pose.pose.position.y
+        dist_sq = (px - robot_x)**2 + (py - robot_y)**2
+        idx = np.argsort(dist_sq)
+        
+        # 返回排序后的点列表
+        return [(float(px[i]), float(py[i])) for i in idx]
+    # ========== 改动1结束 ==========
+
     def distance_sq(self, point):
         dx = point[0] - self.robot_pose.pose.position.x
         dy = point[1] - self.robot_pose.pose.position.y
@@ -1022,19 +1133,12 @@ class CarAvoidancePointActionServer(Node):
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
     def process_points(self, robot_pose, vertices, points, direction):
-        edge1, edge2 = self.calculate_long_edges(vertices)
-        line1, line2 = edge1[2], edge2[2]
-        angle1, angle2 = edge1[1], edge2[1]
-        
         results = []
         for point in points:
             dx = point[0] - robot_pose.pose.position.x
             dy = point[1] - robot_pose.pose.position.y
             alpha = math.degrees(math.atan2(dy, dx))
             
-            dist1 = self.distance_point_to_line(point, line1)
-            dist2 = self.distance_point_to_line(point, line2)
-            # target_angle = angle1 if dist1 < dist2 else angle2
             target_angle = math.degrees(direction)
             direction_vec = (dx, dy)
             alpha = self.adjust_angle(direction_vec, target_angle)
@@ -1177,7 +1281,7 @@ class CarAvoidancePointActionServer(Node):
 
         return (x2, y2)
     
-    # 检查点附近是否有障碍物
+    # ========== 改动2：优化 check_point_is_free 方法 ==========
     def check_point_is_free(self, image, center, radius=20):
         """
         判断以指定像素点为中心、半径为radius 像素的圆形区域内所有像素值是否都等于0
@@ -1187,17 +1291,25 @@ class CarAvoidancePointActionServer(Node):
         :return: 如果圆形区域内所有像素值都等于 0 返回 True，否则返回 False
         """
         height, width = image.shape
-
-        # 遍历圆形区域内的所有像素
-        for y in range(max(0, int(center[1] - radius)), min(height, int(center[1] + radius + 1))):
-            for x in range(max(0, int(center[0] - radius)), min(width, int(center[0] + radius + 1))):
-                # 计算当前像素到中心像素的距离
-                distance = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2)
-                if distance <= radius:
-                    # 检查像素值是否等于 0
+        r_sq = radius * radius
+        cx = int(center[0])
+        cy = int(center[1])
+        
+        y_start = max(0, cy - radius)
+        y_end = min(height - 1, cy + radius)
+        x_start = max(0, cx - radius)
+        x_end = min(width - 1, cx + radius)
+        
+        for y in range(y_start, y_end + 1):
+            dy = y - cy
+            dy_sq = dy * dy
+            for x in range(x_start, x_end + 1):
+                dx = x - cx
+                if dx * dx + dy_sq <= r_sq:
                     if image[y, x] == 254:
                         return False
         return True
+    # ========== 改动2结束 ==========
 
     # 判断两个点之间的角度差
     def angle_diff(self, a, b, use_abs=True):
@@ -1277,6 +1389,45 @@ class CarAvoidancePointActionServer(Node):
 
         return np.array(pixels)
 
+    # ========== 改动3a：新增 bresenham_check 方法 ==========
+    def bresenham_check(self, current_x, current_y, target_x, target_y, map_array):
+        """
+        检查两点连线是否通畅（无障碍物）
+        :param current_x: 当前点的 x 坐标
+        :param current_y: 当前点的 y 坐标
+        :param target_x: 目标点的 x 坐标
+        :param target_y: 目标点的 y 坐标
+        :param map_array: 地图数组
+        :return: 如果连线无障碍物返回 True，否则返回 False
+        """
+        dx = abs(target_x - current_x)
+        dy = abs(target_y - current_y)
+        sx = 1 if current_x < target_x else -1
+        sy = 1 if current_y < target_y else -1
+        err = dx - dy
+
+        x, y = current_x, current_y
+        
+        while True:
+            # 检查点是否在地图范围内且无障碍物
+            if 0 <= x < len(map_array[0]) and 0 <= y < len(map_array):
+                if map_array[y, x] > 253:
+                    return False
+            
+            if x == target_x and y == target_y:
+                break
+                
+            e2 = 2 * err
+            if e2 > -dy:
+                err = err - dy
+                x = x + sx
+            if e2 < dx:
+                err = err + dx
+                y = y + sy
+
+        return True
+    # ========== 改动3a结束 ==========
+
 def main(args=None):
     rclpy.init(args=args)
     executor_ = MultiThreadedExecutor()
@@ -1288,4 +1439,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-    
