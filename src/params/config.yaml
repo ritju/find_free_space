@@ -13,6 +13,7 @@ find_free_space_action_server:
     
     check_service_max_time: 1.0
     distance_extend_outside: 1.1
+    inside_step: 0.1  # 每次往通道内部挪的步长（m），可被环境变量 GARAGE_FIND_PARKING_POINT_INSIDE_STEP 覆盖
     show_global_costmap_raw_cv2: false
     show_global_costmap_raw_colored_cv2: false
 

@@ -1,4 +1,3 @@
-
 import os
 
 from ament_index_python.packages import get_package_share_directory
@@ -37,11 +36,13 @@ def generate_launch_description():
         search_radius_max = [4.0]
         outside_min = [0.0]
         outside_max = [0.5]
+        inside_step = [0.1]
 
         get_environment_value(search_radius_min, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MIN', 3.0)
         get_environment_value(search_radius_max, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MAX', 4.0)
         get_environment_value(outside_min, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MIN', 0.0)
         get_environment_value(outside_max, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MAX', 0.5)
+        get_environment_value(inside_step, 'GARAGE_FIND_PARKING_POINT_INSIDE_STEP', 0.1)
         
         return LaunchDescription([
                 Node(
@@ -54,6 +55,7 @@ def generate_launch_description():
                                     {'search_radius_min': float(search_radius_min[0]),
                                     'search_radius_max': float(search_radius_max[0]),
                                     'outside_min': float(outside_min[0]),
-                                    'outside_max': float(outside_max[0])}],
+                                    'outside_max': float(outside_max[0]),
+                                    'inside_step': float(inside_step[0])}],
                 ),
         ])
