@@ -33,16 +33,16 @@ def get_environment_value(var, env, default):
 
 def generate_launch_description():
         search_radius_min = [3.0]
-        search_radius_max = [4.0]
-        outside_min = [0.0]
-        outside_max = [0.5]
-        inside_step = [0.1]
+        search_radius_max = [3.5]
+        outside_min = [0.8]
+        outside_max = [1.0]
+        search_point_interval = [0.15]
 
         get_environment_value(search_radius_min, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MIN', 3.0)
         get_environment_value(search_radius_max, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MAX', 4.0)
         get_environment_value(outside_min, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MIN', 0.0)
         get_environment_value(outside_max, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MAX', 0.5)
-        get_environment_value(inside_step, 'GARAGE_FIND_PARKING_POINT_INSIDE_STEP', 0.1)
+        get_environment_value(search_point_interval, 'GARAGE_FIND_PARKING_POINT_SEARCH_POINT_INTERVAL', 0.15)
         
         return LaunchDescription([
                 Node(
@@ -56,6 +56,6 @@ def generate_launch_description():
                                     'search_radius_max': float(search_radius_max[0]),
                                     'outside_min': float(outside_min[0]),
                                     'outside_max': float(outside_max[0]),
-                                    'inside_step': float(inside_step[0])}],
+                                    'search_point_interval': float(search_point_interval[0])}],
                 ),
         ])

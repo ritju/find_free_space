@@ -120,19 +120,23 @@ class CarAvoidancePointActionServer(Node):
         self.check_avoidance_service = self.create_client(IsCarPassable, '/check_car_passable',callback_group=callback_gp3)
 
     def init_params(self):
-        self.declare_parameter("topic_name_global_costmap", "")
-        self.declare_parameter("service_name_check_car_passble", "")
-        self.declare_parameter("topic_name_footprint", "")
-        self.declare_parameter("search_interval", 0.3)
-        self.declare_parameter("search_radius_min", 3.0)
-        self.declare_parameter("search_radius_max", 4.0)
-        self.declare_parameter("search_radius_extra_dis", 2.5)
-        self.declare_parameter("outside_min", 0.0)
-        self.declare_parameter("outside_max", 0.5)
-        self.declare_parameter("inside_step", 0.1)
-        self.declare_parameter("check_service_max_time", 0.5)
-        self.declare_parameter('show_global_costmap_raw_cv2', False)
-        self.declare_parameter('show_global_costmap_raw_colored_cv2', False)
+        self.declare_parameter("topic_name_global_costmap", "")          # 全局代价地图话题名
+        self.declare_parameter("service_name_check_car_passble", "")     # 车辆可通过性检查服务名
+        self.declare_parameter("topic_name_footprint", "")               # 机器人足迹话题名
+        self.declare_parameter("search_interval", 0.3)                   # 搜索角度间隔
+        self.declare_parameter("search_radius_min", 3.0)                 # 搜索半径最小值
+        self.declare_parameter("search_radius_max", 4.0)                 # 搜索半径最大值
+        self.declare_parameter("search_radius_extra_dis", 2.5)           # 搜索半径额外增加距离
+        self.declare_parameter("outside_min", 0.0)                       # 搜索框外侧最小偏移
+        self.declare_parameter("outside_max", 0.5)                       # 搜索框外侧最大偏移
+        self.declare_parameter("inside_step", 0.1)                       # 每轮往内移动步长
+        self.declare_parameter('inward_offset', 0.0)                     # 搜索框初始位置离多边形边线往内多少米（0=紧贴边线）
+        self.declare_parameter('max_inward_offset', 1.5)                 # 搜索框最大往内偏移距离
+        self.declare_parameter("check_service_max_time", 0.5)            # 车辆通过性检查超时
+        self.declare_parameter('show_global_costmap_raw_cv2', False)     # 显示原始代价地图
+        self.declare_parameter('show_global_costmap_raw_colored_cv2', False)  # 显示彩色代价地图
+
+        self.declare_parameter("search_point_interval", 0.15)            # 下采样的阈值，越大点越少
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -147,6 +151,9 @@ class CarAvoidancePointActionServer(Node):
         self.check_service_max_time = self.get_parameter("check_service_max_time").value
         self.show_global_costmap_raw_cv2 = self.get_parameter('show_global_costmap_raw_cv2').value
         self.show_global_costmap_raw_colored_cv2 = self.get_parameter('show_global_costmap_raw_colored_cv2').value
+        self.inward_offset = self.get_parameter('inward_offset').value
+        self.max_inward_offset = self.get_parameter('max_inward_offset').value
+        self.search_point_interval = self.get_parameter("search_point_interval").value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
@@ -161,6 +168,9 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'check_service_max_time: {self.check_service_max_time}')
         self.get_logger().info(f'show_global_costmap_raw_cv2: {self.show_global_costmap_raw_cv2}')
         self.get_logger().info(f'show_global_costmap_raw_colored_cv2: {self.show_global_costmap_raw_colored_cv2}')
+        self.get_logger().info(f'inward_offset: {self.inward_offset}')
+        self.get_logger().info(f'max_inward_offset: {self.max_inward_offset}')
+        self.get_logger().info(f'search_point_interval: {self.search_point_interval}')
     
     def footprint_sub_callback(self, msg):
         points = msg.polygon.points
@@ -687,216 +697,196 @@ class CarAvoidancePointActionServer(Node):
         half_width = passage_width / 2.0
         self.get_logger().info(f'通道宽度: {passage_width}, 半宽: {half_width}')
 
-        # 循环搜索：从外侧开始，逐步往内部挪
-        current_offset = 0.0
+        # 单次搜索：只在当前偏移位置搜索一次
         avoidance_pose_result = None
 
-        while True:
-            offset_min = current_offset + self.outside_min
-            offset_max = current_offset + self.outside_max
+        offset_min = self.outside_min
+        offset_max = self.outside_max
 
-            self.get_logger().info(
-                f'当前搜索偏移: offset_min={offset_min:.2f}, offset_max={offset_max:.2f}'
+        self.get_logger().info(
+            f'当前搜索偏移: offset_min={offset_min:.2f}, offset_max={offset_max:.2f}'
+        )
+
+        # 根据机器人是否在通道内部，决定偏移方向
+        if self.is_point_inside_parallelogram(robot_x, robot_y, self.vertices):
+            # 机器人在通道内部
+            p1_near = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x1, robot_y1], offset_min
+            )
+            p2_near = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x2, robot_y2], offset_min
+            )
+            p1_far = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x1, robot_y1], offset_max
+            )
+            p2_far = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x2, robot_y2], offset_max
+            )
+        else:
+            # 机器人在通道外部
+            dis_robot_to_nearest_bound = self.dis_point_to_line2(
+                robot_x, robot_y,
+                nearest_boundary[0][0], nearest_boundary[0][1],
+                nearest_boundary[1][0], nearest_boundary[1][1]
+            )
+            if dis_robot_to_nearest_bound > self.outside_min and dis_robot_to_nearest_bound < self.outside_max:
+                self.outside_min = dis_robot_to_nearest_bound
+            elif dis_robot_to_nearest_bound >= self.outside_max:
+                self.get_logger().info("返回机器人当前点为停靠点")
+                ret_pose = PoseStamped()
+                ret_pose.header.stamp = self.get_clock().now().to_msg()
+                ret_pose.header.frame_id = "map"
+                ret_pose.pose.position.x = robot_x
+                ret_pose.pose.position.y = robot_y
+                target_angle = math.degrees(math.atan2(
+                    nearest_boundary[1][1] - nearest_boundary[0][1],
+                    nearest_boundary[1][0] - nearest_boundary[0][0]
+                ))
+                yaw = self.get_yaw_from_pose(robot_pose)
+                ret_pose_yaw = math.radians(self.adjust_angle((math.cos(yaw), math.sin(yaw)), target_angle))
+                quat = Quaternion()
+                quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, ret_pose_yaw)
+                ret_pose.pose.orientation = quat
+                return ret_pose
+
+            p1_near = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x1, robot_y1], -offset_min
+            )
+            p2_near = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x2, robot_y2], -offset_min
+            )
+            p1_far = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x1, robot_y1], -offset_max
+            )
+            p2_far = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x2, robot_y2], -offset_max
             )
 
-            # 终止条件：搜索框靠外侧的边已经到达通道中线
-            if offset_max <= -half_width:
-                self.get_logger().info('搜索框已到达通道中线，放弃搜索')
-                break
+        if p1_near is None or p2_near is None or p1_far is None or p2_far is None:
+            self.get_logger().info('findIntersection 返回 None，放弃搜索')
+            return None
 
-            # 根据机器人是否在通道内部，决定偏移方向
-            if self.is_point_inside_parallelogram(robot_x, robot_y, self.vertices):
-                # 机器人在通道内部
-                p1_near = self.findIntersection(
-                    nearest_boundary[0], nearest_boundary[1],
-                    [robot_x1, robot_y1], offset_min
-                )
-                p2_near = self.findIntersection(
-                    nearest_boundary[0], nearest_boundary[1],
-                    [robot_x2, robot_y2], offset_min
-                )
-                p1_far = self.findIntersection(
-                    nearest_boundary[0], nearest_boundary[1],
-                    [robot_x1, robot_y1], offset_max
-                )
-                p2_far = self.findIntersection(
-                    nearest_boundary[0], nearest_boundary[1],
-                    [robot_x2, robot_y2], offset_max
-                )
-            else:
-                # 机器人在通道外部
-                dis_robot_to_nearest_bound = self.dis_point_to_line2(
-                    robot_x, robot_y,
-                    nearest_boundary[0][0], nearest_boundary[0][1],
-                    nearest_boundary[1][0], nearest_boundary[1][1]
-                )
-                if dis_robot_to_nearest_bound > self.outside_min and dis_robot_to_nearest_bound < self.outside_max:
-                    self.outside_min = dis_robot_to_nearest_bound
-                elif dis_robot_to_nearest_bound >= self.outside_max:
-                    self.get_logger().info("返回机器人当前点为停靠点")
-                    ret_pose = PoseStamped()
-                    ret_pose.header.stamp = self.get_clock().now().to_msg()
-                    ret_pose.header.frame_id = "map"
-                    ret_pose.pose.position.x = robot_x
-                    ret_pose.pose.position.y = robot_y
-                    target_angle = math.degrees(math.atan2(
-                        nearest_boundary[1][1] - nearest_boundary[0][1],
-                        nearest_boundary[1][0] - nearest_boundary[0][0]
-                    ))
-                    yaw = self.get_yaw_from_pose(robot_pose)
-                    ret_pose_yaw = math.radians(self.adjust_angle((math.cos(yaw), math.sin(yaw)), target_angle))
-                    quat = Quaternion()
-                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, ret_pose_yaw)
-                    ret_pose.pose.orientation = quat
-                    return ret_pose
+        find_vertices = self.sort_quadrilateral_vertices([
+            p1_near, p1_far, p2_far, p2_near
+        ])
 
-                p1_near = self.findIntersection(
-                    nearest_boundary[0], nearest_boundary[1],
-                    [robot_x1, robot_y1], -offset_min
-                )
-                p2_near = self.findIntersection(
-                    nearest_boundary[0], nearest_boundary[1],
-                    [robot_x2, robot_y2], -offset_min
-                )
-                p1_far = self.findIntersection(
-                    nearest_boundary[0], nearest_boundary[1],
-                    [robot_x1, robot_y1], -offset_max
-                )
-                p2_far = self.findIntersection(
-                    nearest_boundary[0], nearest_boundary[1],
-                    [robot_x2, robot_y2], -offset_max
-                )
+        self.get_logger().info(f'find_vertices: {find_vertices}')
 
-            if p1_near is None or p2_near is None or p1_far is None or p2_far is None:
-                self.get_logger().info('findIntersection 返回 None，放弃搜索')
-                break
+        # 发布搜索区域 marker
+        msg_marker_searching_rect = Marker()
+        msg_marker_searching_rect.header.frame_id = "map"
+        msg_marker_searching_rect.header.stamp = self.get_clock().now().to_msg()
+        msg_marker_searching_rect.id = 4
+        msg_marker_searching_rect.type = Marker.LINE_LIST
+        msg_marker_searching_rect.action = Marker.ADD
+        msg_marker_searching_rect.scale.x = 0.1
+        msg_marker_searching_rect.color.r = 1.0
+        msg_marker_searching_rect.color.g = 0.0
+        msg_marker_searching_rect.color.b = 0.0
+        msg_marker_searching_rect.color.a = 1.0
+        size_tmp = len(find_vertices)
+        for i in range(size_tmp):
+            p_start = Point()
+            p_start.x = find_vertices[i][0]
+            p_start.y = find_vertices[i][1]
+            msg_marker_searching_rect.points.append(p_start)
+            p_end = Point()
+            p_end.x = find_vertices[(i + 1) % size_tmp][0]
+            p_end.y = find_vertices[(i + 1) % size_tmp][1]
+            msg_marker_searching_rect.points.append(p_end)
+        self.marker_searching_rect_publisher.publish(msg_marker_searching_rect)
 
-            find_vertices = self.sort_quadrilateral_vertices([
-                p1_near, p1_far, p2_far, p2_near
+        # 在当前搜索区域内找避让点
+        search_posestamped_list = self.select_points_in_parallelogram(find_vertices, self.search_point_interval, k)
+        self.get_logger().info(f'search_posestamped length: {len(search_posestamped_list)}')
+
+        if len(search_posestamped_list) > 0:
+            boundary_points = np.array([
+                (pose.pose.position.x, pose.pose.position.y)
+                for pose in search_posestamped_list
             ])
+            boundary_points_pixel = (boundary_points - np.array([origin_x, origin_y])) / resolution
+            boundary_points_pixel[:, 0] = np.clip(boundary_points_pixel[:, 0], 0, width - 1)
+            boundary_points_pixel[:, 1] = np.clip(boundary_points_pixel[:, 1], 0, height - 1)
 
-            self.get_logger().info(f'find_vertices: {find_vertices}')
+            self.get_logger().info(f'一共{len(boundary_points)}个候选避让点')
 
-            # 发布搜索区域 marker
-            msg_marker_searching_rect = Marker()
-            msg_marker_searching_rect.header.frame_id = "map"
-            msg_marker_searching_rect.header.stamp = self.get_clock().now().to_msg()
-            msg_marker_searching_rect.id = 4
-            msg_marker_searching_rect.type = Marker.LINE_LIST
-            msg_marker_searching_rect.action = Marker.ADD
-            msg_marker_searching_rect.scale.x = 0.1
-            msg_marker_searching_rect.color.r = 1.0
-            msg_marker_searching_rect.color.g = 0.0
-            msg_marker_searching_rect.color.b = 0.0
-            msg_marker_searching_rect.color.a = 1.0
-            size_tmp = len(find_vertices)
-            for i in range(size_tmp):
-                p_start = Point()
-                p_start.x = find_vertices[i][0]
-                p_start.y = find_vertices[i][1]
-                msg_marker_searching_rect.points.append(p_start)
-                p_end = Point()
-                p_end.x = find_vertices[(i + 1) % size_tmp][0]
-                p_end.y = find_vertices[(i + 1) % size_tmp][1]
-                msg_marker_searching_rect.points.append(p_end)
-            self.marker_searching_rect_publisher.publish(msg_marker_searching_rect)
+            # 排除障碍物点
+            is_obstacle_index = [
+                self.check_point_is_free(costmap, (x, y), 2)
+                for x, y in boundary_points_pixel
+            ]
+            search_posestamped_list = np.array(search_posestamped_list)[is_obstacle_index]
 
-            # 在当前搜索区域内找避让点
-            search_posestamped_list = self.select_points_in_parallelogram(find_vertices, 0.15, k)
-            self.get_logger().info(f'search_posestamped length: {len(search_posestamped_list)}')
+            self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个候选点')
 
-            if len(search_posestamped_list) > 0:
-                boundary_points = np.array([
-                    (pose.pose.position.x, pose.pose.position.y)
-                    for pose in search_posestamped_list
+            for avoidance_pose in search_posestamped_list:
+                robot_point_pixel = (
+                    np.array([robot_x, robot_y]) - np.array([origin_x, origin_y])
+                ) / resolution
+                robot_point_pixel[0] = np.clip(robot_point_pixel[0], 0, width - 1)
+                robot_point_pixel[1] = np.clip(robot_point_pixel[1], 0, height - 1)
+                robot_x_p = int(robot_point_pixel[0])
+                robot_y_p = int(robot_point_pixel[1])
+
+                point = np.array([
+                    avoidance_pose.pose.position.x,
+                    avoidance_pose.pose.position.y
                 ])
-                boundary_points_pixel = (boundary_points - np.array([origin_x, origin_y])) / resolution
-                boundary_points_pixel[:, 0] = np.clip(boundary_points_pixel[:, 0], 0, width - 1)
-                boundary_points_pixel[:, 1] = np.clip(boundary_points_pixel[:, 1], 0, height - 1)
+                point_pixel = (point - np.array([origin_x, origin_y])) / resolution
+                point_pixel[0] = np.clip(point_pixel[0], 0, width - 1)
+                point_pixel[1] = np.clip(point_pixel[1], 0, height - 1)
+                point_x_p = int(point_pixel[0])
+                point_y_p = int(point_pixel[1])
 
-                self.get_logger().info(f'一共{len(boundary_points)}个候选避让点')
-
-                # 排除障碍物点
-                is_obstacle_index = [
-                    self.check_point_is_free(costmap, (x, y), 2)
-                    for x, y in boundary_points_pixel
-                ]
-                search_posestamped_list = np.array(search_posestamped_list)[is_obstacle_index]
-
-                self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个候选点')
-
-                for avoidance_pose in search_posestamped_list:
-                    robot_point_pixel = (
-                        np.array([robot_x, robot_y]) - np.array([origin_x, origin_y])
-                    ) / resolution
-                    robot_point_pixel[0] = np.clip(robot_point_pixel[0], 0, width - 1)
-                    robot_point_pixel[1] = np.clip(robot_point_pixel[1], 0, height - 1)
-                    robot_x_p = int(robot_point_pixel[0])
-                    robot_y_p = int(robot_point_pixel[1])
-
-                    point = np.array([
+                if self.check_path_is_free(costmap, (robot_x_p, robot_y_p), (point_x_p, point_y_p)):
+                    self.get_logger().info('机器人到当前点的连线满足')
+                    # 检查候选点处 footprint 是否安全
+                    pose_yaw = euler_from_quaternion([
+                        avoidance_pose.pose.orientation.x,
+                        avoidance_pose.pose.orientation.y,
+                        avoidance_pose.pose.orientation.z,
+                        avoidance_pose.pose.orientation.w
+                    ])[2]
+                    if not self.check_footprint_at_pose(
+                        costmap,
                         avoidance_pose.pose.position.x,
-                        avoidance_pose.pose.position.y
-                    ])
-                    point_pixel = (point - np.array([origin_x, origin_y])) / resolution
-                    point_pixel[0] = np.clip(point_pixel[0], 0, width - 1)
-                    point_pixel[1] = np.clip(point_pixel[1], 0, height - 1)
-                    point_x_p = int(point_pixel[0])
-                    point_y_p = int(point_pixel[1])
+                        avoidance_pose.pose.position.y,
+                        pose_yaw,
+                        origin_x, origin_y, resolution, width, height
+                    ):
+                        self.get_logger().info('候选点处footprint与障碍物重叠，跳过')
+                        continue
 
-                    bresenham_point = self.bresenham(
-                        robot_x_p, robot_y_p,
-                        point_x_p, point_y_p,
-                        costmap
-                    )
-                    bresenham_point_value = np.array([
-                        costmap[p[1], p[0]] for p in bresenham_point
-                    ])
+                    # 调用服务判断车辆是否能通过
+                    avoidance_pose_msg = IsCarPassable.Request()
+                    avoidance_pose_msg.robot_pose = avoidance_pose
+                    avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
+                    avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
+                    start_time = time.time()
+                    check_result = self.check_avoidance(avoidance_pose_msg)
+                    end_time = time.time()
+                    self.get_logger().info(f'check_avoidance result: {check_result}, time: {end_time - start_time:.3f}s')
 
-                    if (bresenham_point_value <= 253).all():
-                        self.get_logger().info('机器人到当前点的连线满足')
-                        # 检查候选点处 footprint 是否安全
-                        pose_yaw = euler_from_quaternion([
-                            avoidance_pose.pose.orientation.x,
-                            avoidance_pose.pose.orientation.y,
-                            avoidance_pose.pose.orientation.z,
-                            avoidance_pose.pose.orientation.w
-                        ])[2]
-                        if not self.check_footprint_at_pose(
-                            costmap,
-                            avoidance_pose.pose.position.x,
-                            avoidance_pose.pose.position.y,
-                            pose_yaw,
-                            origin_x, origin_y, resolution, width, height
-                        ):
-                            self.get_logger().info('候选点处footprint与障碍物重叠，跳过')
-                            continue
-
-                        # 调用服务判断车辆是否能通过
-                        avoidance_pose_msg = IsCarPassable.Request()
-                        avoidance_pose_msg.robot_pose = avoidance_pose
-                        avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
-                        avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
-                        start_time = time.time()
-                        check_result = self.check_avoidance(avoidance_pose_msg)
-                        end_time = time.time()
-                        self.get_logger().info(f'check_avoidance result: {check_result}, time: {end_time - start_time:.3f}s')
-
-                        if check_result and (end_time - start_time) < self.check_service_max_time:
-                            avoidance_pose_result = avoidance_pose
-                            return avoidance_pose_result
-                        else:
-                            self.get_logger().info('服务判断该点不可通过或超时，继续搜索')
-                            continue
+                    if check_result and (end_time - start_time) < self.check_service_max_time:
+                        avoidance_pose_result = avoidance_pose
+                        return avoidance_pose_result
                     else:
-                        self.get_logger().info('机器人到当前点的连线不满足')
+                        self.get_logger().info('服务判断该点不可通过或超时，继续搜索')
+                        continue
+                else:
+                    self.get_logger().info('机器人到当前点的连线不满足')
 
-            # 当前搜索区域没找到，往内部挪一步
-            self.get_logger().info(f'当前搜索区域未找到，往内部挪 {self.inside_step}m')
-            current_offset -= self.inside_step
-
-        # 循环结束，没找到
-        self.get_logger().info('所有搜索区域都没有找到避让点')
+        # 单次搜索结束，没找到
+        self.get_logger().info('当前搜索区域没有找到避让点')
         return None
 
     def get_yaw_from_pose(self, pose_stamped):
@@ -1316,6 +1306,18 @@ class CarAvoidancePointActionServer(Node):
         return new_angle
 
     
+    def check_path_is_free(self, costmap, robot_pixel, target_pixel, threshold=253):
+        """
+        检查机器人到候选点的连线上是否无障碍
+        """
+        bresenham_points = self.bresenham(
+            robot_pixel[0], robot_pixel[1],
+            target_pixel[0], target_pixel[1],
+            costmap
+        )
+        values = np.array([costmap[p[1], p[0]] for p in bresenham_points])
+        return bool((values <= threshold).all())
+
     def bresenham(self, current_x, current_y, target_x, target_y, map_array):
         """
         提取两点连线上的所有像素点

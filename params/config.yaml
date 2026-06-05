@@ -5,17 +5,19 @@ find_free_space_action_server:
     topic_name_footprint: '/global_costmap/published_footprint'
     search_interval: 0.5
 
-    # search_radius_min: 3.0  # 改成从docker-compose.yaml文件动态获取
-    # search_radius_max: 4.0
-    # outside_min: 0.0
-    # outside_max: 0.5
+    search_radius_min: 3.0
+    search_radius_max: 3.3      # 长度方向只有0.3m
+    outside_min: 0.2
+    outside_max: 0.35            # 宽度方向只有0.15m
+    search_point_interval: 0.15  # 采样间隔0.15m → 长度0.3/0.15=2点，宽度0.15/0.15=1点
     search_radius_extra_dis: 2.0 # 前避车时额外增加的寻找距离
-    
+
     check_service_max_time: 1.0
     distance_extend_outside: 1.1
     inside_step: 0.1  # 每次往通道内部挪的步长（m），可被环境变量 GARAGE_FIND_PARKING_POINT_INSIDE_STEP 覆盖
     show_global_costmap_raw_cv2: false
     show_global_costmap_raw_colored_cv2: false
+    max_inward_offset: 1.5
 
 
 
