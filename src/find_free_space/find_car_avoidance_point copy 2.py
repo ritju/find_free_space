@@ -1438,4 +1438,8 @@ def main(args=None):
 
 
 if __name__ == '__main__':
+<<<<<<< HEAD:src/find_free_space/find_car_avoidance_point copy 2.py
     main()
+=======
+    main()
+>>>>>>> 096338bc25e37b825cfb79e1acfba6108985af85:find_free_space/find_car_avoidance_point.py
