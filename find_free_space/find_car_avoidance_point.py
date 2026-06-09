@@ -846,17 +846,8 @@ class CarAvoidancePointActionServer(Node):
 
             self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个候选点')
 
+            skipped_special_terrain_count = 0
             for avoidance_pose in search_posestamped_list:
-                # 禁扫区检查
-                if self._is_point_in_special_terrain(
-                    avoidance_pose.pose.position.x,
-                    avoidance_pose.pose.position.y
-                ):
-                    self.get_logger().info(
-                        f'候选停靠点({avoidance_pose.pose.position.x:.3f}, '
-                        f'{avoidance_pose.pose.position.y:.3f})位于禁扫区内，跳过'
-                    )
-                    continue
                 robot_point_pixel = (
                     np.array([robot_x, robot_y]) - np.array([origin_x, origin_y])
                 ) / resolution
@@ -904,6 +895,14 @@ class CarAvoidancePointActionServer(Node):
                         self.get_logger().info('移动路径上footprint遍历区域与障碍物重叠，跳过')
                         continue
 
+                    # 禁扫区检查
+                    if self._is_point_in_special_terrain(
+                        avoidance_pose.pose.position.x,
+                        avoidance_pose.pose.position.y
+                    ):
+                        skipped_special_terrain_count += 1
+                        continue
+
                     # 调用服务判断车辆是否能通过
                     avoidance_pose_msg = IsCarPassable.Request()
                     avoidance_pose_msg.robot_pose = avoidance_pose
@@ -922,6 +921,11 @@ class CarAvoidancePointActionServer(Node):
                         continue
                 else:
                     self.get_logger().info('机器人到当前点的连线不满足')
+
+        if skipped_special_terrain_count > 0:
+            self.get_logger().info(
+                f'共{skipped_special_terrain_count}个候选点因位于禁扫区内被跳过'
+            )
 
         # 单次搜索结束，没找到
         self.get_logger().info('当前搜索区域没有找到避让点')
