@@ -7,6 +7,7 @@ from rclpy.action import ActionServer,GoalResponse,CancelResponse
 from rclpy.qos import qos_profile_sensor_data, DurabilityPolicy,ReliabilityPolicy,QoSProfile,HistoryPolicy
 from geometry_msgs.msg import PoseStamped, Pose, Quaternion, Point
 from capella_ros_msg.srv import IsCarPassable
+from garage_utils_msgs.msg import Polygons
 import tf2_ros
 import numpy as np
 import time
@@ -119,6 +120,17 @@ class CarAvoidancePointActionServer(Node):
         # 检查pose能否避让的服务
         self.check_avoidance_service = self.create_client(IsCarPassable, '/check_car_passable',callback_group=callback_gp3)
 
+        # 禁扫区多边形（/cleaning_tool_retraction_areas）
+        self.special_terrain_polygons = None
+        qos_transient = QoSProfile(depth=1)
+        qos_transient.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.special_terrain_sub = self.create_subscription(
+            Polygons,
+            '/cleaning_tool_retraction_areas',
+            self._special_terrain_callback,
+            qos_transient,
+        )
+
     def init_params(self):
         self.declare_parameter("topic_name_global_costmap", "")          # 全局代价地图话题名
         self.declare_parameter("service_name_check_car_passble", "")     # 车辆可通过性检查服务名
@@ -137,8 +149,8 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter('show_global_costmap_raw_colored_cv2', False)  # 显示彩色代价地图
 
         self.declare_parameter("search_point_interval", 0.15)            # 下采样的阈值，越大点越少
-        self.declare_parameter('footprint_sweep_long_step', 999.0)       # 扫掠检查长边步长(m)，默认999.0(>footprint长边)=不启用;设<=长边才启用;设0=全像素填充
-        self.declare_parameter('footprint_sweep_short_step', 999.0)      # 扫掠检查短边步长(m)，默认999.0(>footprint短边)=只扫两条长边;设<=短边=网格采样;设0=全像素填充
+        self.declare_parameter('footprint_sweep_long_step', 0.0)       # 扫掠检查长边步长(m)，默认999.0(>footprint长边)=不启用;设<=长边才启用;设0=全像素填充
+        self.declare_parameter('footprint_sweep_short_step', 0.0)      # 扫掠检查短边步长(m)，默认999.0(>footprint短边)=只扫两条长边;设<=短边=网格采样;设0=全像素填充
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -835,6 +847,16 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个候选点')
 
             for avoidance_pose in search_posestamped_list:
+                # 禁扫区检查
+                if self._is_point_in_special_terrain(
+                    avoidance_pose.pose.position.x,
+                    avoidance_pose.pose.position.y
+                ):
+                    self.get_logger().info(
+                        f'候选停靠点({avoidance_pose.pose.position.x:.3f}, '
+                        f'{avoidance_pose.pose.position.y:.3f})位于禁扫区内，跳过'
+                    )
+                    continue
                 robot_point_pixel = (
                     np.array([robot_x, robot_y]) - np.array([origin_x, origin_y])
                 ) / resolution
@@ -984,6 +1006,27 @@ class CarAvoidancePointActionServer(Node):
         # else:
         #     self.get_logger().info('该点无法避障。')
         #     return False
+
+    def _special_terrain_callback(self, msg):
+        self.special_terrain_polygons = msg.polygons
+        self.get_logger().info(
+            f'收到禁扫区: {len(msg.polygons)}个区域', once=True
+        )
+
+    def _is_point_in_special_terrain(self, x, y):
+        """检查点(x, y)是否在任何禁扫区多边形内"""
+        if self.special_terrain_polygons is None:
+            return False
+        for polygon in self.special_terrain_polygons:
+            if not polygon.points or len(polygon.points) < 3:
+                continue
+            poly_pts = np.array(
+                [[p.x, p.y] for p in polygon.points], dtype=np.float32
+            )
+            result = cv2.pointPolygonTest(poly_pts, (float(x), float(y)), False)
+            if result >= 0:
+                return True
+        return False
 
     # 判断机器人是否在某个边框内
     def is_point_inside_parallelogram(self, robot_x, robot_y, vertices):

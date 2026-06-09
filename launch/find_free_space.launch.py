@@ -37,8 +37,8 @@ def generate_launch_description():
         outside_min = [0.8]
         outside_max = [1.0]
         search_point_interval = [0.15]
-        footprint_sweep_long_step = [999.0]
-        footprint_sweep_short_step = [999.0]
+        footprint_sweep_long_step = [0.0]
+        footprint_sweep_short_step = [0.0]
 
         get_environment_value(search_radius_min, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MIN', 3.0)
         get_environment_value(search_radius_max, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MAX', 4.0)
