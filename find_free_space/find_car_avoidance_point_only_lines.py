@@ -7,6 +7,7 @@ from rclpy.action import ActionServer,GoalResponse,CancelResponse
 from rclpy.qos import qos_profile_sensor_data, DurabilityPolicy,ReliabilityPolicy,QoSProfile,HistoryPolicy
 from geometry_msgs.msg import PoseStamped, Pose, Quaternion, Point
 from capella_ros_msg.srv import IsCarPassable
+from garage_utils_msgs.msg import Polygons
 import tf2_ros
 import numpy as np
 import time
@@ -119,6 +120,17 @@ class CarAvoidancePointActionServer(Node):
         # 检查pose能否避让的服务
         self.check_avoidance_service = self.create_client(IsCarPassable, '/check_car_passable',callback_group=callback_gp3)
 
+        # 禁扫区多边形（/cleaning_tool_retraction_areas）
+        self.special_terrain_polygons = None
+        qos_transient = QoSProfile(depth=1)
+        qos_transient.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.special_terrain_sub = self.create_subscription(
+            Polygons,
+            '/cleaning_tool_retraction_areas',
+            self._special_terrain_callback,
+            qos_transient,
+        )
+
     def init_params(self):
         self.declare_parameter("topic_name_global_costmap", "")          # 全局代价地图话题名
         self.declare_parameter("service_name_check_car_passble", "")     # 车辆可通过性检查服务名
@@ -137,6 +149,8 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter('show_global_costmap_raw_colored_cv2', False)  # 显示彩色代价地图
 
         self.declare_parameter("search_point_interval", 0.15)            # 下采样的阈值，越大点越少
+        self.declare_parameter('footprint_sweep_long_step', 0.0)       # 扫掠检查长边步长(m)，默认999.0(>footprint长边)=不启用;设<=长边才启用;设0=全像素填充
+        self.declare_parameter('footprint_sweep_short_step', 0.0)      # 扫掠检查短边步长(m)，默认999.0(>footprint短边)=只扫两条长边;设<=短边=网格采样;设0=全像素填充
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -154,6 +168,8 @@ class CarAvoidancePointActionServer(Node):
         self.inward_offset = self.get_parameter('inward_offset').value
         self.max_inward_offset = self.get_parameter('max_inward_offset').value
         self.search_point_interval = self.get_parameter("search_point_interval").value
+        self.footprint_sweep_long_step = self.get_parameter('footprint_sweep_long_step').value
+        self.footprint_sweep_short_step = self.get_parameter('footprint_sweep_short_step').value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
@@ -171,6 +187,8 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'inward_offset: {self.inward_offset}')
         self.get_logger().info(f'max_inward_offset: {self.max_inward_offset}')
         self.get_logger().info(f'search_point_interval: {self.search_point_interval}')
+        self.get_logger().info(f'footprint_sweep_long_step: {self.footprint_sweep_long_step}  # 默认999.0=不启用扫掠检查')
+        self.get_logger().info(f'footprint_sweep_short_step: {self.footprint_sweep_short_step} # 默认999.0=只扫两条长边')
     
     def footprint_sub_callback(self, msg):
         points = msg.polygon.points
@@ -828,6 +846,7 @@ class CarAvoidancePointActionServer(Node):
 
             self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个候选点')
 
+            skipped_special_terrain_count = 0
             for avoidance_pose in search_posestamped_list:
                 robot_point_pixel = (
                     np.array([robot_x, robot_y]) - np.array([origin_x, origin_y])
@@ -866,6 +885,24 @@ class CarAvoidancePointActionServer(Node):
                         self.get_logger().info('候选点处footprint与障碍物重叠，跳过')
                         continue
 
+                    # 新增：遍历矩形检查
+                    if not self.check_footprint_sweep(
+                        costmap, self.robot_pose, avoidance_pose, pose_yaw,
+                        self.footprint_sweep_long_step,
+                        self.footprint_sweep_short_step,
+                        origin_x, origin_y, resolution, width, height
+                    ):
+                        self.get_logger().info('移动路径上footprint遍历区域与障碍物重叠，跳过')
+                        continue
+
+                    # 禁扫区检查
+                    if self._is_point_in_special_terrain(
+                        avoidance_pose.pose.position.x,
+                        avoidance_pose.pose.position.y
+                    ):
+                        skipped_special_terrain_count += 1
+                        continue
+
                     # 调用服务判断车辆是否能通过
                     avoidance_pose_msg = IsCarPassable.Request()
                     avoidance_pose_msg.robot_pose = avoidance_pose
@@ -884,6 +921,11 @@ class CarAvoidancePointActionServer(Node):
                         continue
                 else:
                     self.get_logger().info('机器人到当前点的连线不满足')
+
+        if skipped_special_terrain_count > 0:
+            self.get_logger().info(
+                f'共{skipped_special_terrain_count}个候选点因位于禁扫区内被跳过'
+            )
 
         # 单次搜索结束，没找到
         self.get_logger().info('当前搜索区域没有找到避让点')
@@ -968,6 +1010,27 @@ class CarAvoidancePointActionServer(Node):
         # else:
         #     self.get_logger().info('该点无法避障。')
         #     return False
+
+    def _special_terrain_callback(self, msg):
+        self.special_terrain_polygons = msg.polygons
+        self.get_logger().info(
+            f'收到禁扫区: {len(msg.polygons)}个区域', once=True
+        )
+
+    def _is_point_in_special_terrain(self, x, y):
+        """检查点(x, y)是否在任何禁扫区多边形内"""
+        if self.special_terrain_polygons is None:
+            return False
+        for polygon in self.special_terrain_polygons:
+            if not polygon.points or len(polygon.points) < 3:
+                continue
+            poly_pts = np.array(
+                [[p.x, p.y] for p in polygon.points], dtype=np.float32
+            )
+            result = cv2.pointPolygonTest(poly_pts, (float(x), float(y)), False)
+            if result >= 0:
+                return True
+        return False
 
     # 判断机器人是否在某个边框内
     def is_point_inside_parallelogram(self, robot_x, robot_y, vertices):
@@ -1273,6 +1336,198 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'check_footprint_at_pose: 共检查 {total_points} 个栅格点, safe={is_safe}')
 
         return is_safe
+
+    def check_footprint_sweep(self, costmap, robot_pose, target_pose, target_yaw,
+                              long_edge_step, short_edge_step,
+                              origin_x, origin_y, resolution, width, height, threshold=253):
+        """
+        检查机器人到候选点的扫掠矩形区域是否安全
+        """
+        if not self.footprint_vertices:
+            return True
+
+        # 计算 footprint 边长
+        edge_lengths = []
+        for i in range(len(self.footprint_vertices)):
+            v1 = np.array(self.footprint_vertices[i])
+            v2 = np.array(self.footprint_vertices[(i + 1) % len(self.footprint_vertices)])
+            edge_lengths.append(np.linalg.norm(v2 - v1))
+        footprint_long_edge = max(edge_lengths)
+        footprint_short_edge = min(edge_lengths)
+
+        # 如果 long_step 大于 footprint 长边，不启用
+        if long_edge_step > footprint_long_edge:
+            return True
+
+        #  生成两个 footprint 的世界坐标角点
+        cos_yaw = math.cos(target_yaw)
+        sin_yaw = math.sin(target_yaw)
+
+        robot_vertices = []
+        for vx, vy in self.footprint_vertices:
+            rx = vx * cos_yaw - vy * sin_yaw
+            ry = vx * sin_yaw + vy * cos_yaw
+            wx = robot_pose.pose.position.x + rx
+            wy = robot_pose.pose.position.y + ry
+            robot_vertices.append((wx, wy))
+
+        target_vertices = []
+        for vx, vy in self.footprint_vertices:
+            rx = vx * cos_yaw - vy * sin_yaw
+            ry = vx * sin_yaw + vy * cos_yaw
+            wx = target_pose.pose.position.x + rx
+            wy = target_pose.pose.position.y + ry
+            target_vertices.append((wx, wy))
+
+        # 找到最远的两条不重复连线（X 形状的四个端点）
+        best_pair = None
+        best_total_distance = 0
+
+        for i in range(4):
+            for j in range(4):
+                for k in range(4):
+                    for l in range(4):
+                        if i == k or j == l:
+                            continue
+                        dist1 = math.sqrt(
+                            (target_vertices[j][0] - robot_vertices[i][0]) ** 2 +
+                            (target_vertices[j][1] - robot_vertices[i][1]) ** 2
+                        )
+                        dist2 = math.sqrt(
+                            (target_vertices[l][0] - robot_vertices[k][0]) ** 2 +
+                            (target_vertices[l][1] - robot_vertices[k][1]) ** 2
+                        )
+                        total = dist1 + dist2
+                        if total > best_total_distance:
+                            best_total_distance = total
+                            best_pair = (
+                                (robot_vertices[i], target_vertices[j]),
+                                (robot_vertices[k], target_vertices[l])
+                            )
+
+        if best_pair is None:
+            return True
+
+        # X 的四个端点就是扫掠矩形的四个角点
+        sweep_vertices = [
+            best_pair[0][0],  # 机器人角点1
+            best_pair[0][1],  # 候选点角点1
+            best_pair[1][1],  # 候选点角点2
+            best_pair[1][0],  # 机器人角点2
+        ]
+
+        # 保证顶点按凸多边形顺序排列，cv2.fillConvexPoly 需要凸多边形顶点顺序
+        sweep_vertices = self.sort_quadrilateral_vertices(sweep_vertices)
+
+        # 建立局部坐标系
+        dx = target_pose.pose.position.x - robot_pose.pose.position.x
+        dy = target_pose.pose.position.y - robot_pose.pose.position.y
+        move_distance = math.sqrt(dx ** 2 + dy ** 2)
+
+        if move_distance < 1e-6:
+            return True
+
+        long_axis_x = dx / move_distance
+        long_axis_y = dy / move_distance
+        short_axis_x = -long_axis_y
+        short_axis_y = long_axis_x
+
+        #  将四个角点投影到局部坐标系，找到采样范围
+        local_coords = []
+        for wx, wy in sweep_vertices:
+            offset_x = wx - robot_pose.pose.position.x
+            offset_y = wy - robot_pose.pose.position.y
+            local_long = offset_x * long_axis_x + offset_y * long_axis_y
+            local_short = offset_x * short_axis_x + offset_y * short_axis_y
+            local_coords.append((local_long, local_short))
+
+        long_min = min(c[0] for c in local_coords)
+        long_max = max(c[0] for c in local_coords)
+        short_min = min(c[1] for c in local_coords)
+        short_max = max(c[1] for c in local_coords)
+
+        # 任一步长为 0，检查所有点
+        if short_edge_step == 0 or long_edge_step == 0:
+            pixel_vertices = []
+            for wx, wy in sweep_vertices:
+                px = int((wx - origin_x) / resolution)
+                py = int((wy - origin_y) / resolution)
+                px = max(0, min(width - 1, px))
+                py = max(0, min(height - 1, py))
+                pixel_vertices.append([px, py])
+
+            mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.fillConvexPoly(mask, np.array(pixel_vertices, dtype=np.int32), 255)
+            ys, xs = np.where(mask == 255)
+            if len(xs) == 0:
+                return True
+            values = costmap[ys, xs]
+            is_safe = bool(np.all(values <= threshold))
+            self.get_logger().info(f'check_footprint_sweep (filled): {len(xs)} pixels, safe={is_safe}')
+            return is_safe
+
+        # short_step > 短边，只检查两条长边
+        if short_edge_step > footprint_short_edge:
+            pixel_vertices = []
+            for wx, wy in sweep_vertices:
+                px = int((wx - origin_x) / resolution)
+                py = int((wy - origin_y) / resolution)
+                px = max(0, min(width - 1, px))
+                py = max(0, min(height - 1, py))
+                pixel_vertices.append((px, py))
+
+            # 识别两条长边
+            edge_lengths_px = []
+            for i in range(4):
+                p1 = pixel_vertices[i]
+                p2 = pixel_vertices[(i + 1) % 4]
+                length = math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
+                edge_lengths_px.append((i, length))
+            sorted_edges = sorted(edge_lengths_px, key=lambda x: -x[1])
+            long_edge_1_idx = sorted_edges[0][0]
+            long_edge_2_idx = sorted_edges[1][0]
+
+            # bresenham 提取两条长边的像素
+            p1 = pixel_vertices[long_edge_1_idx]
+            p2 = pixel_vertices[(long_edge_1_idx + 1) % 4]
+            edge1_points = self.bresenham(p1[0], p1[1], p2[0], p2[1], costmap)
+
+            p3 = pixel_vertices[long_edge_2_idx]
+            p4 = pixel_vertices[(long_edge_2_idx + 1) % 4]
+            edge2_points = self.bresenham(p3[0], p3[1], p4[0], p4[1], costmap)
+
+            all_points = np.vstack([edge1_points, edge2_points])
+            values = costmap[all_points[:, 1], all_points[:, 0]]
+            is_safe = bool((values <= threshold).all())
+            self.get_logger().info(f'check_footprint_sweep (edges only): {len(all_points)} pixels, safe={is_safe}')
+            return is_safe
+
+        # 9. 策略3：正常下采样
+        robot_x = robot_pose.pose.position.x
+        robot_y = robot_pose.pose.position.y
+
+        long_current = long_min
+        while long_current <= long_max:
+            short_current = short_min
+            while short_current <= short_max:
+                wx = robot_x + long_current * long_axis_x + short_current * short_axis_x
+                wy = robot_y + long_current * long_axis_y + short_current * short_axis_y
+
+                px = int((wx - origin_x) / resolution)
+                py = int((wy - origin_y) / resolution)
+                px = max(0, min(width - 1, px))
+                py = max(0, min(height - 1, py))
+
+                if costmap[py, px] > threshold:
+                    self.get_logger().info(
+                        f'check_footprint_sweep (sampled): obstacle at ({wx:.2f}, {wy:.2f})')
+                    return False
+
+                short_current += short_edge_step
+            long_current += long_edge_step
+
+        self.get_logger().info('check_footprint_sweep (sampled): safe')
+        return True
 
     # 判断两个点之间的角度差
     def angle_diff(self, a, b, use_abs=True):

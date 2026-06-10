@@ -1,0 +1,29 @@
+[33m888871e[m[33m ([m[1;36mHEAD -> [m[1;32m2.0[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;31morigin/2.0[m[33m)[m HEAD@{0}: reset: moving to HEAD~1
+[33me746fb1[m HEAD@{1}: reset: moving to HEAD~1
+[33m5bd4dcb[m HEAD@{2}: commit: 增加了禁行区的逻辑
+[33me746fb1[m HEAD@{3}: commit: 增加了禁行区的逻辑
+[33m888871e[m[33m ([m[1;36mHEAD -> [m[1;32m2.0[m[33m, [m[1;31morigin/HEAD[m[33m, [m[1;31morigin/2.0[m[33m)[m HEAD@{4}: commit: 增加了用机器人轮廓检查的功能
+[33m7c9fd80[m HEAD@{5}: commit: 增加了几个可以控制搜索框的参数
+[33m8f56c63[m HEAD@{6}: commit: 合并远程更新
+[33mfc834a9[m HEAD@{7}: commit (merge): 合并远程更新
+[33md1f8dba[m HEAD@{8}: commit: 修改了注释的服务，以及增加了对footprint的判断
+[33m517a644[m HEAD@{9}: commit: 往机器人前方五米发一个车辆的信息的点
+[33m4bb52ae[m HEAD@{10}: commit: test是直接创建子线程直接用完就删，demo是用完手动删
+[33m85d7ed6[m HEAD@{11}: checkout: moving from psutil to 2.0
+[33m9d424ea[m[33m ([m[1;31morigin/psutil[m[33m, [m[1;32mpsutil[m[33m)[m HEAD@{12}: checkout: moving from 2.0 to psutil
+[33m85d7ed6[m HEAD@{13}: commit: 日志
+[33m8728528[m HEAD@{14}: commit: 增加了psutil依赖
+[33m34390a8[m HEAD@{15}: checkout: moving from psutil to 2.0
+[33m9d424ea[m[33m ([m[1;31morigin/psutil[m[33m, [m[1;32mpsutil[m[33m)[m HEAD@{16}: checkout: moving from 2.0 to psutil
+[33m34390a8[m HEAD@{17}: commit: 测试cpu的占用的
+[33ma14ae18[m HEAD@{18}: checkout: moving from psutil to 2.0
+[33m9d424ea[m[33m ([m[1;31morigin/psutil[m[33m, [m[1;32mpsutil[m[33m)[m HEAD@{19}: checkout: moving from 2.0 to psutil
+[33ma14ae18[m HEAD@{20}: commit: 优化了cpu在tf上的占用过高问题
+[33mc8d15e0[m HEAD@{21}: checkout: moving from psutil to 2.0
+[33m9d424ea[m[33m ([m[1;31morigin/psutil[m[33m, [m[1;32mpsutil[m[33m)[m HEAD@{22}: commit: 获取cpu占用的版本
+[33m9f55b14[m HEAD@{23}: checkout: moving from 2.0 to psutil
+[33mc8d15e0[m HEAD@{24}: checkout: moving from psutil to 2.0
+[33m9f55b14[m HEAD@{25}: commit: 单独的查看cpu占用的版本
+[33mc8d15e0[m HEAD@{26}: checkout: moving from 2.0 to psutil
+[33mc8d15e0[m HEAD@{27}: commit: 优化程序
+[33m6f71919[m HEAD@{28}: clone: from https://github.com/ritju/find_free_space

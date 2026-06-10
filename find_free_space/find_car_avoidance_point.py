@@ -79,6 +79,12 @@ class CarAvoidancePointActionServer(Node):
             marker_qos
         )
 
+        self.marker_special_terrain_publisher = self.create_publisher(
+            Marker,
+            "marker_special_terrain",
+            marker_qos
+        )
+
         callback_gp1 = MutuallyExclusiveCallbackGroup()
         callback_gp2 = MutuallyExclusiveCallbackGroup()
         callback_gp3 = MutuallyExclusiveCallbackGroup()
@@ -846,8 +852,35 @@ class CarAvoidancePointActionServer(Node):
 
             self.get_logger().info(f'排除障碍物点后还剩{len(search_posestamped_list)}个候选点')
 
-            skipped_special_terrain_count = 0
             for avoidance_pose in search_posestamped_list:
+                # 禁扫区检查
+                if self._is_point_in_special_terrain(
+                    avoidance_pose.pose.position.x,
+                    avoidance_pose.pose.position.y
+                ):
+                    self.get_logger().info(
+                        f'候选停靠点({avoidance_pose.pose.position.x:.3f}, '
+                        f'{avoidance_pose.pose.position.y:.3f})在禁扫区内，跳过'
+                    )
+                    continue
+
+                # 新增: footprint 级别禁扫区检查
+                pose_yaw_for_terrain = euler_from_quaternion([
+                    avoidance_pose.pose.orientation.x,
+                    avoidance_pose.pose.orientation.y,
+                    avoidance_pose.pose.orientation.z,
+                    avoidance_pose.pose.orientation.w
+                ])[2]
+                if self._is_footprint_in_special_terrain(
+                    avoidance_pose.pose.position.x,
+                    avoidance_pose.pose.position.y,
+                    pose_yaw_for_terrain
+                ):
+                    self.get_logger().info(
+                        f'候选停靠点({avoidance_pose.pose.position.x:.3f}, '
+                        f'{avoidance_pose.pose.position.y:.3f})的footprint与禁扫区重叠，跳过'
+                    )
+                    continue
                 robot_point_pixel = (
                     np.array([robot_x, robot_y]) - np.array([origin_x, origin_y])
                 ) / resolution
@@ -895,14 +928,6 @@ class CarAvoidancePointActionServer(Node):
                         self.get_logger().info('移动路径上footprint遍历区域与障碍物重叠，跳过')
                         continue
 
-                    # 禁扫区检查
-                    if self._is_point_in_special_terrain(
-                        avoidance_pose.pose.position.x,
-                        avoidance_pose.pose.position.y
-                    ):
-                        skipped_special_terrain_count += 1
-                        continue
-
                     # 调用服务判断车辆是否能通过
                     avoidance_pose_msg = IsCarPassable.Request()
                     avoidance_pose_msg.robot_pose = avoidance_pose
@@ -921,11 +946,6 @@ class CarAvoidancePointActionServer(Node):
                         continue
                 else:
                     self.get_logger().info('机器人到当前点的连线不满足')
-
-        if skipped_special_terrain_count > 0:
-            self.get_logger().info(
-                f'共{skipped_special_terrain_count}个候选点因位于禁扫区内被跳过'
-            )
 
         # 单次搜索结束，没找到
         self.get_logger().info('当前搜索区域没有找到避让点')
@@ -1013,9 +1033,55 @@ class CarAvoidancePointActionServer(Node):
 
     def _special_terrain_callback(self, msg):
         self.special_terrain_polygons = msg.polygons
+        for idx, polygon in enumerate(msg.polygons):
+            pts_str = ', '.join([f'({p.x:.3f}, {p.y:.3f})' for p in polygon.points])
+            self.get_logger().info(
+                f'禁扫区[{idx}]: {pts_str}',
+                throttle_duration_sec=20.0
+            )
         self.get_logger().info(
             f'收到禁扫区: {len(msg.polygons)}个区域', once=True
         )
+
+        # 发布禁扫区 Marker 用于 rviz2 可视化
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.id = 10
+        marker.type = Marker.LINE_LIST
+        marker.scale.x = 0.05
+
+        if len(msg.polygons) == 0:
+            marker.action = Marker.DELETE
+            self.marker_special_terrain_publisher.publish(marker)
+            return
+
+        marker.action = Marker.ADD
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.color.a = 0.5
+
+        for polygon in msg.polygons:
+            pts = polygon.points
+            if len(pts) < 2:
+                continue
+            n = len(pts)
+            for i in range(n):
+                p1 = pts[i]
+                p2 = pts[(i + 1) % n]
+                point1 = Point()
+                point1.x = p1.x
+                point1.y = p1.y
+                point1.z = p1.z
+                marker.points.append(point1)
+                point2 = Point()
+                point2.x = p2.x
+                point2.y = p2.y
+                point2.z = p2.z
+                marker.points.append(point2)
+
+        self.marker_special_terrain_publisher.publish(marker)
 
     def _is_point_in_special_terrain(self, x, y):
         """检查点(x, y)是否在任何禁扫区多边形内"""
@@ -1030,6 +1096,46 @@ class CarAvoidancePointActionServer(Node):
             result = cv2.pointPolygonTest(poly_pts, (float(x), float(y)), False)
             if result >= 0:
                 return True
+        return False
+
+    def _is_footprint_in_special_terrain(self, x, y, yaw):
+        """检查机器人在(x, y, yaw)处时，footprint是否与任何禁扫区多边形重叠"""
+        if self.special_terrain_polygons is None or not self.footprint_vertices:
+            return False
+
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+
+        # 计算 footprint 在世界坐标系下的顶点
+        fp_world = []
+        for vx, vy in self.footprint_vertices:
+            wx = x + vx * cos_yaw - vy * sin_yaw
+            wy = y + vx * sin_yaw + vy * cos_yaw
+            fp_world.append([wx, wy])
+        fp_contour = np.array(fp_world, dtype=np.float32)
+
+        for polygon in self.special_terrain_polygons:
+            if not polygon.points or len(polygon.points) < 3:
+                continue
+            poly_pts = np.array(
+                [[p.x, p.y] for p in polygon.points], dtype=np.float32
+            )
+
+            # 检查1: footprint 任意顶点在禁扫区内
+            for pt in fp_world:
+                if cv2.pointPolygonTest(poly_pts, (pt[0], pt[1]), False) >= 0:
+                    return True
+
+            # 检查2: 禁扫区任意顶点在 footprint 内
+            for pt in poly_pts:
+                if cv2.pointPolygonTest(fp_contour, (float(pt[0]), float(pt[1])), False) >= 0:
+                    return True
+
+            # 检查3: 边是否相交（用 cv2 计算交集面积）
+            ret, intersection = cv2.intersectConvexConvex(fp_contour, poly_pts)
+            if ret > 0:
+                return True
+
         return False
 
     # 判断机器人是否在某个边框内
