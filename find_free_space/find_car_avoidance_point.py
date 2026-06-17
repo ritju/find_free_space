@@ -412,7 +412,12 @@ class CarAvoidancePointActionServer(Node):
             # goal_handle.abort()
             result = FindCarAvoidancePoint.Result()
             result.pose = avoidance_point
-            self.get_logger().info(f'成功找到避让点*****')
+        
+        
+            result.pose.pose.position.z = 10.0
+            
+            self.get_logger().info(f'成功找到避让点*****， z = 10 ')
+            
             return result
         else:
             self.get_logger().info(f'无法找到避让点')
