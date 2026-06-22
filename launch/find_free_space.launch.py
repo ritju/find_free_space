@@ -39,16 +39,18 @@ def generate_launch_description():
         search_point_interval = [0.15]
         footprint_sweep_long_step = [0.0]
         footprint_sweep_short_step = [0.0]
+        external_point_max_distance = [8.0]
 
-        get_environment_value(search_radius_min, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MIN', 3.0)
+        get_environment_value(search_radius_min, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MIN', 3.0)    # 搜素框的范围
         get_environment_value(search_radius_max, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MAX', 4.0)
-        get_environment_value(outside_min, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MIN', 0.0)
+        get_environment_value(outside_min, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MIN', 0.0)     # 搜素框的偏移范围
         get_environment_value(outside_max, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MAX', 0.5)
-        get_environment_value(search_point_interval, 'GARAGE_FIND_PARKING_POINT_SEARCH_POINT_INTERVAL', 0.15)
+        get_environment_value(search_point_interval, 'GARAGE_FIND_PARKING_POINT_SEARCH_POINT_INTERVAL', 0.15)    # 搜素框的下采样点
         # footprint_sweep_long_step: 默认999.0不启用; 设<=footprint长边才启用; 0=全像素填充==
         get_environment_value(footprint_sweep_long_step, 'GARAGE_FOOTPRINT_SWEEP_LONG_STEP', 0.0)
         # footprint_sweep_short_step: 默认999.0只扫两条长边; <=短边=网格采样; 0=全像素填充
         get_environment_value(footprint_sweep_short_step, 'GARAGE_FOOTPRINT_SWEEP_SHORT_STEP', 0.0)
+        get_environment_value(external_point_max_distance, 'GARAGE_FIND_PARKING_POINT_EXTERNAL_POINT_MAX_DISTANCE', 8.0)   # 最大的接收的点的距离
     
         return LaunchDescription([
                 Node(
@@ -64,6 +66,7 @@ def generate_launch_description():
                                     'outside_max': float(outside_max[0]),
                                     'search_point_interval': float(search_point_interval[0]),
                                     'footprint_sweep_long_step': float(footprint_sweep_long_step[0]),
-                                    'footprint_sweep_short_step': float(footprint_sweep_short_step[0])}],
+                                    'footprint_sweep_short_step': float(footprint_sweep_short_step[0]),
+                                    'external_point_max_distance': float(external_point_max_distance[0])}],
                 ),
         ])
