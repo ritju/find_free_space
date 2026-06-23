@@ -43,6 +43,7 @@ class CarAvoidancePointActionServer(Node):
         self.outside_max = 0.5
         self.footprint_vertices = []
         self.cv_window_name = 'Global Costmap Raw Colored'
+        self._static_check_info_logged = False
 
         self.init_params()
 
@@ -170,6 +171,7 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter('footprint_sweep_long_step', 0.0)       # 扫掠检查长边步长(m)，默认999.0(>footprint长边)=不启用;设<=长边才启用;设0=全像素填充
         self.declare_parameter('footprint_sweep_short_step', 0.0)      # 扫掠检查短边步长(m)，默认999.0(>footprint短边)=只扫两条长边;设<=短边=网格采样;设0=全像素填充
         self.declare_parameter('external_point_max_distance', 8.0)      # 外部点最大距离
+        self.declare_parameter('point_free_check_radius', 0.2)          # 候选点周围无障碍检查半径(m)
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -190,6 +192,7 @@ class CarAvoidancePointActionServer(Node):
         self.footprint_sweep_long_step = self.get_parameter('footprint_sweep_long_step').value
         self.footprint_sweep_short_step = self.get_parameter('footprint_sweep_short_step').value
         self.external_point_max_distance = self.get_parameter('external_point_max_distance').value
+        self.point_free_check_radius = self.get_parameter('point_free_check_radius').value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
@@ -210,6 +213,7 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'footprint_sweep_long_step: {self.footprint_sweep_long_step}  # 默认999.0=不启用扫掠检查')
         self.get_logger().info(f'footprint_sweep_short_step: {self.footprint_sweep_short_step} # 默认999.0=只扫两条长边')
         self.get_logger().info(f'external_point_max_distance: {self.external_point_max_distance}')
+        self.get_logger().info(f'point_free_check_radius: {self.point_free_check_radius}')
     
     def footprint_sub_callback(self, msg):
         points = msg.polygon.points
@@ -333,11 +337,6 @@ class CarAvoidancePointActionServer(Node):
     def dis_point_to_line2(self, x, y, p1_x, p1_y, p2_x, p2_y):
         """
         计算点到直线的垂直距离
-        参数：
-        p1_x, p1_y: 直线第一个点坐标
-        p2_x, p2_y: 直线第二个点坐标
-        x, y: 直线外点坐标
-        返回：点到直线的距离
         """
         # 处理直线为垂直线的情况
         if p1_x == p2_x:
@@ -410,27 +409,21 @@ class CarAvoidancePointActionServer(Node):
         if avoidance_point is not None:
             self.get_logger().info(f'成功找到避让点{avoidance_point}')
 
-            msg_marker_parking_point = Marker()
-            msg_marker_parking_point.header.frame_id = "map"
-            msg_marker_parking_point.header.stamp = self.get_clock().now().to_msg()
-            msg_marker_parking_point.id = 5
-            msg_marker_parking_point.type = Marker.ARROW
-            msg_marker_parking_point.action = Marker.ADD
-            msg_marker_parking_point.scale.x = 0.5
-            msg_marker_parking_point.scale.y = 0.2
-            msg_marker_parking_point.scale.z = 0.4
-            msg_marker_parking_point.color.r = 0.0
-            msg_marker_parking_point.color.g = 0.0
-            msg_marker_parking_point.color.b = 1.0
-            msg_marker_parking_point.color.a = 1.0
-            msg_marker_parking_point.pose = avoidance_point.pose
-            self.marker_parking_point_publisher.publish(msg_marker_parking_point)
+            # 发布最终避让点 marker
+            nearest_boundary = self.find_nearest_boundary(self.robot_pose, self.vertices)
+            car_pose = self.action_goal_handle_msg.car_pose.pose.position
+            self._publish_debug_markers(
+                self.robot_pose.pose.position.x,
+                self.robot_pose.pose.position.y,
+                car_pose,
+                nearest_boundary,
+                avoidance_point=avoidance_point
+            )
 
             goal_handle.succeed()
             # goal_handle.abort()
             result = FindCarAvoidancePoint.Result()
             result.pose = avoidance_point
-        
         
             result.pose.pose.position.z = 10.0
             
@@ -443,81 +436,12 @@ class CarAvoidancePointActionServer(Node):
             return FindCarAvoidancePoint.Result()
 
     def calculate_total_passage_width(self, vertices):
-        # 假设为长方形，长边为通行方向，短边为通道宽度
-        # p1 = np.array([vertices[0].x, vertices[0].y])
-        # p2 = np.array([vertices[1].x, vertices[1].y])
-        # p3 = np.array([vertices[2].x, vertices[2].y])
-        # p4 = np.array([vertices[3].x, vertices[3].y])
 
         # 计算每两点之间的长边
         side_length_list = [math.dist([vertices[i][0],vertices[i][1]],[vertices[(i + 1) % 4][0],vertices[(i + 1) % 4][1]]) for i in range(4)]
         distance = min(side_length_list)
-
         return distance
-
-    # 寻找距离机器人最近的长边
-    # def find_min_long_sides(self, cleaning_area_vertices, robot_position):
-    #     # 计算相邻顶点之间的距离
-    #     distances = []
-    #     for i in range(4):
-    #         x1, y1 = cleaning_area_vertices[i]
-    #         x2, y2 = cleaning_area_vertices[(i+1)%4]
-    #         distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-    #         distances.append(distance)
-        
-        # # 判断长边对
-        # if distances[0] > distances[1]:
-        #     # 长边是0-1和2-3
-        #     long_sides = [
-        #         (cleaning_area_vertices[0], cleaning_area_vertices[1]),
-        #         (cleaning_area_vertices[2], cleaning_area_vertices[3])
-        #     ]
-        # else:
-        #     # 长边是1-2和3-0
-        #     long_sides = [
-        #         (cleaning_area_vertices[1], cleaning_area_vertices[2]),
-        #         (cleaning_area_vertices[3], cleaning_area_vertices[0])
-        #     ]
-        
-        # # 计算点到线段的距离
-        # def point_to_line_distance(point, line):
-        #     x0, y0 = point
-        #     x1, y1 = line[0]
-        #     x2, y2 = line[1]
-            
-        #     # 线段长度的平方
-        #     l2 = (x2 - x1)**2 + (y2 - y1)**2
-            
-        #     # 如果线段实际上是一个点，返回到该点的距离
-        #     if l2 == 0:
-        #         return math.sqrt((x0 - x1)**2 + (y0 - y1)**2)
-            
-        #     # 考虑线段参数化表示：P(t) = (1-t)*A + t*B，计算投影参数t
-        #     t = ((x0 - x1) * (x2 - x1) + (y0 - y1) * (y2 - y1)) / l2
-            
-        #     if t < 0:
-        #         # 投影点在A之前，返回A到点的距离
-        #         return math.sqrt((x0 - x1)**2 + (y0 - y1)**2)
-        #     elif t > 1:
-        #         # 投影点在B之后，返回B到点的距离
-        #         return math.sqrt((x0 - x2)**2 + (y0 - y2)**2)
-        #     else:
-        #         # 投影点在线段上，计算投影点到点的距离
-        #         px = x1 + t * (x2 - x1)
-        #         py = y1 + t * (y2 - y1)
-        #         return math.sqrt((x0 - px)**2 + (y0 - py)**2)
-        
-        # # 找出距离机器人最近的长边
-        # min_distance = float('inf')
-        # closest_side = None
-        # for side in long_sides:
-        #     distance = point_to_line_distance(robot_position, side)
-        #     if distance < min_distance:
-        #         min_distance = distance
-        #         closest_side = side
-        
-        # return closest_side
-    
+  
     # 计算点与直线垂直且向外延申的点的点
     def findIntersection(self, a, b, c, distance):
         # 计算线段ab的向量
@@ -534,7 +458,7 @@ class CarAvoidancePointActionServer(Node):
         unit_ab_x = ab_x / length_ab
         unit_ab_y = ab_y / length_ab
         
-        # 线段ab的法向量（垂直于线段，指向线段的右侧）
+        # 线段ab的法向量
         normal_x = -unit_ab_y
         normal_y = unit_ab_x
         
@@ -550,7 +474,7 @@ class CarAvoidancePointActionServer(Node):
         foot_x = a[0] + projection * unit_ab_x
         foot_y = a[1] + projection * unit_ab_y
         
-        # 计算向量ac在法向量上的投影（带符号）
+        # 计算向量ac在法向量上的投影
         normal_projection = ac_x * normal_x + ac_y * normal_y
         
         # 确定方向：始终向线段的另一侧移动
@@ -562,171 +486,233 @@ class CarAvoidancePointActionServer(Node):
         
         return (target_x, target_y)
     
-    # 寻找所有的避让点
-    def find_avoidance_point(self, robot_pose, cleaning_area_vertices):
+    def _prepare_avoidance_search(self, robot_pose, cleaning_area_vertices):
+        """
+        准备避让点搜索所需的基础数据：
+        - costmap 数组
+        - 地图参数（origin, resolution, width, height）
+        - nearest_boundary  最近长边
+        - k   搜索方向角
+        - k_diff2      k 与机器人朝向的夹角
+        发布调试 marker。
+        返回 None 表示准备失败。
+        """
         if self.global_costmap is None:
             self.get_logger().error('全局代价地图未收到')
             return None
-        # self.get_logger().error(f'全局代价图: {self.global_costmap}')
+
+        # 地图数据
         map_info = self.global_costmap.metadata
         origin_x = map_info.origin.position.x
         origin_y = map_info.origin.position.y
         resolution = map_info.resolution
         width = map_info.size_x
         height = map_info.size_y
-        self.get_logger().info(f'origin_x: {origin_x}')
-        self.get_logger().info(f'origin_y: {origin_y}')
-        self.get_logger().info(f'resolution: {resolution}')
-        self.get_logger().info(f'width: {width}')
-        self.get_logger().info(f'height: {height}')
-        
-        map = np.array(self.global_costmap.data)
-        # map[map == -1] = 50
-        # map = (100 - map) / 100 * 255
-        # map[map != 0] = 255
-        costmap = np.ascontiguousarray(map.reshape((height,width)).astype(np.uint8))
+        self.get_logger().info(f'origin_x: {origin_x}', once=True)
+        self.get_logger().info(f'origin_y: {origin_y}', once=True)
+        self.get_logger().info(f'resolution: {resolution}', once=True)
+        self.get_logger().info(f'width: {width}', once=True)
+        self.get_logger().info(f'height: {height}', once=True)
+
+        map_data = np.array(self.global_costmap.data)
+        costmap = np.ascontiguousarray(map_data.reshape((height, width)).astype(np.uint8))
 
         robot_x = robot_pose.pose.position.x
         robot_y = robot_pose.pose.position.y
 
-        msg_marker_robot_pose = Marker()
-        msg_marker_robot_pose.header.frame_id = "map"
-        msg_marker_robot_pose.header.stamp = self.get_clock().now().to_msg()
-        msg_marker_robot_pose.id = 2
-        msg_marker_robot_pose.type = Marker.SPHERE
-        msg_marker_robot_pose.action = Marker.ADD
-        msg_marker_robot_pose.scale.x = 0.2
-        msg_marker_robot_pose.scale.y = 0.2
-        msg_marker_robot_pose.scale.z = 0.2
-        msg_marker_robot_pose.color.r = 0.0
-        msg_marker_robot_pose.color.g = 1.0
-        msg_marker_robot_pose.color.b = 0.0
-        msg_marker_robot_pose.color.a = 1.0
-        msg_marker_robot_pose.pose.position.x = robot_x
-        msg_marker_robot_pose.pose.position.y = robot_y
-        msg_marker_robot_pose.pose.orientation.w = 1.0
-        self.marker_robot_pose_publisher.publish(msg_marker_robot_pose)
-
-        # 计算最近的边界
-        
+        # 计算最近长边
         self.get_logger().info('寻找最近的边界...')
-        # 寻找距离最近的长边
-        # nearest_boundary = self.find_min_long_sides(cleaning_area_vertices,[robot_x1,robot_y1])
         nearest_boundary = self.find_nearest_boundary(robot_pose, cleaning_area_vertices)
-        y_ = (nearest_boundary[0][1] - nearest_boundary[1][1])
-        x_ = (nearest_boundary[0][0] - nearest_boundary[1][0])
+        y_ = nearest_boundary[0][1] - nearest_boundary[1][1]
+        x_ = nearest_boundary[0][0] - nearest_boundary[1][0]
         self.get_logger().info(f'nearest_boundary: [({nearest_boundary[0][0]}, {nearest_boundary[0][1]}), ({nearest_boundary[1][0]}, {nearest_boundary[1][1]})]')
-        self.get_logger().info(f'delta_y: {y_}')
-        self.get_logger().info(f'delta_x: {x_}')
 
-        msg_marker_avoidance_side = Marker()
-        msg_marker_avoidance_side.header.frame_id = "map"
-        msg_marker_avoidance_side.header.stamp = self.get_clock().now().to_msg()
-        msg_marker_avoidance_side.id = 3
-        msg_marker_avoidance_side.type = Marker.LINE_LIST
-        msg_marker_avoidance_side.action = Marker.ADD
-        msg_marker_avoidance_side.scale.x = 0.2
-        msg_marker_avoidance_side.color.r = 0.0
-        msg_marker_avoidance_side.color.g = 1.0
-        msg_marker_avoidance_side.color.b = 0.0
-        msg_marker_avoidance_side.color.a = 1.0
-        point1 = Point()
-        point1.x = nearest_boundary[0][0]
-        point1.y = nearest_boundary[0][1]
-        msg_marker_avoidance_side.points.append(point1)
-        point2 = Point()
-        point2.x = nearest_boundary[1][0]
-        point2.y = nearest_boundary[1][1]
-        msg_marker_avoidance_side.points.append(point2)
-        
-        self.marker_avoidance_side_publisher.publish(msg_marker_avoidance_side)
-
-        # if abs(x_) < 1e-3:
-        #     self.get_logger().info(f'delta_x == 0: true')
-        #     k = math.pi /2
-        # else:
-        #     self.get_logger().info(f'delta_x == 0: false')
-        #     k = y_ / x_
-        #     self.get_logger().info(f'k: {k}')
-        #     k = np.arctan2(k)
+        # 计算搜索方向 k
         k = np.arctan2(y_, x_)
-        p1,p2 = nearest_boundary        
-        self.get_logger().info(f'k_radian: {k}')
-        self.get_logger().info(f'k_degree: {k/math.pi*180}')
-        # 计算四个方向
-        directions_ = [self.convert_angle_to_ros2(k+x) for x in [0.0,math.pi]]
-        self.get_logger().info(f'kdirections_: {directions_}')
-        directions = []
-        for angle in directions_:
-            q = Quaternion()
-            q.x, q.y, q.z, q.w = quaternion_from_euler(0, 0, angle)
-            directions.append(q)
-        # 计算最近的边界直线，ax+by+c=0
-        a = p2[1] - p1[1]
-        b = p1[0] - p2[0]
-        c = p2[0] * p1[1] - p1[0] * p2[1]
-        # 计算汽车和机器人之间的角度
-        car_pose= self.action_goal_handle_msg.car_pose.pose.position
+        self.get_logger().info(f'k_radian: {k}, k_degree: {k / math.pi * 180}')
+
+        # 根据车的位置调整 k 方向
+        car_pose = self.action_goal_handle_msg.car_pose.pose.position
         self.get_logger().info(f'robot: ({robot_x}, {robot_y})')
         self.get_logger().info(f'car: ({car_pose.x}, {car_pose.y})')
 
-        msg_marker_car_pose = Marker()
-        msg_marker_car_pose.header.frame_id = "map"
-        msg_marker_car_pose.header.stamp = self.get_clock().now().to_msg()
-        msg_marker_car_pose.id = 1
-        msg_marker_car_pose.type = Marker.CUBE
-        msg_marker_car_pose.action = Marker.ADD
-        msg_marker_car_pose.scale.x = 0.5
-        msg_marker_car_pose.scale.y = 0.5
-        msg_marker_car_pose.scale.z = 0.5
-        msg_marker_car_pose.color.r = 1.0
-        msg_marker_car_pose.color.g = 0.0
-        msg_marker_car_pose.color.b = 0.0
-        msg_marker_car_pose.color.a = 1.0
-        msg_marker_car_pose.pose.position.x = car_pose.x
-        msg_marker_car_pose.pose.position.y = car_pose.y
-        msg_marker_car_pose.pose.orientation.w = 1.0
-        self.marker_car_pose_publisher.publish(msg_marker_car_pose)
+        # 统一发布基础调试 marker（车、机器人、最近长边）
+        self._publish_debug_markers(robot_x, robot_y, car_pose, nearest_boundary)
 
-        y_ = robot_y - car_pose.y
-        x_ = robot_x - car_pose.x
-        # if x_ == 0.0:
-        #     car_robot_k = math.pi /2
-        # else:
-        #     car_robot_k = y_ / x_
-        #     car_robot_k = np.arctan2(car_robot_k)
-        car_robot_k = np.arctan2(y_, x_)
-        self.get_logger().info(f"k: {k}, car_robot_k: {car_robot_k}")
-        k_diff = self.angle_diff(k,car_robot_k)
-        self.get_logger().info(f'k_diff: {k_diff}')
-        if k_diff > math.pi/2:
-            k = self.add_angles(k,math.pi)
-
-        # 计算避让方向k和机器人方向的夹角大小 => 夹角小于pi/2.0,认为二者方向相同;大于pi/2.0,认为二者方向不同。
-        # k_robot = np.arctan2(robot_y, robot_x)  # error
-        orientation = robot_pose.pose.orientation
-        quaternion = (
-            orientation.x,
-            orientation.y,
-            orientation.z,
-            orientation.w
+        # 打印 footprint 等静态检查信息（只打一次）
+        self._log_static_check_info_once(
+            costmap, origin_x, origin_y, resolution, width, height
         )
-    
-        # 将四元数转换为欧拉角(roll, pitch, yaw)
-        (roll, pitch, yaw) = euler_from_quaternion(quaternion)
+
+        car_robot_k = np.arctan2(robot_y - car_pose.y, robot_x - car_pose.x)
+        k_diff = self.angle_diff(k, car_robot_k)
+        self.get_logger().info(f'k: {k}, car_robot_k: {car_robot_k}, k_diff: {k_diff}')
+        if k_diff > math.pi / 2:
+            k = self.add_angles(k, math.pi)
+
+        # 计算 k 与机器人朝向的夹角
+        orientation = robot_pose.pose.orientation
+        (roll, pitch, yaw) = euler_from_quaternion([
+            orientation.x, orientation.y, orientation.z, orientation.w
+        ])
         k_robot = yaw
         k_diff2 = self.angle_diff(k, k_robot)
         self.get_logger().info(f'k: {k}, k_robot: {k_robot}, k_diff2: {k_diff2}')
+
+        return {
+            'costmap': costmap,
+            'origin_x': origin_x,
+            'origin_y': origin_y,
+            'resolution': resolution,
+            'width': width,
+            'height': height,
+            'robot_x': robot_x,
+            'robot_y': robot_y,
+            'nearest_boundary': nearest_boundary,
+            'k': k,
+            'k_diff2': k_diff2,
+            'car_pose': car_pose,
+        }
+
+    def _publish_debug_markers(self, robot_x, robot_y, car_pose, nearest_boundary,
+                               find_vertices=None, avoidance_point=None):
+        """
+        统一发布所有调试用 marker
+        """
+        now = self.get_clock().now().to_msg()
+
+        # 1. 车位置 marker
+        msg = Marker()
+        msg.header.frame_id = "map"
+        msg.header.stamp = now
+        msg.id = 1
+        msg.type = Marker.CUBE
+        msg.action = Marker.ADD
+        msg.scale.x = 0.5
+        msg.scale.y = 0.5
+        msg.scale.z = 0.5
+        msg.color.r = 1.0
+        msg.color.g = 0.0
+        msg.color.b = 0.0
+        msg.color.a = 1.0
+        msg.pose.position.x = car_pose.x
+        msg.pose.position.y = car_pose.y
+        msg.pose.orientation.w = 1.0
+        self.marker_car_pose_publisher.publish(msg)
+
+        # 2. 机器人位置 marker
+        msg = Marker()
+        msg.header.frame_id = "map"
+        msg.header.stamp = now
+        msg.id = 2
+        msg.type = Marker.SPHERE
+        msg.action = Marker.ADD
+        msg.scale.x = 0.2
+        msg.scale.y = 0.2
+        msg.scale.z = 0.2
+        msg.color.r = 0.0
+        msg.color.g = 1.0
+        msg.color.b = 0.0
+        msg.color.a = 1.0
+        msg.pose.position.x = robot_x
+        msg.pose.position.y = robot_y
+        msg.pose.orientation.w = 1.0
+        self.marker_robot_pose_publisher.publish(msg)
+
+        # 3. 最近长边 marker
+        msg = Marker()
+        msg.header.frame_id = "map"
+        msg.header.stamp = now
+        msg.id = 3
+        msg.type = Marker.LINE_LIST
+        msg.action = Marker.ADD
+        msg.scale.x = 0.2
+        msg.color.r = 0.0
+        msg.color.g = 1.0
+        msg.color.b = 0.0
+        msg.color.a = 1.0
+        p1 = Point()
+        p1.x = nearest_boundary[0][0]
+        p1.y = nearest_boundary[0][1]
+        msg.points.append(p1)
+        p2 = Point()
+        p2.x = nearest_boundary[1][0]
+        p2.y = nearest_boundary[1][1]
+        msg.points.append(p2)
+        self.marker_avoidance_side_publisher.publish(msg)
+
+        # 4. 搜索矩形 marker
+        if find_vertices is not None:
+            msg = Marker()
+            msg.header.frame_id = "map"
+            msg.header.stamp = now
+            msg.id = 4
+            msg.type = Marker.LINE_LIST
+            msg.action = Marker.ADD
+            msg.scale.x = 0.1
+            msg.color.r = 1.0
+            msg.color.g = 0.0
+            msg.color.b = 0.0
+            msg.color.a = 1.0
+            size_tmp = len(find_vertices)
+            for i in range(size_tmp):
+                p_start = Point()
+                p_start.x = find_vertices[i][0]
+                p_start.y = find_vertices[i][1]
+                msg.points.append(p_start)
+                p_end = Point()
+                p_end.x = find_vertices[(i + 1) % size_tmp][0]
+                p_end.y = find_vertices[(i + 1) % size_tmp][1]
+                msg.points.append(p_end)
+            self.marker_searching_rect_publisher.publish(msg)
+
+        # 5. 避让点 marker
+        if avoidance_point is not None:
+            msg = Marker()
+            msg.header.frame_id = "map"
+            msg.header.stamp = now
+            msg.id = 5
+            msg.type = Marker.ARROW
+            msg.action = Marker.ADD
+            msg.scale.x = 0.5
+            msg.scale.y = 0.2
+            msg.scale.z = 0.4
+            msg.color.r = 0.0
+            msg.color.g = 0.0
+            msg.color.b = 1.0
+            msg.color.a = 1.0
+            msg.pose = avoidance_point.pose
+            self.marker_parking_point_publisher.publish(msg)
+
+    # 寻找所有的避让点
+    def find_avoidance_point(self, robot_pose, cleaning_area_vertices):
+        prep = self._prepare_avoidance_search(robot_pose, cleaning_area_vertices)
+        if prep is None:
+            return None
+
+        costmap = prep['costmap']
+        origin_x = prep['origin_x']
+        origin_y = prep['origin_y']
+        resolution = prep['resolution']
+        width = prep['width']
+        height = prep['height']
+        robot_x = prep['robot_x']
+        robot_y = prep['robot_y']
+        nearest_boundary = prep['nearest_boundary']
+        k = prep['k']
+        k_diff2 = prep['k_diff2']
+        car_pose = prep['car_pose']
 
         # ===== 优先尝试外部停车点 =====
         car_pose = self.action_goal_handle_msg.car_pose.pose.position
         external_candidates = self._filter_external_stop_points(
             robot_x, robot_y, car_pose.x, car_pose.y, k
-        )
+        )   # 把超过8m的点都删除了
         if len(external_candidates) > 0:
             self.get_logger().info(f'尝试外部停车点，共{len(external_candidates)}个')
-            valid_external = []
+            valid_external = []    # 所有的满足的外部停车点
             for ext_pose in external_candidates:
+                # 对单个点进行完整的筛选流程
                 if self._validate_candidate(
                     ext_pose, costmap, robot_x, robot_y,
                     origin_x, origin_y, resolution, width, height, nearest_boundary
@@ -734,7 +720,7 @@ class CarAvoidancePointActionServer(Node):
                     valid_external.append(ext_pose)
 
             if len(valid_external) > 0:
-                # 选离 nearest_boundary（机器人最近的长边）最近的点
+                # 新增的一个   选离 nearest_boundary  机器人最近的长边最近的点   
                 best = min(valid_external, key=lambda pose: self.dis_point_to_line2(
                     pose.pose.position.x, pose.pose.position.y,
                     nearest_boundary[0][0], nearest_boundary[0][1],
@@ -746,9 +732,9 @@ class CarAvoidancePointActionServer(Node):
                 )
                 return best
 
-            self.get_logger().info('所有外部停车点均不满足，回退自搜索')
+            self.get_logger().info('有外部停车点，但是所有外部停车点在筛选判断以后均不满足，回退自搜索')
         else:
-            self.get_logger().info('无有效外部停车点，使用自搜索')
+            self.get_logger().info('话题无有效外部停车点，使用自搜索')
         # ===== 外部点逻辑结束，继续原有搜索矩形逻辑 =====
 
         robot_x1 = 0.0
@@ -863,28 +849,10 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'find_vertices: {find_vertices}')
 
         # 发布搜索区域 marker
-        msg_marker_searching_rect = Marker()
-        msg_marker_searching_rect.header.frame_id = "map"
-        msg_marker_searching_rect.header.stamp = self.get_clock().now().to_msg()
-        msg_marker_searching_rect.id = 4
-        msg_marker_searching_rect.type = Marker.LINE_LIST
-        msg_marker_searching_rect.action = Marker.ADD
-        msg_marker_searching_rect.scale.x = 0.1
-        msg_marker_searching_rect.color.r = 1.0
-        msg_marker_searching_rect.color.g = 0.0
-        msg_marker_searching_rect.color.b = 0.0
-        msg_marker_searching_rect.color.a = 1.0
-        size_tmp = len(find_vertices)
-        for i in range(size_tmp):
-            p_start = Point()
-            p_start.x = find_vertices[i][0]
-            p_start.y = find_vertices[i][1]
-            msg_marker_searching_rect.points.append(p_start)
-            p_end = Point()
-            p_end.x = find_vertices[(i + 1) % size_tmp][0]
-            p_end.y = find_vertices[(i + 1) % size_tmp][1]
-            msg_marker_searching_rect.points.append(p_end)
-        self.marker_searching_rect_publisher.publish(msg_marker_searching_rect)
+        self._publish_debug_markers(
+            robot_x, robot_y, car_pose, nearest_boundary,
+            find_vertices=find_vertices
+        )
 
         # 在当前搜索区域内找避让点
         search_posestamped_list = self.select_points_in_parallelogram(find_vertices, self.search_point_interval, k)
@@ -916,13 +884,6 @@ class CarAvoidancePointActionServer(Node):
     def find_nearest_boundary(self, robot_pose, vertices):
         """
         找到距离机器人位置最近的矩形长边
-        
-        参数:
-            robot_pose: 包含机器人位置信息的对象
-            vertices: 矩形四个顶点坐标列表，按顺序排列
-            
-        返回:
-            距离机器人最近的边界线段（由两个端点坐标组成的元组）
         """
         # 构建四条边（假设顶点已按顺序排列）
         edges = [
@@ -1044,14 +1005,23 @@ class CarAvoidancePointActionServer(Node):
             throttle_duration_sec=5.0
         )
 
+        if len(msg.poses) > 0:
+            orientation = msg.poses[0].orientation
+            is_default_orientation = (
+                abs(orientation.x) < 1e-6 and
+                abs(orientation.y) < 1e-6 and
+                abs(orientation.z) < 1e-6 and
+                abs(abs(orientation.w) - 1.0) < 1e-6
+            )
+            if is_default_orientation:
+                self.get_logger().info(
+                    '外部停车点没有发 yaw，将使用避让方向自行计算',
+                    throttle_duration_sec=5.0
+                )
+
     def _filter_external_stop_points(self, robot_x, robot_y, car_x, car_y, k):
         """
         过滤外部避车停车点：
-        1. 距离机器人 <= external_point_max_distance 的保留
-        2. 把车候选点都转到 base_link 下，只保留与车在 x 轴上异侧的点
-        3. 按距离升序排列
-        4. 重算朝向（对齐避让方向 k）
-        返回过滤后的 PoseStamped 列表
         """
         if self.vehicle_avoidance_stop_points is None:
             return []
@@ -1082,16 +1052,13 @@ class CarAvoidancePointActionServer(Node):
             if dist > self.external_point_max_distance:
                 continue
 
-            # base_link 下符号过滤：与车在 x 轴异侧才保留
+            # base_link 与车在 x 轴异侧才保留
             point_local_x, _ = to_base_link(px, py)
             if car_local_x * point_local_x >= 0:
+                self.get_logger().info(
+                    f'外部停车点 ({px:.2f}, {py:.2f}) 与车同侧，过滤掉'
+                )
                 continue
-
-            # 重算朝向：复用已有的 adjust_angle
-            direction_vec = (px - robot_x, py - robot_y)
-            target_angle = math.degrees(k)
-            adjusted_angle = self.adjust_angle(direction_vec, target_angle)
-            yaw_rad = math.radians(adjusted_angle)
 
             pose_stamped = PoseStamped()
             pose_stamped.header.stamp = self.get_clock().now().to_msg()
@@ -1099,9 +1066,25 @@ class CarAvoidancePointActionServer(Node):
             pose_stamped.pose.position.x = px
             pose_stamped.pose.position.y = py
             pose_stamped.pose.position.z = 0.0
-            quat = Quaternion()
-            quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, yaw_rad)
-            pose_stamped.pose.orientation = quat
+
+            # 外部点带了有效 yaw 就用它的，没带再用避让方向重算
+            orientation = pose.orientation
+            is_default_orientation = (
+                abs(orientation.x) < 1e-6 and
+                abs(orientation.y) < 1e-6 and
+                abs(orientation.z) < 1e-6 and
+                abs(abs(orientation.w) - 1.0) < 1e-6
+            )
+            if is_default_orientation:
+                direction_vec = (px - robot_x, py - robot_y)
+                target_angle = math.degrees(k)
+                adjusted_angle = self.adjust_angle(direction_vec, target_angle)
+                yaw_rad = math.radians(adjusted_angle)
+                quat = Quaternion()
+                quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, yaw_rad)
+                pose_stamped.pose.orientation = quat
+            else:
+                pose_stamped.pose.orientation = orientation
 
             results.append((dist, pose_stamped))
 
@@ -1113,7 +1096,7 @@ class CarAvoidancePointActionServer(Node):
     def _validate_candidate(self, avoidance_pose, costmap, robot_x, robot_y,
                              origin_x, origin_y, resolution, width, height, nearest_boundary):
         """
-        对单个候选点执行完整校验链（3-1~3-6 + 服务检查）
+        对单个候选点执行完整校验链
         返回 True 通过，False 不通过
         """
         px_point = avoidance_pose.pose.position.x
@@ -1127,8 +1110,12 @@ class CarAvoidancePointActionServer(Node):
         point_y_p = int(point_pixel[1])
 
         # 3-1 点周围无障碍
-        if not self.check_point_is_free(costmap, (point_x_p, point_y_p)):
-            self.get_logger().info(f'候选点({px_point:.2f},{py_point:.2f}) 周围有障碍')
+        point_free_radius_pixels = max(1, int(self.point_free_check_radius / resolution))
+        if not self.check_point_is_free(costmap, (point_x_p, point_y_p), radius=point_free_radius_pixels):
+            self.get_logger().info(
+                f'候选点({px_point:.2f},{py_point:.2f}) 周围{self.point_free_check_radius}m'
+                f'（{point_free_radius_pixels}像素）内有障碍'
+            )
             return False
 
         # 3-2 不在禁扫区
@@ -1239,7 +1226,7 @@ class CarAvoidancePointActionServer(Node):
                 if cv2.pointPolygonTest(fp_contour, (float(pt[0]), float(pt[1])), False) >= 0:
                     return True
 
-            # 检查3: 边是否相交（用 cv2 计算交集面积）
+            # 检查3: 边是否相交   用 cv2 计算交集面积
             ret, intersection = cv2.intersectConvexConvex(fp_contour, poly_pts)
             if ret > 0:
                 return True
@@ -1250,10 +1237,6 @@ class CarAvoidancePointActionServer(Node):
     def is_point_inside_parallelogram(self, robot_x, robot_y, vertices):
         """
         使用射线法判断点是否在多边形内部
-        :param robot_x: 点的x坐标
-        :param robot_y: 点的y坐标
-        :param vertices: 多边形顶点列表，格式为[(x1,y1), (x2,y2), ...]
-        :return: True(在内部)或False(在外部)
         """
         inside = False
         j = len(vertices) - 1
@@ -1412,29 +1395,20 @@ class CarAvoidancePointActionServer(Node):
 
     # 对四边形的四个顶点进行排序，按左上角、右上角、右下角、左下角的顺序返回
     def sort_quadrilateral_vertices(self, points):
-        """
-        对矩形的四个顶点进行排序，返回顺序为 [左上, 右上, 右下, 左下]
-        
-        参数:
-            points (np.ndarray or list): 四个点的坐标，形状为 (4, 2)
-        
-        返回:
-            np.ndarray: 排序后的四个点，形状为 (4, 2)
-        """
         points = np.array(points)
         
         # 1. 计算中心点
         center = np.mean(points, axis=0)
         
-        # 2. 计算每个点相对于中心的角度（使用反正切函数）
+        # 2. 计算每个点相对于中心的角度
         angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
         
-        # 3. 按角度排序（顺时针方向）
+        # 3. 按角度排序
         sorted_indices = np.argsort(angles)
         sorted_points = points[sorted_indices]
         
         # 4. 确保顺序是 [左上, 右上, 右下, 左下]
-        # 找到 y 值最小的两个点（顶部点）
+        # 找到 y 值最小的两个点
         top_points = sorted_points[np.argsort(sorted_points[:, 1])[:2]]
         
         # 在顶部点中，x 较小的为左上，较大的为右上
@@ -1453,12 +1427,7 @@ class CarAvoidancePointActionServer(Node):
     
     # 将角度转换为机器人坐标系下的角度
     def convert_angle_to_ros2(self, angle, input_in_degrees=False):
-        """
-        将角度转换为 ROS 2 中常用的弧度范围 (-π, π]。
-        :param angle: 输入的角度值。
-        :param input_in_degrees: 若为 True，则输入角度以度为单位；若为 False，则以弧度为单位。默认为 False。
-        :return: 转换到 (-π, π] 范围内的弧度值。
-        """
+
         # 如果输入是度，先将其转换为弧度
         if input_in_degrees:
             angle = math.radians(angle)
@@ -1473,12 +1442,7 @@ class CarAvoidancePointActionServer(Node):
 
     # 寻找点关于一条直线的对称点
     def find_symmetric_point(self, a, line_coeffs):
-        """
-        计算点 a 关于给定直线的对称点 b
-        :param a: 已知点，格式为 (x, y)
-        :param line_coeffs: 直线方程 Ax + By + C = 0 的系数，格式为 (A, B, C)
-        :return: 对称点 b 的坐标，格式为 (x, y)
-        """
+
         A, B, C = line_coeffs
         x1, y1 = a
 
@@ -1489,6 +1453,33 @@ class CarAvoidancePointActionServer(Node):
 
         return (x2, y2)
     
+    def _log_static_check_info_once(self, costmap, origin_x, origin_y, resolution, width, height):
+        """
+        footprint 大小和地图分辨率都是静态的，只在第一次拿到两者后，
+        打印一次 footprint 覆盖栅格数等固定信息。
+        """
+        if self._static_check_info_logged or not self.footprint_vertices:
+            return
+
+        # 以 yaw=0 计算 footprint 覆盖栅格数（仅用于日志，不影响实际检查）
+        pixel_vertices = []
+        for vx, vy in self.footprint_vertices:
+            px = int((vx - origin_x) / resolution)
+            py = int((vy - origin_y) / resolution)
+            px = max(0, min(width - 1, px))
+            py = max(0, min(height - 1, py))
+            pixel_vertices.append([px, py])
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, np.array(pixel_vertices, dtype=np.int32), 255)
+        total_points = int(np.count_nonzero(mask == 255))
+
+        self.get_logger().info(
+            f'静态检查信息: footprint 覆盖栅格数={total_points}, '
+            f'分辨率={resolution}m, footprint_vertices={self.footprint_vertices}'
+        )
+        self._static_check_info_logged = True
+
     # 检查点附近是否有障碍物
     def check_point_is_free(self, image, center, radius=2):
         """
@@ -1546,8 +1537,11 @@ class CarAvoidancePointActionServer(Node):
         values = costmap[ys, xs]
         is_safe = bool(np.all(values <= 253))
 
-        # 第四步：打印日志
-        self.get_logger().info(f'check_footprint_at_pose: 共检查 {total_points} 个栅格点, safe={is_safe}')
+        if not is_safe:
+            self.get_logger().warning(
+                f'check_footprint_at_pose: footprint 撞障碍 '
+                f'({total_points} 个栅格点)'
+            )
 
         return is_safe
 
@@ -1593,7 +1587,7 @@ class CarAvoidancePointActionServer(Node):
             wy = target_pose.pose.position.y + ry
             target_vertices.append((wx, wy))
 
-        # 找到最远的两条不重复连线（X 形状的四个端点）
+        # 找到最远的两条不重复连线
         best_pair = None
         best_total_distance = 0
 
@@ -1677,7 +1671,10 @@ class CarAvoidancePointActionServer(Node):
                 return True
             values = costmap[ys, xs]
             is_safe = bool(np.all(values <= threshold))
-            self.get_logger().info(f'check_footprint_sweep (filled): {len(xs)} pixels, safe={is_safe}')
+            if not is_safe:
+                self.get_logger().warning(
+                    f'check_footprint_sweep (filled): {len(xs)} pixels 中有障碍'
+                )
             return is_safe
 
         # short_step > 短边，只检查两条长边
@@ -1713,7 +1710,10 @@ class CarAvoidancePointActionServer(Node):
             all_points = np.vstack([edge1_points, edge2_points])
             values = costmap[all_points[:, 1], all_points[:, 0]]
             is_safe = bool((values <= threshold).all())
-            self.get_logger().info(f'check_footprint_sweep (edges only): {len(all_points)} pixels, safe={is_safe}')
+            if not is_safe:
+                self.get_logger().warning(
+                    f'check_footprint_sweep (edges only): {len(all_points)} pixels 中有障碍'
+                )
             return is_safe
 
         # 9. 策略3：正常下采样
@@ -1740,17 +1740,12 @@ class CarAvoidancePointActionServer(Node):
                 short_current += short_edge_step
             long_current += long_edge_step
 
-        self.get_logger().info('check_footprint_sweep (sampled): safe')
         return True
 
     # 判断两个点之间的角度差
     def angle_diff(self, a, b, use_abs=True):
         """
         判断以指定像素点为中心、半径为 x 像素的圆形区域内所有像素值是否都大于 0
-        :param a: 角度a（弧度）
-        :param b: 角度b（弧度）
-        :param use_abs: 是否返回绝对值
-        :return: a和b之间的角度差（弧度）
         """
         error = a - b
         if error < -math.pi:
@@ -1768,9 +1763,6 @@ class CarAvoidancePointActionServer(Node):
     def add_angles(self, current_angle, rotation_angle):
         """
         计算机器人当前角度和旋转角度相加的结果，并将结果限制在 [-pi, pi] 范围内
-        :param current_angle: 机器人当前角度（弧度）
-        :param rotation_angle: 旋转角度（弧度）
-        :return: 相加后的角度，范围在 [-pi, pi] 之间
         """
         # 计算相加后的角度
         new_angle = current_angle + rotation_angle
@@ -1797,12 +1789,7 @@ class CarAvoidancePointActionServer(Node):
     def bresenham(self, current_x, current_y, target_x, target_y, map_array):
         """
         提取两点连线上的所有像素点
-        :param current_x: 当前点的 x 坐标
-        :param current_y: 当前点的 y 坐标
-        :param target_x: 目标点的 x 坐标
-        :param target_y: 目标点的 y 坐标
-        :param map_array: 地图数组
-        :return: 两点连线上的所有像素点列表
+
         """
         pixels = []
         dx = abs(target_x - current_x)
