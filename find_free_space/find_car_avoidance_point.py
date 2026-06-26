@@ -172,6 +172,7 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter('footprint_sweep_short_step', 0.0)      # 扫掠检查短边步长(m)，默认999.0(>footprint短边)=只扫两条长边;设<=短边=网格采样;设0=全像素填充
         self.declare_parameter('external_point_max_distance', 8.0)      # 外部点最大距离
         self.declare_parameter('point_free_check_radius', 0.2)          # 候选点周围无障碍检查半径(m)
+        self.declare_parameter('stop_in_place_min_dist', 2.0)           # 机器人在通道外长边方向、且离长边超过这个距离才允许原地停
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -193,6 +194,7 @@ class CarAvoidancePointActionServer(Node):
         self.footprint_sweep_short_step = self.get_parameter('footprint_sweep_short_step').value
         self.external_point_max_distance = self.get_parameter('external_point_max_distance').value
         self.point_free_check_radius = self.get_parameter('point_free_check_radius').value
+        self.stop_in_place_min_dist = self.get_parameter('stop_in_place_min_dist').value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
@@ -214,6 +216,7 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'footprint_sweep_short_step: {self.footprint_sweep_short_step} # 默认999.0=只扫两条长边')
         self.get_logger().info(f'external_point_max_distance: {self.external_point_max_distance}')
         self.get_logger().info(f'point_free_check_radius: {self.point_free_check_radius}')
+        self.get_logger().info(f'stop_in_place_min_dist: {self.stop_in_place_min_dist}')
     
     def footprint_sub_callback(self, msg):
         points = msg.polygon.points
@@ -285,27 +288,19 @@ class CarAvoidancePointActionServer(Node):
         if len(self.polygons) == 0:
             pass
         else:
-            current_polygon_vertices = []
-            min_dis_robot_to_polygon = 1000.0
             for polygon in self.polygons:
-                current_polygon_vertices = np.array([[point.x,point.y] for point in polygon.points])
-                robot_is_in_area = self.is_point_inside_parallelogram(self.robot_pose.pose.position.x,self.robot_pose.pose.position.y,current_polygon_vertices)
-                self.get_logger().info(f"robot: ({self.robot_pose.pose.position.x}, {self.robot_pose.pose.position.y})")
-                self.get_logger().info(f'polygons: \n{current_polygon_vertices}')
+                current_polygon_vertices = np.array([[point.x, point.y] for point in polygon.points])
+                robot_is_in_area = self.is_point_inside_parallelogram(
+                    self.robot_pose.pose.position.x,
+                    self.robot_pose.pose.position.y,
+                    current_polygon_vertices
+                )
                 if robot_is_in_area:
                     self.vertices = current_polygon_vertices
-                    self.get_logger().info('inside polygon: True')
+                    self.get_logger().info(
+                        f'机器人在通道内，使用当前通道: \n{current_polygon_vertices}'
+                    )
                     break
-                else:
-                    self.get_logger().info('inside polygon: False')
-                    robot_x = self.robot_pose.pose.position.x
-                    robot_y = self.robot_pose.pose.position.y
-                    dis = self.dis_point_to_rect(robot_x, robot_y, current_polygon_vertices)
-                    if dis < min_dis_robot_to_polygon and dis < 2.0:
-                        min_dis_robot_to_polygon = dis
-                        self.vertices = current_polygon_vertices
-                        self.get_logger().info(f'robot_to_polygon dis: {min_dis_robot_to_polygon}')
-                        self.get_logger().info(f'update self.vertices: {self.vertices}')
 
 
     def dis_point_to_point(self, p1_x, p1_y, p2_x, p2_y):
@@ -334,24 +329,6 @@ class CarAvoidancePointActionServer(Node):
 
         return self.dis_point_to_point(x, y, proj_x, proj_y)
     
-    def dis_point_to_line2(self, x, y, p1_x, p1_y, p2_x, p2_y):
-        """
-        计算点到直线的垂直距离
-        """
-        # 处理直线为垂直线的情况
-        if p1_x == p2_x:
-            return abs(x - p1_x)
-        
-        # 计算直线方程参数 (Ax + By + C = 0)
-        A = p2_y - p1_y
-        B = p1_x - p2_x
-        C = p2_x * p1_y - p1_x * p2_y
-        
-        # 计算距离
-        numerator = abs(A * x + B * y + C)
-        denominator = math.sqrt(A**2 + B**2)
-
-        return numerator / denominator
 
     def dis_point_to_rect(self, x, y, rect):
         length = len(rect)
@@ -363,7 +340,6 @@ class CarAvoidancePointActionServer(Node):
             if dis < min_dis:
                 min_dis = dis
         return min_dis
-
 
     def action_goal_callback(self, goal_handle):
         self.get_logger().info('开始寻找避让点...')
@@ -424,10 +400,8 @@ class CarAvoidancePointActionServer(Node):
             # goal_handle.abort()
             result = FindCarAvoidancePoint.Result()
             result.pose = avoidance_point
-        
-            result.pose.pose.position.z = 10.0
             
-            self.get_logger().info(f'成功找到避让点*****， z = 10 ')
+            self.get_logger().info(f'成功找到避让点*****， z = {result.pose.pose.position.z} ')
             
             return result
         else:
@@ -721,15 +695,56 @@ class CarAvoidancePointActionServer(Node):
 
             if len(valid_external) > 0:
                 # 新增的一个   选离 nearest_boundary  机器人最近的长边最近的点   
-                best = min(valid_external, key=lambda pose: self.dis_point_to_line2(
+                best = min(valid_external, key=lambda pose: self.dis_point_to_line(
                     pose.pose.position.x, pose.pose.position.y,
                     nearest_boundary[0][0], nearest_boundary[0][1],
                     nearest_boundary[1][0], nearest_boundary[1][1]
                 ))
-                self.get_logger().info(
-                    f'外部停车点通过校验共{len(valid_external)}个，'
-                    f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})'
+                # 判断外部停靠点是否在通道内，并设置对应的 z 值与方向
+                is_inside = self.is_point_inside_parallelogram(
+                    best.pose.position.x, best.pose.position.y, self.vertices
                 )
+                if is_inside:
+                    # 通道内的固定停靠点：按原来的方法修改方向
+                    orientation = best.pose.orientation
+                    is_default_orientation = (
+                        abs(orientation.x) < 1e-6 and
+                        abs(orientation.y) < 1e-6 and
+                        abs(orientation.z) < 1e-6 and
+                        abs(abs(orientation.w) - 1.0) < 1e-6
+                    )
+                    if is_default_orientation:
+                        direction_vec = (
+                            best.pose.position.x - robot_x,
+                            best.pose.position.y - robot_y
+                        )
+                        target_angle = math.degrees(k)
+                        adjusted_angle = self.adjust_angle(direction_vec, target_angle)
+                        yaw_rad = math.radians(adjusted_angle)
+                        quat = Quaternion()
+                        quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, yaw_rad)
+                        best.pose.orientation = quat
+                        self.get_logger().info(
+                            '通道内固定停靠点未发 yaw，已按避让方向重算方向'
+                        )
+                    else:
+                        self.get_logger().info(
+                            '通道内固定停靠点带有有效 yaw，保留原方向'
+                        )
+                    best.pose.position.z = 20.0
+                    self.get_logger().info(
+                        f'外部停车点通过校验共{len(valid_external)}个，'
+                        f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
+                        f'该点在通道内，z = 20.0'
+                    )
+                else:
+                    # 通道外的固定停靠点：方向值保持不变
+                    best.pose.position.z = 30.0
+                    self.get_logger().info(
+                        f'外部停车点通过校验共{len(valid_external)}个，'
+                        f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
+                        f'该点在通道外，方向保持不变，z = 30.0'
+                    )
                 return best
 
             self.get_logger().info('有外部停车点，但是所有外部停车点在筛选判断以后均不满足，回退自搜索')
@@ -795,16 +810,32 @@ class CarAvoidancePointActionServer(Node):
             )
         else:
             # 机器人在通道外部
+            # 复用 dis_point_to_line 找最近边，并记录它的长度
+            verts = self.vertices
+            min_dis = float('inf')
+            nearest_edge_len = 0.0
+            for i in range(4):
+                p1 = verts[i]
+                p2 = verts[(i + 1) % 4]
+                d = self.dis_point_to_line(robot_x, robot_y, p1[0], p1[1], p2[0], p2[1])
+                if d < min_dis:
+                    min_dis = d
+                    nearest_edge_len = self.dis_point_to_point(p1[0], p1[1], p2[0], p2[1])
+
+            short_edge_len = self.calculate_total_passage_width(verts)  # 复用：最短边长度
+            # 最近边长度接近短边长度 → 从短边出去；明显更长 → 从长边出去
+            nearest_is_long = nearest_edge_len > short_edge_len * 1.5
+
+            dis_robot_to_nearest_bound = min_dis  # 复用这个值，下面 offset_min_local 也用它
+
             offset_min_local = offset_min
-            dis_robot_to_nearest_bound = self.dis_point_to_line2(
-                robot_x, robot_y,
-                nearest_boundary[0][0], nearest_boundary[0][1],
-                nearest_boundary[1][0], nearest_boundary[1][1]
-            )
             if offset_min < dis_robot_to_nearest_bound < offset_max:
                 offset_min_local = dis_robot_to_nearest_bound
-            elif dis_robot_to_nearest_bound >= offset_max:
-                self.get_logger().info("返回机器人当前点为停靠点")
+            elif nearest_is_long and dis_robot_to_nearest_bound >= self.stop_in_place_min_dist:
+                # 从长边出去、且离边够远 → 路肩位置，可原地停
+                self.get_logger().info(
+                    f"机器人在长边外侧 {dis_robot_to_nearest_bound:.2f}m，原地停车"
+                )
                 ret_pose = PoseStamped()
                 ret_pose.header.stamp = self.get_clock().now().to_msg()
                 ret_pose.header.frame_id = "map"
@@ -819,7 +850,13 @@ class CarAvoidancePointActionServer(Node):
                 quat = Quaternion()
                 quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, ret_pose_yaw)
                 ret_pose.pose.orientation = quat
+                ret_pose.pose.position.z = 10.0
                 return ret_pose
+            else:
+                self.get_logger().info(
+                    f"出口边是{'长边' if nearest_is_long else '短边'}, 距离{dis_robot_to_nearest_bound:.2f}m，"
+                    f"不满足原地停条件，继续搜索"
+                )
 
             p1_near = self.findIntersection(
                 nearest_boundary[0], nearest_boundary[1],
@@ -867,6 +904,7 @@ class CarAvoidancePointActionServer(Node):
                     origin_x, origin_y, resolution, width, height, nearest_boundary
                 ):
                     avoidance_pose_result = avoidance_pose
+                    avoidance_pose_result.pose.position.z = 10.0
                     return avoidance_pose_result
 
         # 单次搜索结束，没找到
@@ -1067,24 +1105,8 @@ class CarAvoidancePointActionServer(Node):
             pose_stamped.pose.position.y = py
             pose_stamped.pose.position.z = 0.0
 
-            # 外部点带了有效 yaw 就用它的，没带再用避让方向重算
-            orientation = pose.orientation
-            is_default_orientation = (
-                abs(orientation.x) < 1e-6 and
-                abs(orientation.y) < 1e-6 and
-                abs(orientation.z) < 1e-6 and
-                abs(abs(orientation.w) - 1.0) < 1e-6
-            )
-            if is_default_orientation:
-                direction_vec = (px - robot_x, py - robot_y)
-                target_angle = math.degrees(k)
-                adjusted_angle = self.adjust_angle(direction_vec, target_angle)
-                yaw_rad = math.radians(adjusted_angle)
-                quat = Quaternion()
-                quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, yaw_rad)
-                pose_stamped.pose.orientation = quat
-            else:
-                pose_stamped.pose.orientation = orientation
+            # 先保留外部点的原始方向，通道内/外的方向处理放到 find_avoidance_point 中决定
+            pose_stamped.pose.orientation = pose.orientation
 
             results.append((dist, pose_stamped))
 
