@@ -8,10 +8,11 @@
 
   1. 机器人不在通道内但发了外部停车点 -> 仍 aborted (验证外部点不影响早期 abort)
   2. 机器人和车之间有一个外部通道内点 -> 验证位置过滤会拒绝该点
-  3. 通道外的外部固定点 -> 不请求 /check_car_passable 服务
-  4. 通道内的外部固定点 -> 仍然请求服务
-  5. 自搜索找到的候选点 -> 仍然请求服务
-  6. 搜索框最前面的短边越过通道前方短边 -> 搜索框构造失败 -> aborted
+  3. 外部通道内点在车对侧（机器人后方） -> 应通过位置过滤并请求服务
+  4. 通道外的外部固定点 -> 不请求 /check_car_passable 服务
+  5. 通道内的外部固定点 -> 仍然请求服务
+  6. 自搜索找到的候选点 -> 仍然请求服务
+  7. 搜索框最前面的短边越过通道前方短边 -> 搜索框构造失败 -> aborted
 
   本脚本通过参数 test_mode 切换测试场景，一次只跑一个场景。
   # 场景1: 机器人不在通道内但发了外部停车点, 仍应 aborted
@@ -20,16 +21,19 @@
   # 场景2: 机器人和车之间有一个外部通道内点, 验证位置过滤
   python3 warning.py --ros-args -p test_mode:=external_inside_between_robot_car
 
-  # 场景3: 通道外外部固定点, 不请求服务 (服务调用次数应为 0)
+  # 场景3: 外部通道内点在车对侧（机器人后方）, 应通过位置过滤并请求服务
+  python3 warning.py --ros-args -p test_mode:=external_inside_opposite_car
+
+  # 场景4: 通道外外部固定点, 不请求服务 (服务调用次数应为 0)
   python3 warning.py --ros-args -p test_mode:=external_outside_skip_service
 
-  # 场景4: 通道内外部固定点, 仍然请求服务 (服务调用次数 > 0)
+  # 场景5: 通道内外部固定点, 仍然请求服务 (服务调用次数 > 0)
   python3 warning.py --ros-args -p test_mode:=external_inside_need_service
 
-  # 场景5: 自搜索点仍然请求服务 (服务调用次数 > 0)
+  # 场景6: 自搜索点仍然请求服务 (服务调用次数 > 0)
   python3 warning.py --ros-args -p test_mode:=self_search_need_service
 
-  # 场景6: 搜索框前边越过前方短边, 应该 aborted (服务调用次数应为 0)
+  # 场景7: 搜索框前边越过前方短边, 应该 aborted (服务调用次数应为 0)
   python3 warning.py --ros-args -p test_mode:=search_box_exceed_front_short_edge
 
 
@@ -60,6 +64,8 @@ TEST_MODE_DESC = {
         '机器人不在通道内但发了外部停车点 -> 预期: 仍 aborted, 服务调用次数 = 0',
     'external_inside_between_robot_car':
         '机器人和车之间有一个外部通道内点 -> 预期: 该点被位置过滤拒绝, 回退自搜索',
+    'external_inside_opposite_car':
+        '外部通道内点在车对侧（机器人后方） -> 预期: 通过位置过滤, 请求服务, z=20',
     'external_outside_skip_service':
         '通道外外部固定点 -> 预期: 不请求服务(次数=0), Action 成功, z=30',
     'external_inside_need_service':
@@ -288,6 +294,11 @@ class SimulateAvoidanceEnv(Node):
             # 机器人在通道内, 但外部点放在机器人和车之间 -> 应被位置过滤拒绝
             configs = [
                 (self.car_distance_ahead / 2.0, 0.0, '机器人和车之间的通道内点'),
+            ]
+        elif self.test_mode == 'external_inside_opposite_car':
+            # 机器人在通道内, 外部点在车对侧（机器人后方） -> 应通过位置过滤
+            configs = [
+                (-3.0, 0.0, '车对侧的通道内点'),
             ]
         elif self.test_mode == 'search_box_exceed_front_short_edge':
             # 这个模式不需要外部点, 发空数组
