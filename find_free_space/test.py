@@ -16,8 +16,6 @@
 - find_free_space_action_server 已启动
 - 本脚本与 find_free_space_action_server 使用相同的话题和服务名
 
-使用方式：
-    python3 simulate_avoidance_env.py
 """
 
 import rclpy

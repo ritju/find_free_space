@@ -86,6 +86,12 @@ class CarAvoidancePointActionServer(Node):
             marker_qos
         )
 
+        self.marker_all_passages_publisher = self.create_publisher(
+            Marker,
+            "marker_all_passages",
+            marker_qos
+        )
+
         callback_gp1 = MutuallyExclusiveCallbackGroup()
         callback_gp2 = MutuallyExclusiveCallbackGroup()
         callback_gp3 = MutuallyExclusiveCallbackGroup()
@@ -237,7 +243,8 @@ class CarAvoidancePointActionServer(Node):
             (-half_long, -half_short),
             (-half_long, half_short)
         ]
-        self.get_logger().info(f"robot_width: {self.robot_width}, footprint_vertices (local): {self.footprint_vertices}")
+        fp_str = ', '.join([f'({v[0]:.3f}, {v[1]:.3f})' for v in self.footprint_vertices])
+        self.get_logger().info(f"robot_width: {self.robot_width:.3f}, footprint_vertices (local): [{fp_str}]")
         # 取消订阅
         self.destroy_subscription(self.footprint_sub_)
 
@@ -357,6 +364,9 @@ class CarAvoidancePointActionServer(Node):
         self.polygons = self.action_goal_handle_msg.polygons
         self.get_logger().info(f'polygons: {self.polygons}')
         
+        # 发布所有通道多边形 marker
+        self._publish_all_passages_marker(self.polygons)
+        
         # 获取清洁区域信息
         # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
         self.get_logger().info('寻找当前通行区域...')
@@ -371,7 +381,10 @@ class CarAvoidancePointActionServer(Node):
             return FindCarAvoidancePoint.Result()
 
         v1, v2, v3, v4 = self.vertices
-        self.get_logger().info(f'当前通行区域: [({v1[0]}, {v1[1]}),({v2[0]}, {v2[1]}),({v3[0]}, {v3[1]}),({v4[0]}, {v4[1]})]')
+        self.get_logger().info(
+            f'当前通行区域: [({v1[0]:.3f}, {v1[1]:.3f}),({v2[0]:.3f}, {v2[1]:.3f}),'
+            f'({v3[0]:.3f}, {v3[1]:.3f}),({v4[0]:.3f}, {v4[1]:.3f})]'
+        )
 
 
         # self.get_logger().info(f'self.get_vertices_callback():{len(self.vertices)}')
@@ -381,9 +394,13 @@ class CarAvoidancePointActionServer(Node):
         # 寻找停靠点
         self.get_logger().info('寻找停靠点...')
         avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
-        self.get_logger().info(f'avoidance_point:{avoidance_point}')
         if avoidance_point is not None:
-            self.get_logger().info(f'成功找到避让点{avoidance_point}')
+            ap = avoidance_point.pose
+            yaw = math.degrees(self.get_yaw_from_pose(avoidance_point))
+            self.get_logger().info(
+                f'成功找到避让点: x={ap.position.x:.3f}, y={ap.position.y:.3f}, '
+                f'z={ap.position.z:.3f}, yaw={yaw:.3f}°'
+            )
 
             # 发布最终避让点 marker
             nearest_boundary = self.find_nearest_boundary(self.robot_pose, self.vertices)
@@ -401,7 +418,12 @@ class CarAvoidancePointActionServer(Node):
             result = FindCarAvoidancePoint.Result()
             result.pose = avoidance_point
             
-            self.get_logger().info(f'成功找到避让点*****， z = {result.pose.pose.position.z} ')
+            rp = result.pose.pose
+            yaw = math.degrees(self.get_yaw_from_pose(result.pose))
+            self.get_logger().info(
+                f'成功找到避让点*****: x={rp.position.x:.3f}, y={rp.position.y:.3f}, '
+                f'z={rp.position.z:.3f}, yaw={yaw:.3f}°'
+            )
             
             return result
         else:
@@ -482,9 +504,9 @@ class CarAvoidancePointActionServer(Node):
         resolution = map_info.resolution
         width = map_info.size_x
         height = map_info.size_y
-        self.get_logger().info(f'origin_x: {origin_x}', once=True)
-        self.get_logger().info(f'origin_y: {origin_y}', once=True)
-        self.get_logger().info(f'resolution: {resolution}', once=True)
+        self.get_logger().info(f'origin_x: {origin_x:.3f}', once=True)
+        self.get_logger().info(f'origin_y: {origin_y:.3f}', once=True)
+        self.get_logger().info(f'resolution: {resolution:.3f}', once=True)
         self.get_logger().info(f'width: {width}', once=True)
         self.get_logger().info(f'height: {height}', once=True)
 
@@ -499,16 +521,20 @@ class CarAvoidancePointActionServer(Node):
         nearest_boundary = self.find_nearest_boundary(robot_pose, cleaning_area_vertices)
         y_ = nearest_boundary[0][1] - nearest_boundary[1][1]
         x_ = nearest_boundary[0][0] - nearest_boundary[1][0]
-        self.get_logger().info(f'nearest_boundary: [({nearest_boundary[0][0]}, {nearest_boundary[0][1]}), ({nearest_boundary[1][0]}, {nearest_boundary[1][1]})]')
+        nb0 = nearest_boundary[0]
+        nb1 = nearest_boundary[1]
+        self.get_logger().info(
+            f'nearest_boundary: [({nb0[0]:.3f}, {nb0[1]:.3f}), ({nb1[0]:.3f}, {nb1[1]:.3f})]'
+        )
 
         # 计算搜索方向 k
         k = np.arctan2(y_, x_)
-        self.get_logger().info(f'k_radian: {k}, k_degree: {k / math.pi * 180}')
+        self.get_logger().info(f'k_radian: {k:.3f}, k_degree: {k / math.pi * 180:.3f}')
 
         # 根据车的位置调整 k 方向
         car_pose = self.action_goal_handle_msg.car_pose.pose.position
-        self.get_logger().info(f'robot: ({robot_x}, {robot_y})')
-        self.get_logger().info(f'car: ({car_pose.x}, {car_pose.y})')
+        self.get_logger().info(f'robot: ({robot_x:.3f}, {robot_y:.3f})')
+        self.get_logger().info(f'car: ({car_pose.x:.3f}, {car_pose.y:.3f})')
 
         # 统一发布基础调试 marker（车、机器人、最近长边）
         self._publish_debug_markers(robot_x, robot_y, car_pose, nearest_boundary)
@@ -520,7 +546,7 @@ class CarAvoidancePointActionServer(Node):
 
         car_robot_k = np.arctan2(robot_y - car_pose.y, robot_x - car_pose.x)
         k_diff = self.angle_diff(k, car_robot_k)
-        self.get_logger().info(f'k: {k}, car_robot_k: {car_robot_k}, k_diff: {k_diff}')
+        self.get_logger().info(f'k: {k:.3f}, car_robot_k: {car_robot_k:.3f}, k_diff: {k_diff:.3f}')
         if k_diff > math.pi / 2:
             k = self.add_angles(k, math.pi)
 
@@ -531,7 +557,7 @@ class CarAvoidancePointActionServer(Node):
         ])
         k_robot = yaw
         k_diff2 = self.angle_diff(k, k_robot)
-        self.get_logger().info(f'k: {k}, k_robot: {k_robot}, k_diff2: {k_diff2}')
+        self.get_logger().info(f'k: {k:.3f}, k_robot: {k_robot:.3f}, k_diff2: {k_diff2:.3f}')
 
         return {
             'costmap': costmap,
@@ -686,10 +712,22 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info(f'尝试外部停车点，共{len(external_candidates)}个')
             valid_external = []    # 所有的满足的外部停车点
             for ext_pose in external_candidates:
+                # 外部停车点且在通道外 → 跳过服务检查
+                ext_is_inside = self.is_point_inside_parallelogram(
+                    ext_pose.pose.position.x, ext_pose.pose.position.y, self.vertices
+                )
+                skip_service = not ext_is_inside
+                if skip_service:
+                    self.get_logger().info(
+                        f'外部停车点({ext_pose.pose.position.x:.2f}, '
+                        f'{ext_pose.pose.position.y:.2f}) 在通道外，将跳过服务检查'
+                    )
+
                 # 对单个点进行完整的筛选流程
                 if self._validate_candidate(
                     ext_pose, costmap, robot_x, robot_y,
-                    origin_x, origin_y, resolution, width, height, nearest_boundary
+                    origin_x, origin_y, resolution, width, height, nearest_boundary,
+                    skip_service_check=skip_service
                 ):
                     valid_external.append(ext_pose)
 
@@ -705,37 +743,23 @@ class CarAvoidancePointActionServer(Node):
                     best.pose.position.x, best.pose.position.y, self.vertices
                 )
                 if is_inside:
-                    # 通道内的固定停靠点：按原来的方法修改方向
-                    orientation = best.pose.orientation
-                    is_default_orientation = (
-                        abs(orientation.x) < 1e-6 and
-                        abs(orientation.y) < 1e-6 and
-                        abs(orientation.z) < 1e-6 and
-                        abs(abs(orientation.w) - 1.0) < 1e-6
+                    # 通道内的固定停靠点：统一按避让方向重算方向，
+                    # 与自搜索点保持一致，不再使用外部点自带的 yaw。
+                    direction_vec = (
+                        best.pose.position.x - robot_x,
+                        best.pose.position.y - robot_y
                     )
-                    if is_default_orientation:
-                        direction_vec = (
-                            best.pose.position.x - robot_x,
-                            best.pose.position.y - robot_y
-                        )
-                        target_angle = math.degrees(k)
-                        adjusted_angle = self.adjust_angle(direction_vec, target_angle)
-                        yaw_rad = math.radians(adjusted_angle)
-                        quat = Quaternion()
-                        quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, yaw_rad)
-                        best.pose.orientation = quat
-                        self.get_logger().info(
-                            '通道内固定停靠点未发 yaw，已按避让方向重算方向'
-                        )
-                    else:
-                        self.get_logger().info(
-                            '通道内固定停靠点带有有效 yaw，保留原方向'
-                        )
+                    target_angle = math.degrees(k)
+                    adjusted_angle = self.adjust_angle(direction_vec, target_angle)
+                    yaw_rad = math.radians(adjusted_angle)
+                    quat = Quaternion()
+                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, yaw_rad)
+                    best.pose.orientation = quat
                     best.pose.position.z = 20.0
                     self.get_logger().info(
                         f'外部停车点通过校验共{len(valid_external)}个，'
                         f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
-                        f'该点在通道内，z = 20.0'
+                        f'该点在通道内，已按避让方向重算方向，z = 20.0'
                     )
                 else:
                     # 通道外的固定停靠点：方向值保持不变
@@ -777,7 +801,7 @@ class CarAvoidancePointActionServer(Node):
         # 计算通道宽度和终止条件
         passage_width = self.calculate_total_passage_width(self.vertices)
         half_width = passage_width / 2.0
-        self.get_logger().info(f'通道宽度: {passage_width}, 半宽: {half_width}')
+        self.get_logger().info(f'通道宽度: {passage_width:.3f}, 半宽: {half_width:.3f}')
 
         # 单次搜索：只在当前偏移位置搜索一次
         avoidance_pose_result = None
@@ -879,11 +903,32 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info('findIntersection 返回 None，放弃搜索')
             return None
 
+        # 搜索框最前面的短边不能越过通道前方短边
+        forward_short_edge = self.get_forward_short_edge(robot_x, robot_y, self.vertices, k)
+        polygon_center = np.mean(np.array(self.vertices), axis=0)
+        if self.is_point_beyond_edge(
+            [p1_near[0], p1_near[1]],
+            forward_short_edge,
+            polygon_center
+        ) or self.is_point_beyond_edge(
+            [p1_far[0], p1_far[1]],
+            forward_short_edge,
+            polygon_center
+        ):
+            self.get_logger().error(
+                '搜索框构造失败：搜索框最前面的短边越过了通道前方短边'
+            )
+            return None
+
         find_vertices = self.sort_quadrilateral_vertices([
             p1_near, p1_far, p2_far, p2_near
         ])
 
-        self.get_logger().info(f'find_vertices: {find_vertices}')
+        fv = find_vertices
+        self.get_logger().info(
+            f'find_vertices: [({fv[0][0]:.3f}, {fv[0][1]:.3f}),({fv[1][0]:.3f}, {fv[1][1]:.3f}),'
+            f'({fv[2][0]:.3f}, {fv[2][1]:.3f}),({fv[3][0]:.3f}, {fv[3][1]:.3f})]'
+        )
 
         # 发布搜索区域 marker
         self._publish_debug_markers(
@@ -983,6 +1028,50 @@ class CarAvoidancePointActionServer(Node):
         # else:
         #     self.get_logger().info('该点无法避障。')
         #     return False
+
+    def _publish_all_passages_marker(self, polygons):
+        """
+        发布所有通道多边形到 marker_all_passages，用蓝色细线可视化。
+        :param polygons: list of garage_utils_msgs.msg.Polygon
+        """
+        now = self.get_clock().now().to_msg()
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = now
+        marker.id = 20
+        marker.type = Marker.LINE_LIST
+        marker.action = Marker.ADD
+        marker.scale.x = 0.03
+        marker.color.r = 0.0
+        marker.color.g = 0.5
+        marker.color.b = 1.0
+        marker.color.a = 0.8
+
+        if not polygons or len(polygons) == 0:
+            marker.action = Marker.DELETE
+            self.marker_all_passages_publisher.publish(marker)
+            return
+
+        for polygon in polygons:
+            pts = polygon.points
+            if len(pts) < 2:
+                continue
+            n = len(pts)
+            for i in range(n):
+                p1 = pts[i]
+                p2 = pts[(i + 1) % n]
+                point1 = Point()
+                point1.x = p1.x
+                point1.y = p1.y
+                point1.z = p1.z
+                marker.points.append(point1)
+                point2 = Point()
+                point2.x = p2.x
+                point2.y = p2.y
+                point2.z = p2.z
+                marker.points.append(point2)
+
+        self.marker_all_passages_publisher.publish(marker)
 
     def _special_terrain_callback(self, msg):
         self.special_terrain_polygons = msg.polygons
@@ -1116,7 +1205,8 @@ class CarAvoidancePointActionServer(Node):
         return [ps for _, ps in results]
 
     def _validate_candidate(self, avoidance_pose, costmap, robot_x, robot_y,
-                             origin_x, origin_y, resolution, width, height, nearest_boundary):
+                             origin_x, origin_y, resolution, width, height, nearest_boundary,
+                             skip_service_check=False):
         """
         对单个候选点执行完整校验链
         返回 True 通过，False 不通过
@@ -1184,6 +1274,14 @@ class CarAvoidancePointActionServer(Node):
         ):
             self.get_logger().info(f'候选点({px_point:.2f},{py_point:.2f}) 扫掠区域有障碍')
             return False
+
+        # ===== 外部停车点且在通道外：跳过服务检查，直接通过 =====
+        if skip_service_check:
+            self.get_logger().info(
+                f'候选点({px_point:.2f},{py_point:.2f}) 为通道外外部停车点，'
+                f'跳过 /check_car_passable 服务检查，直接通过'
+            )
+            return True
 
         # 服务检查
         avoidance_pose_msg = IsCarPassable.Request()
@@ -1496,9 +1594,10 @@ class CarAvoidancePointActionServer(Node):
         cv2.fillConvexPoly(mask, np.array(pixel_vertices, dtype=np.int32), 255)
         total_points = int(np.count_nonzero(mask == 255))
 
+        fp_str = ', '.join([f'({v[0]:.3f}, {v[1]:.3f})' for v in self.footprint_vertices])
         self.get_logger().info(
-            f'静态检查信息: footprint 覆盖栅格数={total_points}, '
-            f'分辨率={resolution}m, footprint_vertices={self.footprint_vertices}'
+            f'获取当前格子数量和地图的边长 footprint 覆盖栅格数={total_points}, '
+            f'分辨率={resolution:.3f}m, footprint_vertices=[{fp_str}]'
         )
         self._static_check_info_logged = True
 
@@ -1807,6 +1906,66 @@ class CarAvoidancePointActionServer(Node):
         )
         values = np.array([costmap[p[1], p[0]] for p in bresenham_points])
         return bool((values <= threshold).all())
+
+    def get_polygon_edges(self, vertices):
+        """返回四边形的四条边 [(p0,p1), (p1,p2), (p2,p3), (p3,p0)]"""
+        return [
+            (vertices[0], vertices[1]),
+            (vertices[1], vertices[2]),
+            (vertices[2], vertices[3]),
+            (vertices[3], vertices[0]),
+        ]
+
+    def get_short_edges(self, vertices):
+        """返回两条短边"""
+        edges = self.get_polygon_edges(vertices)
+        edge_infos = []
+        for edge in edges:
+            p1 = np.array(edge[0])
+            p2 = np.array(edge[1])
+            length = np.linalg.norm(p2 - p1)
+            edge_infos.append((edge, length))
+
+        edge_infos.sort(key=lambda x: x[1])  # 从短到长
+        return [edge_infos[0][0], edge_infos[1][0]]
+
+    def get_forward_short_edge(self, robot_x, robot_y, vertices, k):
+        """按搜索方向 k 找前方短边"""
+        short_edges = self.get_short_edges(vertices)
+        dir_vec = np.array([math.cos(k), math.sin(k)])
+        robot = np.array([robot_x, robot_y])
+
+        best_edge = None
+        best_proj = -float('inf')
+
+        for edge in short_edges:
+            p1 = np.array(edge[0])
+            p2 = np.array(edge[1])
+            mid = (p1 + p2) / 2.0
+            proj = np.dot(mid - robot, dir_vec)
+            if proj > best_proj:
+                best_proj = proj
+                best_edge = edge
+
+        return best_edge
+
+    def is_point_beyond_edge(self, point, edge, polygon_center):
+        """point 是否越过 edge 到多边形外侧"""
+        p = np.array(point, dtype=float)
+        a = np.array(edge[0], dtype=float)
+        b = np.array(edge[1], dtype=float)
+        c = np.array(polygon_center, dtype=float)
+
+        edge_vec = b - a
+        normal1 = np.array([-edge_vec[1], edge_vec[0]], dtype=float)
+        normal2 = -normal1
+
+        if np.dot(c - a, normal1) >= 0:
+            inward_normal = normal1
+        else:
+            inward_normal = normal2
+
+        return np.dot(p - a, inward_normal) < 0
 
     def bresenham(self, current_x, current_y, target_x, target_y, map_array):
         """
