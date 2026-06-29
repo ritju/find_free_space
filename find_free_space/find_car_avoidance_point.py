@@ -745,15 +745,14 @@ class CarAvoidancePointActionServer(Node):
                 if is_inside:
                     # 通道内的固定停靠点：统一按避让方向重算方向，
                     # 与自搜索点保持一致，不再使用外部点自带的 yaw。
-                    direction_vec = (
-                        best.pose.position.x - robot_x,
-                        best.pose.position.y - robot_y
-                    )
-                    target_angle = math.degrees(k)
-                    adjusted_angle = self.adjust_angle(direction_vec, target_angle)
-                    yaw_rad = math.radians(adjusted_angle)
+                    # 选择长边方向中远离车的那一侧。
+                    to_car_x = car_pose.x - robot_x
+                    to_car_y = car_pose.y - robot_y
+                    k_vec = (math.cos(k), math.sin(k))
+                    dot = k_vec[0] * to_car_x + k_vec[1] * to_car_y
+                    final_yaw = k if dot < 0 else k + math.pi
                     quat = Quaternion()
-                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, yaw_rad)
+                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, final_yaw)
                     best.pose.orientation = quat
                     best.pose.position.z = 20.0
                     self.get_logger().info(
@@ -1214,6 +1213,28 @@ class CarAvoidancePointActionServer(Node):
         px_point = avoidance_pose.pose.position.x
         py_point = avoidance_pose.pose.position.y
 
+        # ===== 位置硬约束：车和点必须分居机器人前后两侧 =====
+        car_x = self.action_goal_handle_msg.car_pose.pose.position.x
+        car_y = self.action_goal_handle_msg.car_pose.pose.position.y
+        robot_yaw = self.get_yaw_from_pose(self.robot_pose)
+
+        # 车和点都转到 base_link，看局部 x（前为正，后为负）
+        def _local_x(wx, wy):
+            dx = wx - robot_x
+            dy = wy - robot_y
+            return dx * math.cos(robot_yaw) + dy * math.sin(robot_yaw)
+
+        car_local_x = _local_x(car_x, car_y)
+        point_local_x = _local_x(px_point, py_point)
+
+        # 一前一后 → 乘积为负 → 合格；同侧 → 乘积>=0 → 拒绝
+        if car_local_x * point_local_x >= 0:
+            self.get_logger().info(
+                f'候选点({px_point:.2f},{py_point:.2f}) 与车在机器人同侧'
+                f'(car_local_x={car_local_x:.2f}, point_local_x={point_local_x:.2f})，拒绝'
+            )
+            return False
+
         # 像素坐标
         point_pixel = (np.array([px_point, py_point]) - np.array([origin_x, origin_y])) / resolution
         point_pixel[0] = np.clip(point_pixel[0], 0, width - 1)
@@ -1492,24 +1513,32 @@ class CarAvoidancePointActionServer(Node):
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
     def process_points(self, robot_pose, vertices, points, direction):
-        edge1, edge2 = self.calculate_long_edges(vertices)
-        line1, line2 = edge1[2], edge2[2]
-        angle1, angle2 = edge1[1], edge2[1]
-        
+        car_x = self.action_goal_handle_msg.car_pose.pose.position.x
+        car_y = self.action_goal_handle_msg.car_pose.pose.position.y
+        robot_x = robot_pose.pose.position.x
+        robot_y = robot_pose.pose.position.y
+
+        # 机器人 -> 车 的方向
+        to_car_x = car_x - robot_x
+        to_car_y = car_y - robot_y
+
+        # 长边方向 k，两个朝向：k 和 k+180
+        k = direction
+        k_vec = (math.cos(k), math.sin(k))
+
+        # k 方向和"机器人->车"点积：负=夹角>90度=背对车
+        dot = k_vec[0] * to_car_x + k_vec[1] * to_car_y
+        if dot < 0:
+            final_yaw = k            # k 已经背对车
+        else:
+            final_yaw = k + math.pi  # 反过来才背对车
+
+        final_angle = math.degrees(final_yaw)
+
         results = []
         for point in points:
-            dx = point[0] - robot_pose.pose.position.x
-            dy = point[1] - robot_pose.pose.position.y
-            alpha = math.degrees(math.atan2(dy, dx))
-            
-            dist1 = self.distance_point_to_line(point, line1)
-            dist2 = self.distance_point_to_line(point, line2)
-            # target_angle = angle1 if dist1 < dist2 else angle2
-            target_angle = math.degrees(direction)
-            direction_vec = (dx, dy)
-            alpha = self.adjust_angle(direction_vec, target_angle)
-            results.append((point, alpha))
-        
+            results.append((point, final_angle))
+
         return results
     
 

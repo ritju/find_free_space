@@ -6,19 +6,19 @@
 这个脚本用来给 find_free_space_action_server 提供完整外部输入，
 并按【测试模式】依次验证下面这些功能：
 
-  1. 机器人 base_link 不在通道内 -> 直接找不到 (Action aborted)
-  2. 机器人不在通道内但发了外部停车点 -> 仍 aborted (验证外部点不影响早期 abort)
+  1. 机器人不在通道内但发了外部停车点 -> 仍 aborted (验证外部点不影响早期 abort)
+  2. 机器人和车之间有一个外部通道内点 -> 验证位置过滤会拒绝该点
   3. 通道外的外部固定点 -> 不请求 /check_car_passable 服务
   4. 通道内的外部固定点 -> 仍然请求服务
   5. 自搜索找到的候选点 -> 仍然请求服务
   6. 搜索框最前面的短边越过通道前方短边 -> 搜索框构造失败 -> aborted
 
   本脚本通过参数 test_mode 切换测试场景，一次只跑一个场景。
-  # 场景1: 机器人不在通道内, 应该直接 aborted
-  python3 warning.py --ros-args -p test_mode:=robot_outside_abort
-
-  # 场景2: 机器人不在通道内但发了外部停车点, 仍应 aborted
+  # 场景1: 机器人不在通道内但发了外部停车点, 仍应 aborted
   python3 warning.py --ros-args -p test_mode:=robot_outside_with_external
+
+  # 场景2: 机器人和车之间有一个外部通道内点, 验证位置过滤
+  python3 warning.py --ros-args -p test_mode:=external_inside_between_robot_car
 
   # 场景3: 通道外外部固定点, 不请求服务 (服务调用次数应为 0)
   python3 warning.py --ros-args -p test_mode:=external_outside_skip_service
@@ -56,10 +56,10 @@ from tf_transformations import quaternion_from_euler, euler_from_quaternion
 
 # 所有支持的测试模式 + 预期结果说明 (用于运行时打印, 方便对照)
 TEST_MODE_DESC = {
-    'robot_outside_abort':
-        '机器人不在通道内 -> 预期: Action aborted, 服务调用次数 = 0',
     'robot_outside_with_external':
         '机器人不在通道内但发了外部停车点 -> 预期: 仍 aborted, 服务调用次数 = 0',
+    'external_inside_between_robot_car':
+        '机器人和车之间有一个外部通道内点 -> 预期: 该点被位置过滤拒绝, 回退自搜索',
     'external_outside_skip_service':
         '通道外外部固定点 -> 预期: 不请求服务(次数=0), Action 成功, z=30',
     'external_inside_need_service':
@@ -100,7 +100,7 @@ class SimulateAvoidanceEnv(Node):
         self.declare_parameter('stop_points_topic', '/vehicle_avoidance_stop_points')
         self.declare_parameter('check_service_name', '/check_car_passable')
 
-        # robot_outside_abort 模式: 通道整体往前平移多远(让机器人落在通道外) m
+        # robot_outside_with_external 模式: 通道整体往前平移多远(让机器人落在通道外) m
         self.declare_parameter('robot_outside_shift', 20.0)
         # search_box_exceed 模式: 把通道长度压到多短(让搜索框前边越界) m
         self.declare_parameter('short_passage_length', 4.0)
@@ -284,8 +284,13 @@ class SimulateAvoidanceEnv(Node):
                 (-3.0, 0.0, '外部点1'),
                 (-4.0, 0.5, '外部点2'),
             ]
-        elif self.test_mode in ('robot_outside_abort', 'search_box_exceed_front_short_edge'):
-            # 这两个模式不需要外部点, 发空数组
+        elif self.test_mode == 'external_inside_between_robot_car':
+            # 机器人在通道内, 但外部点放在机器人和车之间 -> 应被位置过滤拒绝
+            configs = [
+                (self.car_distance_ahead / 2.0, 0.0, '机器人和车之间的通道内点'),
+            ]
+        elif self.test_mode == 'search_box_exceed_front_short_edge':
+            # 这个模式不需要外部点, 发空数组
             configs = []
         else:
             configs = [(-3.0, half_w - 0.3, '默认点1')]
@@ -351,7 +356,7 @@ class SimulateAvoidanceEnv(Node):
         center_x = robot_x   # 默认: 通道以机器人为中心 -> 机器人在通道内
         center_y = robot_y
 
-        if self.test_mode in ('robot_outside_abort', 'robot_outside_with_external'):
+        if self.test_mode == 'robot_outside_with_external':
             # 通道整体往前平移, 让机器人落在通道外 -> server 应判定找不到通道
             center_x = robot_x + cos_d * self.robot_outside_shift
             center_y = robot_y + sin_d * self.robot_outside_shift
