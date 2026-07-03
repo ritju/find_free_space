@@ -712,16 +712,24 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info(f'尝试外部停车点，共{len(external_candidates)}个')
             valid_external = []    # 所有的满足的外部停车点
             for ext_pose in external_candidates:
-                # 外部停车点且在通道外 → 跳过服务检查
                 ext_is_inside = self.is_point_inside_parallelogram(
                     ext_pose.pose.position.x, ext_pose.pose.position.y, self.vertices
                 )
-                skip_service = not ext_is_inside
-                if skip_service:
+                if ext_is_inside:
+                    # 通道内：先按避让方向覆盖 yaw，再校验（与自搜索点一致）
+                    final_yaw = self._compute_avoidance_yaw(
+                        k, robot_x, robot_y, car_pose.x, car_pose.y
+                    )
+                    quat = Quaternion()
+                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, final_yaw)
+                    ext_pose.pose.orientation = quat
+                else:
                     self.get_logger().info(
                         f'外部停车点({ext_pose.pose.position.x:.2f}, '
                         f'{ext_pose.pose.position.y:.2f}) 在通道外，将跳过服务检查'
                     )
+
+                skip_service = not ext_is_inside
 
                 # 对单个点进行完整的筛选流程
                 if self._validate_candidate(
@@ -743,22 +751,11 @@ class CarAvoidancePointActionServer(Node):
                     best.pose.position.x, best.pose.position.y, self.vertices
                 )
                 if is_inside:
-                    # 通道内的固定停靠点：统一按避让方向重算方向，
-                    # 与自搜索点保持一致，不再使用外部点自带的 yaw。
-                    # 选择长边方向中远离车的那一侧。
-                    to_car_x = car_pose.x - robot_x
-                    to_car_y = car_pose.y - robot_y
-                    k_vec = (math.cos(k), math.sin(k))
-                    dot = k_vec[0] * to_car_x + k_vec[1] * to_car_y
-                    final_yaw = k if dot < 0 else k + math.pi
-                    quat = Quaternion()
-                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, final_yaw)
-                    best.pose.orientation = quat
                     best.pose.position.z = 20.0
                     self.get_logger().info(
                         f'外部停车点通过校验共{len(valid_external)}个，'
                         f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
-                        f'该点在通道内，已按避让方向重算方向，z = 20.0'
+                        f'该点在通道内，使用避让方向，z = 20.0'
                     )
                 else:
                     # 通道外的固定停靠点：方向值保持不变
@@ -1512,27 +1509,23 @@ class CarAvoidancePointActionServer(Node):
 
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
+    def _compute_avoidance_yaw(self, k, robot_x, robot_y, car_x, car_y):
+        """沿通道长边方向，选择与来车方向背对的 yaw（与自搜索点一致）"""
+        to_car_x = car_x - robot_x
+        to_car_y = car_y - robot_y
+        k_vec = (math.cos(k), math.sin(k))
+        dot = k_vec[0] * to_car_x + k_vec[1] * to_car_y
+        return k if dot < 0 else k + math.pi
+
     def process_points(self, robot_pose, vertices, points, direction):
         car_x = self.action_goal_handle_msg.car_pose.pose.position.x
         car_y = self.action_goal_handle_msg.car_pose.pose.position.y
         robot_x = robot_pose.pose.position.x
         robot_y = robot_pose.pose.position.y
 
-        # 机器人 -> 车 的方向
-        to_car_x = car_x - robot_x
-        to_car_y = car_y - robot_y
-
-        # 长边方向 k，两个朝向：k 和 k+180
-        k = direction
-        k_vec = (math.cos(k), math.sin(k))
-
-        # k 方向和"机器人->车"点积：负=夹角>90度=背对车
-        dot = k_vec[0] * to_car_x + k_vec[1] * to_car_y
-        if dot < 0:
-            final_yaw = k            # k 已经背对车
-        else:
-            final_yaw = k + math.pi  # 反过来才背对车
-
+        final_yaw = self._compute_avoidance_yaw(
+            direction, robot_x, robot_y, car_x, car_y
+        )
         final_angle = math.degrees(final_yaw)
 
         results = []
