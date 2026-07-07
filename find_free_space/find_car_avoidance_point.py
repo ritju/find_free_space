@@ -1306,6 +1306,7 @@ class CarAvoidancePointActionServer(Node):
         avoidance_pose_msg.robot_pose = avoidance_pose
         avoidance_pose_msg.car_pose = self.action_goal_handle_msg.car_pose
         avoidance_pose_msg.size = self.action_goal_handle_msg.car_size
+        avoidance_pose_msg.find_parking_pint = True
         start_time = time.time()
         check_result = self.check_avoidance(avoidance_pose_msg)
         end_time = time.time()
