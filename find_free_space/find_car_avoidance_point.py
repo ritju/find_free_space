@@ -96,6 +96,7 @@ class CarAvoidancePointActionServer(Node):
         callback_gp2 = MutuallyExclusiveCallbackGroup()
         callback_gp3 = MutuallyExclusiveCallbackGroup()
         callback_gp4 = MutuallyExclusiveCallbackGroup()
+        self._costmap_cb_group = callback_gp2
 
         self.footprint_sub_ = self.create_subscription(
             PolygonStamped, 
@@ -105,8 +106,8 @@ class CarAvoidancePointActionServer(Node):
             callback_group=callback_gp4)
 
         self.robot_pose = PoseStamped()
-        # 创建一个timer，用于实时获取机器人的位姿
-        self.get_robot_pose_timer_ = self.create_timer(timer_period_sec=0.1, callback=self.get_robot_pose_timer_callback)
+        # 有请求时再开，空闲不开
+        self.get_robot_pose_timer_ = None
 
         self.polygons = []
         self.vertices = []
@@ -123,12 +124,8 @@ class CarAvoidancePointActionServer(Node):
         # tf2
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.global_costmap_sub = self.create_subscription(
-            Costmap,
-            self.topic_name_global_costmap,
-            self.global_costmap_callback,
-            10,
-            callback_group=callback_gp2)
+        # 有请求时再订，空闲不订
+        self.global_costmap_sub = None
         self.global_costmap = None
         # 检查pose能否避让的服务
         self.check_avoidance_service = self.create_client(IsCarPassable, '/check_car_passable',callback_group=callback_gp3)
@@ -277,7 +274,6 @@ class CarAvoidancePointActionServer(Node):
         if self.show_global_costmap_raw_colored_cv2 or self.show_global_costmap_raw_cv2:
             cv2.waitKey(1)
     
-    # 用于实时获取机器人的位姿
     def get_robot_pose_timer_callback(self):
         try:
             trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
@@ -290,6 +286,38 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().error(f'{e}', throttle_duration_sec=5.0)
         
         # self.get_logger().info(f'机器人当前位姿: [{self.robot_pose.pose.position.x}, {self.robot_pose.pose.position.y}]', throttle_duration_sec=2)
+
+    def _start_robot_pose_timer(self):
+        if self.get_robot_pose_timer_ is None:
+            self.get_robot_pose_timer_ = self.create_timer(
+                timer_period_sec=0.1, callback=self.get_robot_pose_timer_callback)
+            self.get_robot_pose_timer_callback()
+
+    def _stop_robot_pose_timer(self):
+        if self.get_robot_pose_timer_ is not None:
+            self.destroy_timer(self.get_robot_pose_timer_)
+            self.get_robot_pose_timer_ = None
+
+    def _start_global_costmap_sub(self):
+        if self.global_costmap_sub is None:
+            self.global_costmap_sub = self.create_subscription(
+                Costmap,
+                self.topic_name_global_costmap,
+                self.global_costmap_callback,
+                10,
+                callback_group=self._costmap_cb_group)
+
+    def _stop_global_costmap_sub(self):
+        if self.global_costmap_sub is not None:
+            self.destroy_subscription(self.global_costmap_sub)
+            self.global_costmap_sub = None
+        self.global_costmap = None
+
+    def _wait_for_global_costmap(self, timeout_sec=2.0):
+        deadline = time.time() + timeout_sec
+        while self.global_costmap is None and time.time() < deadline:
+            time.sleep(0.05)
+        return self.global_costmap is not None
 
     def get_vertices_callback(self):
         if len(self.polygons) == 0:
@@ -350,86 +378,98 @@ class CarAvoidancePointActionServer(Node):
 
     def action_goal_callback(self, goal_handle):
         self.get_logger().info('开始寻找避让点...')
-        # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
-        self.action_goal_handle_msg = goal_handle.request
-        self.vehicle_width = self.action_goal_handle_msg.car_size.y
-        # car_pose 有效性检查：frame_id 为空表示消息未填充
-        car_pose = self.action_goal_handle_msg.car_pose
-        
-        # if car_pose.header.frame_id == '':
-        #     self.get_logger().error('car_pose 为空/无效  frame_id 为空，abort')
-        #     goal_handle.abort()
-        #     return FindCarAvoidancePoint.Result()
+        self._start_robot_pose_timer()
+        self._start_global_costmap_sub()
+        try:
+            if not self._wait_for_global_costmap():
+                self.get_logger().error('等待全局代价地图超时')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
+            self.get_robot_pose_timer_callback()
 
-        self.polygons = self.action_goal_handle_msg.polygons
-        self.get_logger().info(f'polygons: {self.polygons}')
-        
-        # 发布所有通道多边形 marker
-        self._publish_all_passages_marker(self.polygons)
-        
-        # 获取清洁区域信息
-        # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
-        self.get_logger().info('寻找当前通行区域...')
-
-        self.vertices = list(self.vertices)
-        self.vertices.clear()
-        self.get_vertices_callback()
-
-        if len(self.vertices) == 0:
-            self.get_logger().error('未找到用于寻找停靠点的通道')
-            goal_handle.abort()
-            return FindCarAvoidancePoint.Result()
-
-        v1, v2, v3, v4 = self.vertices
-        self.get_logger().info(
-            f'当前通行区域: [({v1[0]:.3f}, {v1[1]:.3f}),({v2[0]:.3f}, {v2[1]:.3f}),'
-            f'({v3[0]:.3f}, {v3[1]:.3f}),({v4[0]:.3f}, {v4[1]:.3f})]'
-        )
-
-
-        # self.get_logger().info(f'self.get_vertices_callback():{len(self.vertices)}')
-        # self.get_logger().info(f'self.vertices:{self.vertices}')
-        
-
-        # 寻找停靠点
-        self.get_logger().info('寻找停靠点...')
-        avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
-        if avoidance_point is not None:
-            ap = avoidance_point.pose
-            yaw = math.degrees(self.get_yaw_from_pose(avoidance_point))
-            self.get_logger().info(
-                f'成功找到避让点: x={ap.position.x:.3f}, y={ap.position.y:.3f}, '
-                f'z={ap.position.z:.3f}, yaw={yaw:.3f}°'
-            )
-
-            # 发布最终避让点 marker
-            nearest_boundary = self.find_nearest_boundary(self.robot_pose, self.vertices)
-            car_pose = self.action_goal_handle_msg.car_pose.pose.position
-            self._publish_debug_markers(
-                self.robot_pose.pose.position.x,
-                self.robot_pose.pose.position.y,
-                car_pose,
-                nearest_boundary,
-                avoidance_point=avoidance_point
-            )
-
-            goal_handle.succeed()
-            # goal_handle.abort()
-            result = FindCarAvoidancePoint.Result()
-            result.pose = avoidance_point
+            # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
+            self.action_goal_handle_msg = goal_handle.request
+            self.vehicle_width = self.action_goal_handle_msg.car_size.y
+            # car_pose 有效性检查：frame_id 为空表示消息未填充
+            car_pose = self.action_goal_handle_msg.car_pose
             
-            rp = result.pose.pose
-            yaw = math.degrees(self.get_yaw_from_pose(result.pose))
-            self.get_logger().info(
-                f'成功找到避让点*****: x={rp.position.x:.3f}, y={rp.position.y:.3f}, '
-                f'z={rp.position.z:.3f}, yaw={yaw:.3f}°'
-            )
+            # if car_pose.header.frame_id == '':
+            #     self.get_logger().error('car_pose 为空/无效  frame_id 为空，abort')
+            #     goal_handle.abort()
+            #     return FindCarAvoidancePoint.Result()
+
+            self.polygons = self.action_goal_handle_msg.polygons
+            self.get_logger().info(f'polygons: {self.polygons}')
             
-            return result
-        else:
-            self.get_logger().error('外部停车点和自搜索均未找到有效避让点')
-            goal_handle.abort()
-            return FindCarAvoidancePoint.Result()
+            # 发布所有通道多边形 marker
+            self._publish_all_passages_marker(self.polygons)
+            
+            # 获取清洁区域信息
+            # 每次需要用到self.vertices时，调用一下 get_vertices_callback()
+            self.get_logger().info('寻找当前通行区域...')
+
+            self.vertices = list(self.vertices)
+            self.vertices.clear()
+            self.get_vertices_callback()
+
+            if len(self.vertices) == 0:
+                self.get_logger().error('未找到用于寻找停靠点的通道')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
+
+            v1, v2, v3, v4 = self.vertices
+            self.get_logger().info(
+                f'当前通行区域: [({v1[0]:.3f}, {v1[1]:.3f}),({v2[0]:.3f}, {v2[1]:.3f}),'
+                f'({v3[0]:.3f}, {v3[1]:.3f}),({v4[0]:.3f}, {v4[1]:.3f})]'
+            )
+
+
+            # self.get_logger().info(f'self.get_vertices_callback():{len(self.vertices)}')
+            # self.get_logger().info(f'self.vertices:{self.vertices}')
+            
+
+            # 寻找停靠点
+            self.get_logger().info('寻找停靠点...')
+            avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
+            if avoidance_point is not None:
+                ap = avoidance_point.pose
+                yaw = math.degrees(self.get_yaw_from_pose(avoidance_point))
+                self.get_logger().info(
+                    f'成功找到避让点: x={ap.position.x:.3f}, y={ap.position.y:.3f}, '
+                    f'z={ap.position.z:.3f}, yaw={yaw:.3f}°'
+                )
+
+                # 发布最终避让点 marker
+                nearest_boundary = self.find_nearest_boundary(self.robot_pose, self.vertices)
+                car_pose = self.action_goal_handle_msg.car_pose.pose.position
+                self._publish_debug_markers(
+                    self.robot_pose.pose.position.x,
+                    self.robot_pose.pose.position.y,
+                    car_pose,
+                    nearest_boundary,
+                    avoidance_point=avoidance_point
+                )
+
+                goal_handle.succeed()
+                # goal_handle.abort()
+                result = FindCarAvoidancePoint.Result()
+                result.pose = avoidance_point
+                
+                rp = result.pose.pose
+                yaw = math.degrees(self.get_yaw_from_pose(result.pose))
+                self.get_logger().info(
+                    f'成功找到避让点*****: x={rp.position.x:.3f}, y={rp.position.y:.3f}, '
+                    f'z={rp.position.z:.3f}, yaw={yaw:.3f}°'
+                )
+                
+                return result
+            else:
+                self.get_logger().error('外部停车点和自搜索均未找到有效避让点')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
+        finally:
+            self._stop_global_costmap_sub()
+            self._stop_robot_pose_timer()
 
     def calculate_total_passage_width(self, vertices):
 
