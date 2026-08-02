@@ -131,27 +131,14 @@ class CarAvoidancePointActionServer(Node):
         self.check_avoidance_service = self.create_client(IsCarPassable, '/check_car_passable',callback_group=callback_gp3)
 
         # 禁扫区多边形（/cleaning_tool_retraction_areas）
+        # 待命不订阅，任务期由 _start_special_terrain_sub 挂载
         self.special_terrain_polygons = None
-        qos_transient = QoSProfile(depth=1)
-        qos_transient.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        self.special_terrain_sub = self.create_subscription(
-            Polygons,
-            '/cleaning_tool_retraction_areas',
-            self._special_terrain_callback,
-            qos_transient,
-        )
+        self.special_terrain_sub = None
 
         # 避车停车点
+        # 待命不订阅，任务期由 _start_vehicle_stop_points_sub 挂载
         self.vehicle_avoidance_stop_points = None
-        qos_stop_points = QoSProfile(depth=1)
-        qos_stop_points.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        qos_stop_points.reliability = ReliabilityPolicy.RELIABLE
-        self.vehicle_stop_points_sub = self.create_subscription(
-            PoseArray,
-            '/vehicle_avoidance_stop_points',
-            self._vehicle_stop_points_callback,
-            qos_stop_points,
-        )
+        self.vehicle_stop_points_sub = None
 
     def init_params(self):
         self.declare_parameter("topic_name_global_costmap", "")          # 全局代价地图话题名
@@ -319,6 +306,49 @@ class CarAvoidancePointActionServer(Node):
             time.sleep(0.05)
         return self.global_costmap is not None
 
+    def _start_special_terrain_sub(self):
+        if self.special_terrain_sub is None:
+            qos_transient = QoSProfile(depth=1)
+            qos_transient.durability = DurabilityPolicy.TRANSIENT_LOCAL
+            self.special_terrain_sub = self.create_subscription(
+                Polygons,
+                '/cleaning_tool_retraction_areas',
+                self._special_terrain_callback,
+                qos_transient,
+            )
+
+    def _stop_special_terrain_sub(self):
+        if self.special_terrain_sub is not None:
+            self.destroy_subscription(self.special_terrain_sub)
+            self.special_terrain_sub = None
+        self.special_terrain_polygons = None
+
+    def _start_vehicle_stop_points_sub(self):
+        if self.vehicle_stop_points_sub is None:
+            qos_stop_points = QoSProfile(depth=1)
+            qos_stop_points.durability = DurabilityPolicy.TRANSIENT_LOCAL
+            qos_stop_points.reliability = ReliabilityPolicy.RELIABLE
+            self.vehicle_stop_points_sub = self.create_subscription(
+                PoseArray,
+                '/vehicle_avoidance_stop_points',
+                self._vehicle_stop_points_callback,
+                qos_stop_points,
+            )
+
+    def _stop_vehicle_stop_points_sub(self):
+        if self.vehicle_stop_points_sub is not None:
+            self.destroy_subscription(self.vehicle_stop_points_sub)
+            self.vehicle_stop_points_sub = None
+        self.vehicle_avoidance_stop_points = None
+
+    def _wait_for_special_terrain(self, timeout_sec=2.0):
+        """等待禁扫区第一条数据"""
+        deadline = time.time() + timeout_sec
+        while self.special_terrain_polygons is None and time.time() < deadline:
+            time.sleep(0.05)
+        if self.special_terrain_polygons is None:
+            self.get_logger().warn('等待禁扫区超时，本次任务不拦截禁扫区')
+
     def get_vertices_callback(self):
         if len(self.polygons) == 0:
             pass
@@ -380,11 +410,14 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info('开始寻找避让点...')
         self._start_robot_pose_timer()
         self._start_global_costmap_sub()
+        self._start_special_terrain_sub()
+        self._start_vehicle_stop_points_sub()
         try:
             if not self._wait_for_global_costmap():
                 self.get_logger().error('等待全局代价地图超时')
                 goal_handle.abort()
                 return FindCarAvoidancePoint.Result()
+            self._wait_for_special_terrain()
             self.get_robot_pose_timer_callback()
 
             # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
@@ -470,6 +503,8 @@ class CarAvoidancePointActionServer(Node):
         finally:
             self._stop_global_costmap_sub()
             self._stop_robot_pose_timer()
+            self._stop_special_terrain_sub()
+            self._stop_vehicle_stop_points_sub()
 
     def calculate_total_passage_width(self, vertices):
 
