@@ -840,6 +840,10 @@ class CarAvoidancePointActionServer(Node):
                         f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
                         f'该点在通道外，方向保持不变，z = 30.0'
                     )
+                    map_yaw_deg = math.degrees(self.get_yaw_from_pose(best))
+                    self.get_logger().info(
+                        f'通道外外部停靠点已选用，map yaw={map_yaw_deg:.1f}°'
+                    )
                 return best
 
             self.get_logger().info('有外部停车点，但是所有外部停车点在筛选判断以后均不满足，回退自搜索')
