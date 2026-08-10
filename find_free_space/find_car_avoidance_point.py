@@ -106,8 +106,8 @@ class CarAvoidancePointActionServer(Node):
             callback_group=callback_gp4)
 
         self.robot_pose = PoseStamped()
-        # 有请求时再开，空闲不开
-        self.get_robot_pose_timer_ = None
+        self.max_robot_pose_age = 1.0  # 最大允许时间
+        self.robot_pose_wait_timeout = 1.5
 
         self.polygons = []
         self.vertices = []
@@ -163,6 +163,8 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter('external_point_max_distance', 8.0)      # 外部点最大距离
         self.declare_parameter('point_free_check_radius', 0.2)          # 候选点周围无障碍检查半径(m)
         self.declare_parameter('stop_in_place_min_dist', 2.0)           # 机器人在通道外长边方向、且离长边超过这个距离才允许原地停
+        self.declare_parameter('max_robot_pose_age', 1.0)               # 机器人位姿最大允许年龄
+        self.declare_parameter('robot_pose_wait_timeout', 1.5)          # 等待新鲜位姿超时
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -185,6 +187,8 @@ class CarAvoidancePointActionServer(Node):
         self.external_point_max_distance = self.get_parameter('external_point_max_distance').value
         self.point_free_check_radius = self.get_parameter('point_free_check_radius').value
         self.stop_in_place_min_dist = self.get_parameter('stop_in_place_min_dist').value
+        self.max_robot_pose_age = self.get_parameter('max_robot_pose_age').value
+        self.robot_pose_wait_timeout = self.get_parameter('robot_pose_wait_timeout').value
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
@@ -207,6 +211,8 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'external_point_max_distance: {self.external_point_max_distance}')
         self.get_logger().info(f'point_free_check_radius: {self.point_free_check_radius}')
         self.get_logger().info(f'stop_in_place_min_dist: {self.stop_in_place_min_dist}')
+        self.get_logger().info(f'max_robot_pose_age: {self.max_robot_pose_age}')
+        self.get_logger().info(f'robot_pose_wait_timeout: {self.robot_pose_wait_timeout}')
     
     def footprint_sub_callback(self, msg):
         points = msg.polygon.points
@@ -261,29 +267,31 @@ class CarAvoidancePointActionServer(Node):
         if self.show_global_costmap_raw_colored_cv2 or self.show_global_costmap_raw_cv2:
             cv2.waitKey(1)
     
-    def get_robot_pose_timer_callback(self):
-        try:
-            trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-            self.robot_pose.header.stamp = self.get_clock().now().to_msg()
-            self.robot_pose.header.frame_id = 'map'
-            self.robot_pose.pose.position.x = trans.transform.translation.x
-            self.robot_pose.pose.position.y = trans.transform.translation.y
-            self.robot_pose.pose.orientation = trans.transform.rotation
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-            self.get_logger().error(f'{e}', throttle_duration_sec=5.0)
-        
-        # self.get_logger().info(f'机器人当前位姿: [{self.robot_pose.pose.position.x}, {self.robot_pose.pose.position.y}]', throttle_duration_sec=2)
-
-    def _start_robot_pose_timer(self):
-        if self.get_robot_pose_timer_ is None:
-            self.get_robot_pose_timer_ = self.create_timer(
-                timer_period_sec=0.1, callback=self.get_robot_pose_timer_callback)
-            self.get_robot_pose_timer_callback()
-
-    def _stop_robot_pose_timer(self):
-        if self.get_robot_pose_timer_ is not None:
-            self.destroy_timer(self.get_robot_pose_timer_)
-            self.get_robot_pose_timer_ = None
+    def _get_fresh_robot_pose(self, timeout_sec=None):
+        """获取一份新鲜的 map->base_link 位姿，超时或过期返回 None"""
+        if timeout_sec is None:
+            timeout_sec = self.robot_pose_wait_timeout
+        deadline = self.get_clock().now() + rclpy.duration.Duration(seconds=timeout_sec)
+        while self.get_clock().now() < deadline:
+            try:
+                trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+                age = (self.get_clock().now() - trans.header.stamp).nanoseconds / 1e9
+                if age > self.max_robot_pose_age:
+                    self.get_logger().warn(
+                        f'TF 位姿过旧 age={age:.2f}s', throttle_duration_sec=1.0)
+                    time.sleep(0.05)
+                    continue
+                pose = PoseStamped()
+                pose.header.stamp = trans.header.stamp
+                pose.header.frame_id = 'map'
+                pose.pose.position.x = trans.transform.translation.x
+                pose.pose.position.y = trans.transform.translation.y
+                pose.pose.orientation = trans.transform.rotation
+                return pose
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+                self.get_logger().error(f'{e}', throttle_duration_sec=1.0)
+                time.sleep(0.05)
+        return None
 
     def _start_global_costmap_sub(self):
         if self.global_costmap_sub is None:
@@ -408,7 +416,6 @@ class CarAvoidancePointActionServer(Node):
 
     def action_goal_callback(self, goal_handle):
         self.get_logger().info('开始寻找避让点...')
-        self._start_robot_pose_timer()
         self._start_global_costmap_sub()
         self._start_special_terrain_sub()
         self._start_vehicle_stop_points_sub()
@@ -418,7 +425,13 @@ class CarAvoidancePointActionServer(Node):
                 goal_handle.abort()
                 return FindCarAvoidancePoint.Result()
             self._wait_for_special_terrain()
-            self.get_robot_pose_timer_callback()
+
+            # 获取一份新鲜的机器人位姿，任务全程固定使用
+            self.robot_pose = self._get_fresh_robot_pose()
+            if self.robot_pose is None:
+                self.get_logger().error('无法获取新鲜的机器人位姿，abort')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
 
             # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
             self.action_goal_handle_msg = goal_handle.request
@@ -502,7 +515,6 @@ class CarAvoidancePointActionServer(Node):
                 return FindCarAvoidancePoint.Result()
         finally:
             self._stop_global_costmap_sub()
-            self._stop_robot_pose_timer()
             self._stop_special_terrain_sub()
             self._stop_vehicle_stop_points_sub()
 

@@ -18,6 +18,8 @@ find_free_space_action_server:
     show_global_costmap_raw_cv2: false
     show_global_costmap_raw_colored_cv2: false
     max_inward_offset: 1.5
+    max_robot_pose_age: 1.0          # 机器人位姿超过 1 秒没更新的位姿，不当成有效位姿
+    robot_pose_wait_timeout: 1.5     # 等待新鲜位姿超时
 
     #  GARAGE_FOOTPRINT_SWEEP_LONG_STEP
     footprint_sweep_long_step: 999.0
