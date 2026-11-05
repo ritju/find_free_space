@@ -1,29 +1,17 @@
 find_free_space_action_server:
   ros__parameters:
     topic_name_global_costmap: '/global_costmap/costmap_raw'
-    service_name_check_car_passble: '/check_car_passable'
     topic_name_footprint: '/global_costmap/published_footprint'
-    search_interval: 0.5
 
     search_radius_min: 3.0
     search_radius_max: 3.3      # 长度方向只有0.3m
     outside_min: 0.2
     outside_max: 0.35            # 宽度方向只有0.15m
-    search_point_interval: 0.15  # 采样间隔0.15m → 长度0.3/0.15=2点，宽度0.15/0.15=1点
     search_radius_extra_dis: 2.0 # 前避车时额外增加的寻找距离
 
     check_service_max_time: 1.0
-    distance_extend_outside: 1.1
-    inside_step: 0.1  # 每次往通道内部挪的步长（m）， GARAGE_FIND_PARKING_POINT_INSIDE_STEP 
     show_global_costmap_raw_cv2: false
     show_global_costmap_raw_colored_cv2: false
-    max_inward_offset: 1.5
     max_robot_pose_age: 1.0          # 机器人位姿超过 1 秒没更新的位姿，不当成有效位姿
     robot_pose_wait_timeout: 1.5     # 等待新鲜位姿超时
-
-    #  GARAGE_FOOTPRINT_SWEEP_LONG_STEP
-    footprint_sweep_long_step: 999.0
-    # GARAGE_FOOTPRINT_SWEEP_SHORT_STEP 
-    footprint_sweep_short_step: 999.0
-
-
+    strict_check_mode: false         # 严格检查模式：true 检查机器人到候选点的整个扫掠区域，false 只检查连线

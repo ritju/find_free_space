@@ -1,0 +1,579 @@
+#include "find_free_space/car_avoidance_point_server.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <sstream>
+#include <thread>
+
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include "tf2/exceptions.h"
+#include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+
+namespace find_free_space
+{
+
+namespace
+{
+
+std::string formatRing(const Ring & ring)
+{
+  std::ostringstream out;
+  out.setf(std::ios::fixed);
+  out.precision(3);
+  for (size_t i = 0; i < ring.size(); ++i) {
+    out << (i == 0 ? "" : ", ") << "(" << ring[i].x() << ", " << ring[i].y() << ")";
+  }
+  return out.str();
+}
+
+}  // namespace
+
+CarAvoidancePointServer::CarAvoidancePointServer()
+: rclcpp::Node("find_free_space_action_server")
+{
+  RCLCPP_INFO(get_logger(), "find_free_space_action_server started.");
+  initParams();
+
+  const auto marker_qos = rclcpp::QoS(1).transient_local();
+  marker_car_pose_publisher_ = create_publisher<visualization_msgs::msg::Marker>("marker_car_pose", marker_qos);
+  marker_robot_pose_publisher_ = create_publisher<visualization_msgs::msg::Marker>("marker_robot_pose", marker_qos);
+  marker_avoidance_side_publisher_ =
+    create_publisher<visualization_msgs::msg::Marker>("marker_avoidance_side", marker_qos);
+  marker_searching_rect_publisher_ =
+    create_publisher<visualization_msgs::msg::Marker>("marker_searching_rect", marker_qos);
+  marker_parking_point_publisher_ =
+    create_publisher<visualization_msgs::msg::Marker>("marker_parking_point", marker_qos);
+  marker_special_terrain_publisher_ =
+    create_publisher<visualization_msgs::msg::Marker>("marker_special_terrain", marker_qos);
+  marker_all_passages_publisher_ =
+    create_publisher<visualization_msgs::msg::Marker>("marker_all_passages", marker_qos);
+
+  action_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  costmap_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  service_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  footprint_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  rclcpp::SubscriptionOptions footprint_options;
+  footprint_options.callback_group = footprint_cb_group_;
+  footprint_sub_ = create_subscription<geometry_msgs::msg::PolygonStamped>(
+    topic_name_footprint_, rclcpp::QoS(1),
+    std::bind(&CarAvoidancePointServer::footprintCallback, this, std::placeholders::_1),
+    footprint_options);
+
+  rcl_action_server_options_t action_options = rcl_action_server_get_default_options();
+  action_options.feedback_topic_qos.depth = 1;
+  action_options.feedback_topic_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+  action_server_ = rclcpp_action::create_server<FindCarAvoidancePoint>(
+    this, "/find_car_avoidance_point_action",
+    [](const rclcpp_action::GoalUUID &, std::shared_ptr<const FindCarAvoidancePoint::Goal>) {
+      return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    },
+    [](const std::shared_ptr<GoalHandle>) {
+      return rclcpp_action::CancelResponse::REJECT;
+    },
+    [this](const std::shared_ptr<GoalHandle> goal_handle) {
+      std::thread{[this, goal_handle]() {execute(goal_handle);}}.detach();
+    },
+    action_options, action_cb_group_);
+
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this);
+
+  check_avoidance_service_ = create_client<IsCarPassable>(
+    "/check_car_passable", rmw_qos_profile_services_default, service_cb_group_);
+}
+
+void CarAvoidancePointServer::initParams()
+{
+  topic_name_global_costmap_ = declare_parameter<std::string>("topic_name_global_costmap", "");
+  topic_name_footprint_ = declare_parameter<std::string>("topic_name_footprint", "");
+  search_radius_min_ = declare_parameter("search_radius_min", 3.0);
+  search_radius_max_ = declare_parameter("search_radius_max", 4.0);
+  search_radius_extra_dis_ = declare_parameter("search_radius_extra_dis", 2.5);
+  outside_min_ = declare_parameter("outside_min", 0.0);
+  outside_max_ = declare_parameter("outside_max", 0.5);
+  check_service_max_time_ = declare_parameter("check_service_max_time", 0.5);
+  show_global_costmap_raw_cv2_ = declare_parameter("show_global_costmap_raw_cv2", false);
+  show_global_costmap_raw_colored_cv2_ = declare_parameter("show_global_costmap_raw_colored_cv2", false);
+  external_point_max_distance_ = declare_parameter("external_point_max_distance", 8.0);
+  point_free_check_radius_ = declare_parameter("point_free_check_radius", 0.2);
+  stop_in_place_min_dist_ = declare_parameter("stop_in_place_min_dist", 2.0);
+  max_robot_pose_age_ = declare_parameter("max_robot_pose_age", 1.0);
+  robot_pose_wait_timeout_ = declare_parameter("robot_pose_wait_timeout", 1.5);
+  strict_check_mode_ = declare_parameter("strict_check_mode", false);
+
+  RCLCPP_INFO(get_logger(), "topic_name_global_costmap: %s", topic_name_global_costmap_.c_str());
+  RCLCPP_INFO(get_logger(), "topic_name_footprint: %s", topic_name_footprint_.c_str());
+  RCLCPP_INFO(get_logger(), "search_radius_min: %f", search_radius_min_);
+  RCLCPP_INFO(get_logger(), "search_radius_max: %f", search_radius_max_);
+  RCLCPP_INFO(get_logger(), "search_radius_extra_dis: %f", search_radius_extra_dis_);
+  RCLCPP_INFO(get_logger(), "outside_min: %f", outside_min_);
+  RCLCPP_INFO(get_logger(), "outside_max: %f", outside_max_);
+  RCLCPP_INFO(get_logger(), "check_service_max_time: %f", check_service_max_time_);
+  RCLCPP_INFO(get_logger(), "show_global_costmap_raw_cv2: %d", show_global_costmap_raw_cv2_);
+  RCLCPP_INFO(get_logger(), "show_global_costmap_raw_colored_cv2: %d", show_global_costmap_raw_colored_cv2_);
+  RCLCPP_INFO(get_logger(), "external_point_max_distance: %f", external_point_max_distance_);
+  RCLCPP_INFO(get_logger(), "point_free_check_radius: %f", point_free_check_radius_);
+  RCLCPP_INFO(get_logger(), "stop_in_place_min_dist: %f", stop_in_place_min_dist_);
+  RCLCPP_INFO(get_logger(), "max_robot_pose_age: %f", max_robot_pose_age_);
+  RCLCPP_INFO(get_logger(), "robot_pose_wait_timeout: %f", robot_pose_wait_timeout_);
+  RCLCPP_INFO(get_logger(), "strict_check_mode: %d", strict_check_mode_);
+}
+
+void CarAvoidancePointServer::footprintCallback(const geometry_msgs::msg::PolygonStamped::ConstSharedPtr msg)
+{
+  if (!footprint_sub_) {
+    return;
+  }
+  const auto & points = msg->polygon.points;
+  std::vector<double> edges_distance;
+  for (size_t i = 0; i < 4; ++i) {
+    const auto & a = points.at(i);
+    const auto & b = points.at((i + 1) % 4);
+    const double length = std::hypot(static_cast<double>(a.x) - b.x, static_cast<double>(a.y) - b.y);
+    edges_distance.push_back(std::nearbyint(length * 100.0) / 100.0);
+  }
+  const double robot_width = *std::min_element(edges_distance.begin(), edges_distance.end());
+  // 用边长构造以机器人中心为原点的局部 footprint
+  const double half_long = *std::max_element(edges_distance.begin(), edges_distance.end()) / 2.0;
+  const double half_short = robot_width / 2.0;
+  const Ring local = {
+    {half_long, half_short},
+    {half_long, -half_short},
+    {-half_long, -half_short},
+    {-half_long, half_short}};
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    footprint_vertices_ = local;
+  }
+  RCLCPP_INFO(get_logger(), "robot_width: %.3f, footprint_vertices (local): [%s]",
+    robot_width, formatRing(local).c_str());
+  footprint_sub_.reset();
+}
+
+void CarAvoidancePointServer::globalCostmapCallback(const nav2_msgs::msg::Costmap::ConstSharedPtr msg)
+{
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    global_costmap_ = msg;
+  }
+  if (!show_global_costmap_raw_colored_cv2_ && !show_global_costmap_raw_cv2_) {
+    return;
+  }
+  const int width = static_cast<int>(msg->metadata.size_x);
+  const int height = static_cast<int>(msg->metadata.size_y);
+  const cv::Mat costmap_data(height, width, CV_8UC1, const_cast<uint8_t *>(msg->data.data()));
+  RCLCPP_INFO_ONCE(get_logger(), "count0: %d", cv::countNonZero(costmap_data == 0));
+  RCLCPP_INFO_ONCE(get_logger(), "count254: %d", cv::countNonZero(costmap_data == 254));
+  RCLCPP_INFO_ONCE(get_logger(), "count255: %d", cv::countNonZero(costmap_data == 255));
+  if (show_global_costmap_raw_colored_cv2_) {
+    cv::Mat colored_map;
+    cv::applyColorMap(costmap_data, colored_map, cv::COLORMAP_JET);
+    cv::imshow("Global Costmap Raw Colored", colored_map);
+  }
+  if (show_global_costmap_raw_cv2_) {
+    cv::imshow("Global Costmap Raw", costmap_data);
+  }
+  cv::waitKey(1);
+}
+
+void CarAvoidancePointServer::specialTerrainCallback(const garage_utils_msgs::msg::Polygons::ConstSharedPtr msg)
+{
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    special_terrain_polygons_ = std::make_shared<const std::vector<geometry_msgs::msg::Polygon>>(msg->polygons);
+  }
+  for (size_t idx = 0; idx < msg->polygons.size(); ++idx) {
+    Ring ring;
+    for (const auto & p : msg->polygons[idx].points) {
+      ring.emplace_back(p.x, p.y);
+    }
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 20000, "禁扫区[%zu]: %s", idx, formatRing(ring).c_str());
+  }
+  RCLCPP_INFO_ONCE(get_logger(), "收到禁扫区: %zu个区域", msg->polygons.size());
+
+  visualization_msgs::msg::Marker marker;
+  marker.header.frame_id = "map";
+  marker.header.stamp = now();
+  marker.id = 10;
+  marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+  marker.scale.x = 0.05;
+  if (msg->polygons.empty()) {
+    marker.action = visualization_msgs::msg::Marker::DELETE;
+    marker_special_terrain_publisher_->publish(marker);
+    return;
+  }
+  marker.action = visualization_msgs::msg::Marker::ADD;
+  marker.color.r = 1.0;
+  marker.color.g = 0.0;
+  marker.color.b = 0.0;
+  marker.color.a = 0.5;
+  for (const auto & polygon : msg->polygons) {
+    const auto & pts = polygon.points;
+    if (pts.size() < 2) {
+      continue;
+    }
+    for (size_t i = 0; i < pts.size(); ++i) {
+      geometry_msgs::msg::Point p1;
+      p1.x = pts[i].x;
+      p1.y = pts[i].y;
+      p1.z = pts[i].z;
+      geometry_msgs::msg::Point p2;
+      p2.x = pts[(i + 1) % pts.size()].x;
+      p2.y = pts[(i + 1) % pts.size()].y;
+      p2.z = pts[(i + 1) % pts.size()].z;
+      marker.points.push_back(p1);
+      marker.points.push_back(p2);
+    }
+  }
+  marker_special_terrain_publisher_->publish(marker);
+}
+
+void CarAvoidancePointServer::vehicleStopPointsCallback(const geometry_msgs::msg::PoseArray::ConstSharedPtr msg)
+{
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    vehicle_avoidance_stop_points_ = msg;
+  }
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "收到避车停车点: %zu个", msg->poses.size());
+  if (!msg->poses.empty()) {
+    const auto & orientation = msg->poses[0].orientation;
+    const bool is_default_orientation =
+      std::abs(orientation.x) < 1e-6 && std::abs(orientation.y) < 1e-6 &&
+      std::abs(orientation.z) < 1e-6 && std::abs(std::abs(orientation.w) - 1.0) < 1e-6;
+    if (is_default_orientation) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "外部停车点没有发 yaw，将使用避让方向自行计算");
+    }
+  }
+}
+
+void CarAvoidancePointServer::startTaskSubscriptions()
+{
+  rclcpp::SubscriptionOptions costmap_options;
+  costmap_options.callback_group = costmap_cb_group_;
+  global_costmap_sub_ = create_subscription<nav2_msgs::msg::Costmap>(
+    topic_name_global_costmap_, rclcpp::QoS(10),
+    std::bind(&CarAvoidancePointServer::globalCostmapCallback, this, std::placeholders::_1),
+    costmap_options);
+  special_terrain_sub_ = create_subscription<garage_utils_msgs::msg::Polygons>(
+    "/cleaning_tool_retraction_areas", rclcpp::QoS(1).transient_local(),
+    std::bind(&CarAvoidancePointServer::specialTerrainCallback, this, std::placeholders::_1));
+  vehicle_stop_points_sub_ = create_subscription<geometry_msgs::msg::PoseArray>(
+    "/vehicle_avoidance_stop_points", rclcpp::QoS(1).transient_local().reliable(),
+    std::bind(&CarAvoidancePointServer::vehicleStopPointsCallback, this, std::placeholders::_1));
+}
+
+void CarAvoidancePointServer::stopTaskSubscriptions()
+{
+  global_costmap_sub_.reset();
+  special_terrain_sub_.reset();
+  vehicle_stop_points_sub_.reset();
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  global_costmap_.reset();
+  special_terrain_polygons_.reset();
+  vehicle_avoidance_stop_points_.reset();
+}
+
+bool CarAvoidancePointServer::waitForGlobalCostmap(double timeout_sec)
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_sec);
+  while (std::chrono::steady_clock::now() < deadline) {
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      if (global_costmap_) {
+        return true;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  return global_costmap_ != nullptr;
+}
+
+void CarAvoidancePointServer::waitForSpecialTerrain(double timeout_sec)
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_sec);
+  while (std::chrono::steady_clock::now() < deadline) {
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      if (special_terrain_polygons_) {
+        return;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  if (!special_terrain_polygons_) {
+    RCLCPP_WARN(get_logger(), "等待禁扫区超时，本次任务不拦截禁扫区");
+  }
+}
+
+std::optional<CarAvoidancePointServer::PoseStamped> CarAvoidancePointServer::getFreshRobotPose()
+{
+  const auto deadline = now() + rclcpp::Duration::from_seconds(robot_pose_wait_timeout_);
+  while (now() < deadline) {
+    try {
+      const auto trans = tf_buffer_->lookupTransform("map", "base_link", tf2::TimePointZero);
+      const double age = (now() - rclcpp::Time(trans.header.stamp)).seconds();
+      if (age > max_robot_pose_age_) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "TF 位姿过旧 age=%.2fs", age);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+      }
+      PoseStamped pose;
+      pose.header.stamp = trans.header.stamp;
+      pose.header.frame_id = "map";
+      pose.pose.position.x = trans.transform.translation.x;
+      pose.pose.position.y = trans.transform.translation.y;
+      pose.pose.orientation = trans.transform.rotation;
+      return pose;
+    } catch (const tf2::LookupException & e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "%s", e.what());
+    } catch (const tf2::ConnectivityException & e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "%s", e.what());
+    } catch (const tf2::ExtrapolationException & e) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "%s", e.what());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return std::nullopt;
+}
+
+void CarAvoidancePointServer::execute(const std::shared_ptr<GoalHandle> goal_handle)
+{
+  std::lock_guard<std::mutex> execute_lock(execute_mutex_);
+  RCLCPP_INFO(get_logger(), "开始寻找避让点...");
+  startTaskSubscriptions();
+  try {
+    runTask(goal_handle);
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(get_logger(), "Error raised in execute callback: %s", e.what());
+  }
+  if (goal_handle->is_active()) {
+    goal_handle->abort(std::make_shared<FindCarAvoidancePoint::Result>());
+  }
+  stopTaskSubscriptions();
+}
+
+void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_handle)
+{
+  auto empty_result = std::make_shared<FindCarAvoidancePoint::Result>();
+  if (!waitForGlobalCostmap(2.0)) {
+    RCLCPP_ERROR(get_logger(), "等待全局代价地图超时");
+    goal_handle->abort(empty_result);
+    return;
+  }
+  waitForSpecialTerrain(2.0);
+
+  // 获取一份新鲜的机器人位姿，任务全程固定使用
+  const auto robot_pose = getFreshRobotPose();
+  if (!robot_pose) {
+    RCLCPP_ERROR(get_logger(), "无法获取新鲜的机器人位姿，abort");
+    goal_handle->abort(empty_result);
+    return;
+  }
+
+  Task task;
+  task.goal = goal_handle->get_goal();
+  task.robot_pose = *robot_pose;
+  RCLCPP_INFO(get_logger(), "polygons: %zu个通道", task.goal->polygons.size());
+  publishAllPassagesMarker(task.goal->polygons);
+
+  RCLCPP_INFO(get_logger(), "寻找当前通行区域...");
+  const Vec2 robot(task.robot_pose.pose.position.x, task.robot_pose.pose.position.y);
+  for (const auto & polygon : task.goal->polygons) {
+    Ring current_polygon_vertices;
+    for (const auto & point : polygon.points) {
+      current_polygon_vertices.emplace_back(point.x, point.y);
+    }
+    if (pointInPolygon(robot, current_polygon_vertices)) {
+      task.vertices = current_polygon_vertices;
+      RCLCPP_INFO(get_logger(), "机器人在通道内，使用当前通道: [%s]", formatRing(task.vertices).c_str());
+      break;
+    }
+  }
+  if (task.vertices.empty()) {
+    RCLCPP_ERROR(get_logger(), "未找到用于寻找停靠点的通道");
+    goal_handle->abort(empty_result);
+    return;
+  }
+  if (task.vertices.size() != 4) {
+    RCLCPP_ERROR(get_logger(), "当前通道顶点数为 %zu，只支持 4 个顶点", task.vertices.size());
+    goal_handle->abort(empty_result);
+    return;
+  }
+  RCLCPP_INFO(get_logger(), "当前通行区域: [%s]", formatRing(task.vertices).c_str());
+
+  RCLCPP_INFO(get_logger(), "寻找停靠点...");
+  const auto avoidance_point = findAvoidancePoint(task);
+  if (!avoidance_point) {
+    RCLCPP_ERROR(get_logger(), "外部停车点和自搜索均未找到有效避让点");
+    goal_handle->abort(empty_result);
+    return;
+  }
+  const auto & ap = avoidance_point->pose;
+  RCLCPP_INFO(get_logger(), "成功找到避让点: x=%.3f, y=%.3f, z=%.3f, yaw=%.3f°",
+    ap.position.x, ap.position.y, ap.position.z, radToDeg(tf2::getYaw(ap.orientation)));
+
+  const auto nearest_boundary = findNearestBoundary(robot, task.vertices);
+  const Vec2 car(task.goal->car_pose.pose.position.x, task.goal->car_pose.pose.position.y);
+  if (nearest_boundary) {
+    publishDebugMarkers(robot, car, *nearest_boundary, nullptr, &*avoidance_point);
+  }
+
+  auto result = std::make_shared<FindCarAvoidancePoint::Result>();
+  result->pose = *avoidance_point;
+  goal_handle->succeed(result);
+  const auto & rp = result->pose.pose;
+  RCLCPP_INFO(get_logger(), "成功找到避让点*****: x=%.3f, y=%.3f, z=%.3f, yaw=%.3f°",
+    rp.position.x, rp.position.y, rp.position.z, radToDeg(tf2::getYaw(rp.orientation)));
+}
+
+void CarAvoidancePointServer::publishDebugMarkers(
+  const Vec2 & robot, const Vec2 & car, const Edge & nearest_boundary,
+  const Ring * find_vertices, const PoseStamped * avoidance_point)
+{
+  using visualization_msgs::msg::Marker;
+  const auto stamp = now();
+
+  Marker car_marker;
+  car_marker.header.frame_id = "map";
+  car_marker.header.stamp = stamp;
+  car_marker.id = 1;
+  car_marker.type = Marker::CUBE;
+  car_marker.action = Marker::ADD;
+  car_marker.scale.x = 0.5;
+  car_marker.scale.y = 0.5;
+  car_marker.scale.z = 0.5;
+  car_marker.color.r = 1.0;
+  car_marker.color.a = 1.0;
+  car_marker.pose.position.x = car.x();
+  car_marker.pose.position.y = car.y();
+  car_marker.pose.orientation.w = 1.0;
+  marker_car_pose_publisher_->publish(car_marker);
+
+  Marker robot_marker;
+  robot_marker.header.frame_id = "map";
+  robot_marker.header.stamp = stamp;
+  robot_marker.id = 2;
+  robot_marker.type = Marker::SPHERE;
+  robot_marker.action = Marker::ADD;
+  robot_marker.scale.x = 0.2;
+  robot_marker.scale.y = 0.2;
+  robot_marker.scale.z = 0.2;
+  robot_marker.color.g = 1.0;
+  robot_marker.color.a = 1.0;
+  robot_marker.pose.position.x = robot.x();
+  robot_marker.pose.position.y = robot.y();
+  robot_marker.pose.orientation.w = 1.0;
+  marker_robot_pose_publisher_->publish(robot_marker);
+
+  Marker side_marker;
+  side_marker.header.frame_id = "map";
+  side_marker.header.stamp = stamp;
+  side_marker.id = 3;
+  side_marker.type = Marker::LINE_LIST;
+  side_marker.action = Marker::ADD;
+  side_marker.scale.x = 0.2;
+  side_marker.color.g = 1.0;
+  side_marker.color.a = 1.0;
+  geometry_msgs::msg::Point p1;
+  p1.x = nearest_boundary.first.x();
+  p1.y = nearest_boundary.first.y();
+  geometry_msgs::msg::Point p2;
+  p2.x = nearest_boundary.second.x();
+  p2.y = nearest_boundary.second.y();
+  side_marker.points = {p1, p2};
+  marker_avoidance_side_publisher_->publish(side_marker);
+
+  if (find_vertices) {
+    Marker rect_marker;
+    rect_marker.header.frame_id = "map";
+    rect_marker.header.stamp = stamp;
+    rect_marker.id = 4;
+    rect_marker.type = Marker::LINE_LIST;
+    rect_marker.action = Marker::ADD;
+    rect_marker.scale.x = 0.1;
+    rect_marker.color.r = 1.0;
+    rect_marker.color.a = 1.0;
+    const size_t size = find_vertices->size();
+    for (size_t i = 0; i < size; ++i) {
+      geometry_msgs::msg::Point start;
+      start.x = (*find_vertices)[i].x();
+      start.y = (*find_vertices)[i].y();
+      geometry_msgs::msg::Point end;
+      end.x = (*find_vertices)[(i + 1) % size].x();
+      end.y = (*find_vertices)[(i + 1) % size].y();
+      rect_marker.points.push_back(start);
+      rect_marker.points.push_back(end);
+    }
+    marker_searching_rect_publisher_->publish(rect_marker);
+  }
+
+  if (avoidance_point) {
+    Marker point_marker;
+    point_marker.header.frame_id = "map";
+    point_marker.header.stamp = stamp;
+    point_marker.id = 5;
+    point_marker.type = Marker::ARROW;
+    point_marker.action = Marker::ADD;
+    point_marker.scale.x = 0.5;
+    point_marker.scale.y = 0.2;
+    point_marker.scale.z = 0.4;
+    point_marker.color.b = 1.0;
+    point_marker.color.a = 1.0;
+    point_marker.pose = avoidance_point->pose;
+    marker_parking_point_publisher_->publish(point_marker);
+  }
+}
+
+void CarAvoidancePointServer::publishAllPassagesMarker(const std::vector<geometry_msgs::msg::Polygon> & polygons)
+{
+  visualization_msgs::msg::Marker marker;
+  marker.header.frame_id = "map";
+  marker.header.stamp = now();
+  marker.id = 20;
+  marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+  marker.action = visualization_msgs::msg::Marker::ADD;
+  marker.scale.x = 0.03;
+  marker.color.r = 0.0;
+  marker.color.g = 0.5;
+  marker.color.b = 1.0;
+  marker.color.a = 0.8;
+  if (polygons.empty()) {
+    marker.action = visualization_msgs::msg::Marker::DELETE;
+    marker_all_passages_publisher_->publish(marker);
+    return;
+  }
+  for (const auto & polygon : polygons) {
+    const auto & pts = polygon.points;
+    if (pts.size() < 2) {
+      continue;
+    }
+    for (size_t i = 0; i < pts.size(); ++i) {
+      geometry_msgs::msg::Point p1;
+      p1.x = pts[i].x;
+      p1.y = pts[i].y;
+      p1.z = pts[i].z;
+      geometry_msgs::msg::Point p2;
+      p2.x = pts[(i + 1) % pts.size()].x;
+      p2.y = pts[(i + 1) % pts.size()].y;
+      p2.z = pts[(i + 1) % pts.size()].z;
+      marker.points.push_back(p1);
+      marker.points.push_back(p2);
+    }
+  }
+  marker_all_passages_publisher_->publish(marker);
+}
+
+Ring CarAvoidancePointServer::footprint() const
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  return footprint_vertices_;
+}
+
+}  // namespace find_free_space
