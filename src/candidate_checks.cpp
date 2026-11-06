@@ -8,6 +8,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 namespace find_free_space
 {
@@ -30,20 +31,18 @@ std::vector<cv::Point2f> toContour(const geometry_msgs::msg::Polygon & polygon)
 }  // namespace
 
 bool CarAvoidancePointServer::validateCandidate(
-  const Task & task, const SearchContext & ctx, const PoseStamped & candidate,
+  const Task & task, const SearchContext & ctx, const PoseStamped & candidate, double along_s,
   bool skip_service_check, const FootprintKernel * kernel, std::string & reason)
 {
   const MapView & map = ctx.map;
   const double x = candidate.pose.position.x;
   const double y = candidate.pose.position.y;
 
-  // 车和点必须分居机器人前后两侧
-  auto local_x = [&](const Vec2 & world) {
-      const Vec2 delta = world - ctx.robot;
-      return delta.x() * std::cos(ctx.robot_yaw) + delta.y() * std::sin(ctx.robot_yaw);
-    };
-  if (local_x(ctx.car) * local_x(Vec2(x, y)) >= 0.0) {
-    reason = "与车在机器人同侧";
+  // 车和点必须分居机器人沿路的两侧。比较的是所选侧边上的弧长，不是 base_link 的 x。
+  const double point_delta = along_s - ctx.robot_s;
+  const double car_delta = ctx.car_s - ctx.robot_s;
+  if (point_delta * car_delta >= -1e-4) {
+    reason = "与车在沿路同侧";
     return false;
   }
 
@@ -70,6 +69,9 @@ bool CarAvoidancePointServer::validateCandidate(
     return false;
   }
 
+  // 这一轮保持现有直线可达性检查，不增加绕弯到达能力；实际执行仍由现有 welt_model 负责。
+  // 默认只检查中心连线和目标处 footprint。strict_check_mode 才额外做固定目标朝向的直线扫掠，
+  // 直线检查通过也不表示整车一定能沿这条直线开到。
   // 机器人到候选点的连线无障碍
   const int robot_x_p = static_cast<int>(
     std::clamp((ctx.robot.x() - map.origin_x) / map.resolution, 0.0, map.width - 1.0));

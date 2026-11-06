@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <thread>
 
@@ -85,6 +86,13 @@ CarAvoidancePointServer::CarAvoidancePointServer()
 
   check_avoidance_service_ = create_client<IsCarPassable>(
     "/check_car_passable", rmw_qos_profile_services_default, service_cb_group_);
+
+  rclcpp::SubscriptionOptions road_model_options;
+  road_model_options.callback_group = costmap_cb_group_;
+  road_models_sub_ = create_subscription<garage_road_model::msg::RoadModelArray>(
+    "/garage_road_models", rclcpp::QoS(1).reliable().transient_local(),
+    std::bind(&CarAvoidancePointServer::roadModelsCallback, this, std::placeholders::_1),
+    road_model_options);
 }
 
 void CarAvoidancePointServer::initParams()
@@ -251,6 +259,121 @@ void CarAvoidancePointServer::vehicleStopPointsCallback(const geometry_msgs::msg
   }
 }
 
+void CarAvoidancePointServer::roadModelsCallback(
+  const garage_road_model::msg::RoadModelArray::ConstSharedPtr msg)
+{
+  std::vector<garage_road_model::RoadModelData> roads;
+  roads.reserve(msg->roads.size());
+  auto load_points = [](const geometry_msgs::msg::Polygon & polygon) {
+      std::vector<Eigen::Vector2d> points;
+      points.reserve(polygon.points.size());
+      for (const auto & point : polygon.points) {
+        points.emplace_back(point.x, point.y);
+      }
+      return points;
+    };
+  for (const auto & item : msg->roads) {
+    garage_road_model::RoadModelData road;
+    road.source_index = item.source_index;
+    road.boundary = load_points(item.boundary);
+    road.start_cap = load_points(item.start_cap);
+    road.end_cap = load_points(item.end_cap);
+    road.valid = item.valid;
+    road.stage = item.stage;
+    road.reason = item.reason;
+    auto load_side = [&](const garage_road_model::msg::SideBoundary & side) {
+        garage_road_model::SideBoundary out;
+        out.raw = load_points(side.raw);
+        out.length = side.length;
+        out.max_error = side.max_error;
+        out.mean_error = side.mean_error;
+        for (const auto & sample : side.samples) {
+          garage_road_model::RoadSampleData data;
+          data.x = sample.x;
+          data.y = sample.y;
+          data.yaw = sample.yaw;
+          data.s = sample.s;
+          data.curvature = sample.curvature;
+          data.corner = sample.corner;
+          out.samples.push_back(data);
+        }
+        return out;
+      };
+    road.side_a = load_side(item.side_a);
+    road.side_b = load_side(item.side_b);
+    roads.push_back(std::move(road));
+  }
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    cached_road_models_ = std::move(roads);
+  }
+  RCLCPP_INFO(get_logger(), "收到 /garage_road_models，revision %lu，数量 %zu",
+    static_cast<unsigned long>(msg->revision), msg->roads.size());
+}
+
+namespace
+{
+
+std::vector<Eigen::Vector2d> cleanRing(const std::vector<Eigen::Vector2d> & points)
+{
+  std::vector<Eigen::Vector2d> ring;
+  for (const auto & point : points) {
+    if (ring.empty() || (ring.back() - point).norm() > 1e-4) {
+      ring.push_back(point);
+    }
+  }
+  if (ring.size() >= 2 && (ring.front() - ring.back()).norm() <= 1e-4) {
+    ring.pop_back();
+  }
+  return ring;
+}
+
+double ringMismatch(const std::vector<Eigen::Vector2d> & lhs, std::vector<Eigen::Vector2d> rhs)
+{
+  if (lhs.size() < 3 || lhs.size() != rhs.size()) {
+    return std::numeric_limits<double>::infinity();
+  }
+  double best = std::numeric_limits<double>::infinity();
+  for (int direction = 0; direction < 2; ++direction) {
+    const int count = static_cast<int>(lhs.size());
+    for (int shift = 0; shift < count; ++shift) {
+      double worst = 0.0;
+      for (int i = 0; i < count; ++i) {
+        worst = std::max(
+          worst, (lhs[static_cast<size_t>(i)] - rhs[static_cast<size_t>((i + shift) % count)]).norm());
+      }
+      best = std::min(best, worst);
+    }
+    std::reverse(rhs.begin(), rhs.end());
+  }
+  return best;
+}
+
+}  // namespace
+
+std::optional<garage_road_model::RoadModelData> CarAvoidancePointServer::matchRoadModel(
+  const Ring & polygon, const std::vector<garage_road_model::RoadModelData> & models,
+  std::string & reason) const
+{
+  const auto ring = cleanRing(polygon);
+  constexpr double kTolerance = 0.05;
+  std::vector<size_t> matches;
+  for (size_t i = 0; i < models.size(); ++i) {
+    if (ringMismatch(ring, cleanRing(models[i].boundary)) <= kTolerance) {
+      matches.push_back(i);
+    }
+  }
+  if (matches.empty()) {
+    reason = "当前通道没有几何对应的道路模型";
+    return std::nullopt;
+  }
+  if (matches.size() > 1) {
+    reason = "当前通道对应多个道路模型，无法确定";
+    return std::nullopt;
+  }
+  return models[matches.front()];
+}
+
 void CarAvoidancePointServer::startTaskSubscriptions()
 {
   rclcpp::SubscriptionOptions costmap_options;
@@ -401,29 +524,49 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
     goal_handle->abort(empty_result);
     return;
   }
-  if (task.vertices.size() != 4) {
-    RCLCPP_ERROR(get_logger(), "当前通道顶点数为 %zu，只支持 4 个顶点", task.vertices.size());
+  RCLCPP_INFO(get_logger(), "当前通行区域: [%s]", formatRing(task.vertices).c_str());
+
+  std::vector<garage_road_model::RoadModelData> models;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    models = cached_road_models_;
+  }
+  if (models.empty()) {
+    RCLCPP_ERROR(get_logger(), "模型缺失：尚未收到 /garage_road_models");
     goal_handle->abort(empty_result);
     return;
   }
-  RCLCPP_INFO(get_logger(), "当前通行区域: [%s]", formatRing(task.vertices).c_str());
+  std::string match_reason;
+  auto matched = matchRoadModel(task.vertices, models, match_reason);
+  if (!matched) {
+    RCLCPP_ERROR(get_logger(), "模型缺失：%s", match_reason.c_str());
+    goal_handle->abort(empty_result);
+    return;
+  }
+  if (!matched->valid) {
+    const bool building = matched->reason.find("BUILDING") != std::string::npos;
+    RCLCPP_ERROR(get_logger(), "模型无效：%s%s",
+      building ? "道路模型正在生成，" : "", matched->reason.c_str());
+    goal_handle->abort(empty_result);
+    return;
+  }
+  if (matched->side_a.samples.size() < 2 || matched->side_b.samples.size() < 2) {
+    RCLCPP_ERROR(get_logger(), "侧边无法查询：两条拟合侧边都要有至少两个采样点");
+    goal_handle->abort(empty_result);
+    return;
+  }
+  task.road_model = std::move(*matched);
 
   RCLCPP_INFO(get_logger(), "寻找停靠点...");
   const auto avoidance_point = findAvoidancePoint(task);
   if (!avoidance_point) {
-    RCLCPP_ERROR(get_logger(), "外部停车点和自搜索均未找到有效避让点");
+    RCLCPP_ERROR(get_logger(), "未找到避让点");
     goal_handle->abort(empty_result);
     return;
   }
   const auto & ap = avoidance_point->pose;
   RCLCPP_INFO(get_logger(), "成功找到避让点: x=%.3f, y=%.3f, z=%.3f, yaw=%.3f°",
     ap.position.x, ap.position.y, ap.position.z, radToDeg(tf2::getYaw(ap.orientation)));
-
-  const auto nearest_boundary = findNearestBoundary(robot, task.vertices);
-  const Vec2 car(task.goal->car_pose.pose.position.x, task.goal->car_pose.pose.position.y);
-  if (nearest_boundary) {
-    publishDebugMarkers(robot, car, *nearest_boundary, nullptr, &*avoidance_point);
-  }
 
   auto result = std::make_shared<FindCarAvoidancePoint::Result>();
   result->pose = *avoidance_point;
@@ -434,8 +577,8 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
 }
 
 void CarAvoidancePointServer::publishDebugMarkers(
-  const Vec2 & robot, const Vec2 & car, const Edge & nearest_boundary,
-  const Ring * find_vertices, const PoseStamped * avoidance_point)
+  const Vec2 & robot, const Vec2 & car, const Ring & side_line,
+  const Ring * search_band, const PoseStamped * avoidance_point)
 {
   using visualization_msgs::msg::Marker;
   const auto stamp = now();
@@ -476,21 +619,22 @@ void CarAvoidancePointServer::publishDebugMarkers(
   side_marker.header.frame_id = "map";
   side_marker.header.stamp = stamp;
   side_marker.id = 3;
-  side_marker.type = Marker::LINE_LIST;
+  side_marker.type = Marker::LINE_STRIP;
   side_marker.action = Marker::ADD;
   side_marker.scale.x = 0.2;
   side_marker.color.g = 1.0;
   side_marker.color.a = 1.0;
-  geometry_msgs::msg::Point p1;
-  p1.x = nearest_boundary.first.x();
-  p1.y = nearest_boundary.first.y();
-  geometry_msgs::msg::Point p2;
-  p2.x = nearest_boundary.second.x();
-  p2.y = nearest_boundary.second.y();
-  side_marker.points = {p1, p2};
-  marker_avoidance_side_publisher_->publish(side_marker);
+  for (const auto & point : side_line) {
+    geometry_msgs::msg::Point marker_point;
+    marker_point.x = point.x();
+    marker_point.y = point.y();
+    side_marker.points.push_back(marker_point);
+  }
+  if (side_marker.points.size() >= 2) {
+    marker_avoidance_side_publisher_->publish(side_marker);
+  }
 
-  if (find_vertices) {
+  if (search_band) {
     Marker rect_marker;
     rect_marker.header.frame_id = "map";
     rect_marker.header.stamp = stamp;
@@ -500,14 +644,14 @@ void CarAvoidancePointServer::publishDebugMarkers(
     rect_marker.scale.x = 0.1;
     rect_marker.color.r = 1.0;
     rect_marker.color.a = 1.0;
-    const size_t size = find_vertices->size();
+    const size_t size = search_band->size();
     for (size_t i = 0; i < size; ++i) {
       geometry_msgs::msg::Point start;
-      start.x = (*find_vertices)[i].x();
-      start.y = (*find_vertices)[i].y();
+      start.x = (*search_band)[i].x();
+      start.y = (*search_band)[i].y();
       geometry_msgs::msg::Point end;
-      end.x = (*find_vertices)[(i + 1) % size].x();
-      end.y = (*find_vertices)[(i + 1) % size].y();
+      end.x = (*search_band)[(i + 1) % size].x();
+      end.y = (*search_band)[(i + 1) % size].y();
       rect_marker.points.push_back(start);
       rect_marker.points.push_back(end);
     }

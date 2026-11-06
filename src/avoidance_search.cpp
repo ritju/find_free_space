@@ -3,8 +3,13 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "garage_road_model/polygon_processor.hpp"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -15,6 +20,11 @@ namespace find_free_space
 namespace
 {
 
+// 通道外的车辆中心离侧边超过该距离时，不再把它当成当前道路上的来车。
+constexpr double kOutsideRoadLimit = 2.0;
+// 点落在横截面附近才算属于这一段。下限覆盖采样误差，并随路宽放宽。
+constexpr double kSectionSlack = 0.5;
+
 geometry_msgs::msg::Quaternion yawToQuaternion(double yaw)
 {
   tf2::Quaternion quaternion;
@@ -22,12 +32,123 @@ geometry_msgs::msg::Quaternion yawToQuaternion(double yaw)
   return tf2::toMsg(quaternion);
 }
 
-// 沿通道长边方向，选择与来车方向背对的 yaw，结果不做归一化
-double computeAvoidanceYaw(double k, const Vec2 & robot, const Vec2 & car)
+struct SideAnchor
 {
-  const Vec2 to_car = car - robot;
-  const double dot = std::cos(k) * to_car.x() + std::sin(k) * to_car.y();
-  return dot < 0.0 ? k : k + M_PI;
+  enum class Status
+  {
+    Ok,
+    Ambiguous,
+    Miss
+  };
+
+  Status status{Status::Miss};
+  double s{0.0};
+  double distance{std::numeric_limits<double>::infinity()};
+  double lateral{0.0};
+  bool has_lateral{false};
+  Vec2 foot{Vec2::Zero()};
+  Vec2 outward{Vec2::Zero()};
+  std::string reason;
+};
+
+bool pointNearSection(const Vec2 & point, const garage_road_model::CrossSection & section)
+{
+  const double limit = std::max(kSectionSlack, 0.25 * section.width);
+  return distancePointToSegment(point, section.near_point, section.far_point) <= limit;
+}
+
+// 整条侧边投影。投影落在 U 形另一条臂上仍然有效；多个远隔投影，或投影位置对不上这段道路区域，才拒绝。
+// 不用弧长窗口把另一条臂提前排除。
+SideAnchor associateToSide(
+  const garage_road_model::RoadModelQuery & query,
+  garage_road_model::SideId side,
+  const Vec2 & point,
+  bool require_region)
+{
+  SideAnchor anchor;
+  const auto projection = query.projectOnSide(side, point, 0.0, -1.0);
+  if (projection.status == garage_road_model::QueryStatus::Ambiguous) {
+    anchor.status = SideAnchor::Status::Ambiguous;
+    anchor.reason = projection.reason.empty() ? "存在多个合理投影，无法确定所属区段" : projection.reason;
+    return anchor;
+  }
+  if (projection.status != garage_road_model::QueryStatus::Ok) {
+    anchor.reason = projection.reason.empty() ? "侧边无法投影" : projection.reason;
+    return anchor;
+  }
+
+  const bool inside = garage_road_model::pointInsidePolygon(point, query.model().boundary, 0.05);
+  if (inside) {
+    const auto section = query.localCrossSection(side, projection.s);
+    if (section.status == garage_road_model::QueryStatus::Ambiguous) {
+      anchor.status = SideAnchor::Status::Ambiguous;
+      anchor.reason = section.reason.empty() ? "投影位置无法对应道路区域" : section.reason;
+      return anchor;
+    }
+    bool belongs = section.status == garage_road_model::QueryStatus::Ok && pointNearSection(point, section);
+    if (!belongs && section.status != garage_road_model::QueryStatus::Ok) {
+      const auto & samples = side == garage_road_model::SideId::A ?
+        query.model().side_a.samples : query.model().side_b.samples;
+      if (samples.size() >= 2) {
+        const double begin = samples.front().s;
+        const double end = samples.back().s;
+        for (const double delta : {-0.2, 0.2, -0.4, 0.4}) {
+          const double neighbor = std::clamp(projection.s + delta, begin, end);
+          const auto neighbor_section = query.localCrossSection(side, neighbor);
+          if (neighbor_section.status == garage_road_model::QueryStatus::Ok &&
+            pointNearSection(point, neighbor_section))
+          {
+            belongs = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!belongs) {
+      anchor.status = SideAnchor::Status::Ambiguous;
+      anchor.reason = section.status == garage_road_model::QueryStatus::Ok || section.reason.empty() ?
+        "投影位置与道路横截面不符" : section.reason;
+      return anchor;
+    }
+  } else if (require_region && projection.distance > kOutsideRoadLimit) {
+    anchor.reason = "不在当前道路区域";
+    return anchor;
+  }
+
+  anchor.status = SideAnchor::Status::Ok;
+  anchor.s = projection.s;
+  anchor.distance = projection.distance;
+  anchor.foot = projection.point;
+  const auto inward = query.inwardNormal(side, projection.s);
+  if (inward.status == garage_road_model::QueryStatus::Ok) {
+    anchor.outward = Vec2(-inward.direction.x(), -inward.direction.y());
+    anchor.lateral = (point - anchor.foot).dot(anchor.outward);
+    anchor.has_lateral = true;
+  }
+  return anchor;
+}
+
+std::optional<double> orientedYaw(
+  const garage_road_model::RoadModelQuery & query,
+  garage_road_model::SideId side,
+  double s,
+  double away_sign)
+{
+  const auto pose = query.evaluateSide(side, s);
+  if (pose.status != garage_road_model::QueryStatus::Ok || pose.corner) {
+    return std::nullopt;
+  }
+  double yaw = pose.yaw;
+  if (away_sign < 0.0) {
+    yaw = addAngles(yaw, M_PI);
+  }
+  return yaw;
+}
+
+const garage_road_model::SideBoundary & boundaryOf(
+  const garage_road_model::RoadModelQuery & query, garage_road_model::SideId side)
+{
+  return side == garage_road_model::SideId::A ? query.model().side_a : query.model().side_b;
 }
 
 }  // namespace
@@ -60,42 +181,72 @@ std::optional<CarAvoidancePointServer::SearchContext> CarAvoidancePointServer::p
   RCLCPP_INFO_ONCE(get_logger(), "width: %d", ctx.map.width);
   RCLCPP_INFO_ONCE(get_logger(), "height: %d", ctx.map.height);
 
+  if (!task.road_model) {
+    RCLCPP_ERROR(get_logger(), "模型缺失：本次任务没有道路模型快照");
+    return std::nullopt;
+  }
+  ctx.query = std::make_shared<garage_road_model::RoadModelQuery>(*task.road_model);
   ctx.robot = Vec2(task.robot_pose.pose.position.x, task.robot_pose.pose.position.y);
   ctx.robot_yaw = tf2::getYaw(task.robot_pose.pose.orientation);
   ctx.car = Vec2(task.goal->car_pose.pose.position.x, task.goal->car_pose.pose.position.y);
 
-  RCLCPP_INFO(get_logger(), "寻找最近的边界...");
-  const auto nearest_boundary = findNearestBoundary(ctx.robot, task.vertices);
-  if (!nearest_boundary) {
-    throw std::runtime_error("通道两条最长边长度都为 0，求不出最近长边");
+  const SideAnchor side_a = associateToSide(*ctx.query, garage_road_model::SideId::A, ctx.robot, true);
+  const SideAnchor side_b = associateToSide(*ctx.query, garage_road_model::SideId::B, ctx.robot, true);
+  const SideAnchor * chosen = nullptr;
+  if (side_a.status == SideAnchor::Status::Ok &&
+    (side_b.status != SideAnchor::Status::Ok || side_a.distance <= side_b.distance))
+  {
+    chosen = &side_a;
+    ctx.side = garage_road_model::SideId::A;
+  } else if (side_b.status == SideAnchor::Status::Ok) {
+    chosen = &side_b;
+    ctx.side = garage_road_model::SideId::B;
   }
-  ctx.nearest_boundary = *nearest_boundary;
-  const Vec2 & nb0 = ctx.nearest_boundary.first;
-  const Vec2 & nb1 = ctx.nearest_boundary.second;
-  RCLCPP_INFO(get_logger(), "nearest_boundary: [(%.3f, %.3f), (%.3f, %.3f)]", nb0.x(), nb0.y(), nb1.x(), nb1.y());
-
-  // 计算搜索方向 k
-  ctx.k = std::atan2(nb0.y() - nb1.y(), nb0.x() - nb1.x());
-  RCLCPP_INFO(get_logger(), "k_radian: %.3f, k_degree: %.3f", ctx.k, ctx.k / M_PI * 180.0);
-  RCLCPP_INFO(get_logger(), "robot: (%.3f, %.3f)", ctx.robot.x(), ctx.robot.y());
-  RCLCPP_INFO(get_logger(), "car: (%.3f, %.3f)", ctx.car.x(), ctx.car.y());
-
-  publishDebugMarkers(ctx.robot, ctx.car, ctx.nearest_boundary);
-
-  // 根据车的位置调整 k 方向
-  const double car_robot_k = std::atan2(ctx.robot.y() - ctx.car.y(), ctx.robot.x() - ctx.car.x());
-  const double k_diff = angleDiff(ctx.k, car_robot_k);
-  RCLCPP_INFO(get_logger(), "k: %.3f, car_robot_k: %.3f, k_diff: %.3f", ctx.k, car_robot_k, k_diff);
-  if (k_diff > M_PI / 2.0) {
-    ctx.k = addAngles(ctx.k, M_PI);
+  if (!chosen) {
+    const bool ambiguous =
+      side_a.status == SideAnchor::Status::Ambiguous || side_b.status == SideAnchor::Status::Ambiguous;
+    if (ambiguous) {
+      RCLCPP_ERROR(get_logger(), "存在多个合理投影，无法确定机器人所属区段：side_a=%s，side_b=%s",
+        side_a.reason.c_str(), side_b.reason.c_str());
+    } else {
+      RCLCPP_ERROR(get_logger(), "侧边无法查询：side_a=%s，side_b=%s",
+        side_a.reason.c_str(), side_b.reason.c_str());
+    }
+    return std::nullopt;
   }
+  ctx.robot_s = chosen->s;
+  RCLCPP_INFO(get_logger(), "近侧边: %s，机器人弧长 %.3f，投影距离 %.3f",
+    ctx.side == garage_road_model::SideId::A ? "side_a" : "side_b", ctx.robot_s, chosen->distance);
 
-  ctx.k_diff2 = angleDiff(ctx.k, ctx.robot_yaw);
-  RCLCPP_INFO(get_logger(), "k: %.3f, k_robot: %.3f, k_diff2: %.3f", ctx.k, ctx.robot_yaw, ctx.k_diff2);
+  const SideAnchor car_anchor = associateToSide(*ctx.query, ctx.side, ctx.car, true);
+  if (car_anchor.status != SideAnchor::Status::Ok) {
+    if (car_anchor.status == SideAnchor::Status::Ambiguous) {
+      RCLCPP_ERROR(get_logger(), "车辆投影不明确：存在多个合理投影，无法确定所属区段（%s）",
+        car_anchor.reason.c_str());
+    } else {
+      RCLCPP_ERROR(get_logger(), "车辆无法关联到所选侧边：%s", car_anchor.reason.c_str());
+    }
+    return std::nullopt;
+  }
+  ctx.car_s = car_anchor.s;
+  if (std::abs(ctx.car_s - ctx.robot_s) < 1e-3) {
+    RCLCPP_ERROR(get_logger(), "车辆与机器人在所选侧边上的弧长重合，无法判断来车方向");
+    return std::nullopt;
+  }
+  ctx.away_sign = ctx.car_s > ctx.robot_s ? -1.0 : 1.0;
+  RCLCPP_INFO(get_logger(), "车辆弧长 %.3f，沿路搜索方向 %s",
+    ctx.car_s, ctx.away_sign > 0.0 ? "弧长增大" : "弧长减小");
+
+  const auto & samples = boundaryOf(*ctx.query, ctx.side).samples;
+  ctx.side_line.reserve(samples.size());
+  for (const auto & sample : samples) {
+    ctx.side_line.emplace_back(sample.x, sample.y);
+  }
+  publishDebugMarkers(ctx.robot, ctx.car, ctx.side_line);
   return ctx;
 }
 
-std::vector<CarAvoidancePointServer::PoseStamped> CarAvoidancePointServer::filterExternalStopPoints(
+std::vector<CarAvoidancePointServer::ExternalCandidate> CarAvoidancePointServer::filterExternalStopPoints(
   const SearchContext & ctx)
 {
   geometry_msgs::msg::PoseArray::ConstSharedPtr stop_points;
@@ -103,84 +254,43 @@ std::vector<CarAvoidancePointServer::PoseStamped> CarAvoidancePointServer::filte
     std::lock_guard<std::mutex> lock(data_mutex_);
     stop_points = vehicle_avoidance_stop_points_;
   }
-  if (!stop_points || stop_points->poses.empty()) {
+  if (!stop_points || stop_points->poses.empty() || !ctx.query) {
     return {};
   }
 
-  const double cos_yaw = std::cos(ctx.robot_yaw);
-  const double sin_yaw = std::sin(ctx.robot_yaw);
-  auto local_x = [&](const Vec2 & world) {
-      const Vec2 delta = world - ctx.robot;
-      return delta.x() * cos_yaw + delta.y() * sin_yaw;
-    };
-  const double car_local_x = local_x(ctx.car);
-
-  std::vector<std::pair<double, PoseStamped>> results;
+  std::vector<ExternalCandidate> results;
   for (const auto & pose : stop_points->poses) {
     const Vec2 point(pose.position.x, pose.position.y);
-    const double dist = (point - ctx.robot).norm();
-    if (dist > external_point_max_distance_) {
+    if ((point - ctx.robot).norm() > external_point_max_distance_) {
       continue;
     }
-    // base_link 下与车在 x 轴异侧才保留
-    if (car_local_x * local_x(point) >= 0.0) {
-      RCLCPP_INFO(get_logger(), "外部停车点 (%.2f, %.2f) 与车同侧，过滤掉", point.x(), point.y());
+    // 通道外的点不要求落在通道内。投影不明确就淘汰这一点，继续看其他点。
+    const SideAnchor anchor = associateToSide(*ctx.query, ctx.side, point, false);
+    if (anchor.status != SideAnchor::Status::Ok) {
+      RCLCPP_INFO(get_logger(), "外部停车点 (%.2f, %.2f) %s，跳过",
+        point.x(), point.y(),
+        anchor.status == SideAnchor::Status::Ambiguous ? "投影不明确" : "无法关联到所选侧边");
       continue;
     }
-    PoseStamped pose_stamped;
-    pose_stamped.header.stamp = now();
-    pose_stamped.header.frame_id = "map";
-    pose_stamped.pose.position.x = point.x();
-    pose_stamped.pose.position.y = point.y();
-    pose_stamped.pose.position.z = 0.0;
-    // 先保留外部点的原始方向，通道内/外的方向处理放到 findAvoidancePoint 中决定
-    pose_stamped.pose.orientation = pose.orientation;
-    results.emplace_back(dist, pose_stamped);
+    const double point_delta = anchor.s - ctx.robot_s;
+    const double car_delta = ctx.car_s - ctx.robot_s;
+    if (point_delta * car_delta >= -1e-4) {
+      RCLCPP_INFO(get_logger(), "外部停车点 (%.2f, %.2f) 与车在沿路同侧，过滤掉", point.x(), point.y());
+      continue;
+    }
+    ExternalCandidate candidate;
+    candidate.pose.header.stamp = now();
+    candidate.pose.header.frame_id = "map";
+    candidate.pose.pose.position.x = point.x();
+    candidate.pose.pose.position.y = point.y();
+    candidate.pose.pose.position.z = 0.0;
+    candidate.pose.pose.orientation = pose.orientation;
+    candidate.along_s = anchor.s;
+    candidate.side_distance = anchor.distance;
+    results.push_back(std::move(candidate));
   }
-  std::stable_sort(results.begin(), results.end(), [](const auto & lhs, const auto & rhs) {
-      return lhs.first < rhs.first;
-    });
   RCLCPP_INFO(get_logger(), "外部停车点过滤后剩余: %zu个", results.size());
-
-  std::vector<PoseStamped> poses;
-  for (auto & result : results) {
-    poses.push_back(std::move(result.second));
-  }
-  return poses;
-}
-
-std::vector<Vec2> CarAvoidancePointServer::searchCellCenters(const MapView & map, const Ring & find_vertices) const
-{
-  double min_x = std::numeric_limits<double>::infinity();
-  double max_x = -std::numeric_limits<double>::infinity();
-  double min_y = std::numeric_limits<double>::infinity();
-  double max_y = -std::numeric_limits<double>::infinity();
-  for (const auto & vertex : find_vertices) {
-    min_x = std::min(min_x, vertex.x());
-    max_x = std::max(max_x, vertex.x());
-    min_y = std::min(min_y, vertex.y());
-    max_y = std::max(max_y, vertex.y());
-  }
-  auto to_cell = [](double value, double origin, double resolution, int size) {
-      return std::clamp(static_cast<int>(std::floor((value - origin) / resolution)), 0, size - 1);
-    };
-  const int x0 = to_cell(min_x, map.origin_x, map.resolution, map.width);
-  const int x1 = to_cell(max_x, map.origin_x, map.resolution, map.width);
-  const int y0 = to_cell(min_y, map.origin_y, map.resolution, map.height);
-  const int y1 = to_cell(max_y, map.origin_y, map.resolution, map.height);
-
-  std::vector<Vec2> centers;
-  for (int cell_y = y0; cell_y <= y1; ++cell_y) {
-    for (int cell_x = x0; cell_x <= x1; ++cell_x) {
-      const Vec2 center(
-        map.origin_x + (cell_x + 0.5) * map.resolution,
-        map.origin_y + (cell_y + 0.5) * map.resolution);
-      if (pointInConvex(center, find_vertices)) {
-        centers.push_back(center);
-      }
-    }
-  }
-  return centers;
+  return results;
 }
 
 std::optional<CarAvoidancePointServer::PoseStamped> CarAvoidancePointServer::findAvoidancePoint(const Task & task)
@@ -190,210 +300,246 @@ std::optional<CarAvoidancePointServer::PoseStamped> CarAvoidancePointServer::fin
     return std::nullopt;
   }
   const SearchContext & ctx = *prepared;
-  const Vec2 & robot = ctx.robot;
-  const Edge & nearest_boundary = ctx.nearest_boundary;
-  const double k = ctx.k;
 
-  // ===== 优先尝试外部停车点 =====
   const auto external_candidates = filterExternalStopPoints(ctx);
   if (!external_candidates.empty()) {
     RCLCPP_INFO(get_logger(), "尝试外部停车点，共%zu个", external_candidates.size());
-    std::vector<PoseStamped> valid_external;
-    for (auto ext_pose : external_candidates) {
-      const Vec2 point(ext_pose.pose.position.x, ext_pose.pose.position.y);
-      const bool ext_is_inside = pointInPolygon(point, task.vertices);
-      if (ext_is_inside) {
-        // 通道内：先按避让方向覆盖 yaw，再校验
-        ext_pose.pose.orientation = yawToQuaternion(computeAvoidanceYaw(k, robot, ctx.car));
+    std::vector<ExternalCandidate> valid_external;
+    for (auto candidate : external_candidates) {
+      const Vec2 point(candidate.pose.pose.position.x, candidate.pose.pose.position.y);
+      candidate.inside = pointInPolygon(point, task.vertices);
+      if (candidate.inside) {
+        const auto yaw = orientedYaw(*ctx.query, ctx.side, candidate.along_s, ctx.away_sign);
+        if (!yaw) {
+          RCLCPP_INFO(get_logger(), "外部停车点(%.2f, %.2f) 在通道内，但该处切向不明确，跳过",
+            point.x(), point.y());
+          continue;
+        }
+        candidate.pose.pose.orientation = yawToQuaternion(*yaw);
       } else {
-        RCLCPP_INFO(get_logger(), "外部停车点(%.2f, %.2f) 在通道外，将跳过服务检查", point.x(), point.y());
+        RCLCPP_INFO(get_logger(), "外部停车点(%.2f, %.2f) 在通道外，保留上位机朝向，将跳过服务检查",
+          point.x(), point.y());
       }
       std::string reason;
-      if (validateCandidate(task, ctx, ext_pose, !ext_is_inside, nullptr, reason)) {
-        valid_external.push_back(ext_pose);
+      if (validateCandidate(task, ctx, candidate.pose, candidate.along_s, !candidate.inside, nullptr, reason)) {
+        valid_external.push_back(std::move(candidate));
       } else {
         RCLCPP_INFO(get_logger(), "外部停车点(%.2f, %.2f) %s", point.x(), point.y(), reason.c_str());
       }
     }
 
     if (!valid_external.empty()) {
-      // 选离最近长边最近的点
-      auto best = *std::min_element(valid_external.begin(), valid_external.end(),
-          [&](const PoseStamped & lhs, const PoseStamped & rhs) {
-            return distancePointToSegment(
-              Vec2(lhs.pose.position.x, lhs.pose.position.y), nearest_boundary.first, nearest_boundary.second) <
-            distancePointToSegment(
-              Vec2(rhs.pose.position.x, rhs.pose.position.y), nearest_boundary.first, nearest_boundary.second);
+      const auto best = std::min_element(valid_external.begin(), valid_external.end(),
+          [](const ExternalCandidate & lhs, const ExternalCandidate & rhs) {
+            return lhs.side_distance < rhs.side_distance;
           });
-      const Vec2 best_point(best.pose.position.x, best.pose.position.y);
-      if (pointInPolygon(best_point, task.vertices)) {
-        best.pose.position.z = 20.0;
+      PoseStamped result = best->pose;
+      const Vec2 best_point(result.pose.position.x, result.pose.position.y);
+      if (best->inside) {
+        result.pose.position.z = 20.0;
         RCLCPP_INFO(get_logger(),
-          "外部停车点通过校验共%zu个，选择最贴近长边: (%.2f, %.2f)，该点在通道内，使用避让方向，z = 20.0",
+          "外部停车点通过校验共%zu个，选择最贴近所选侧边: (%.2f, %.2f)，该点在通道内，使用局部切向，z = 20.0",
           valid_external.size(), best_point.x(), best_point.y());
       } else {
-        // 通道外的固定停靠点：方向值保持不变
-        best.pose.position.z = 30.0;
+        result.pose.position.z = 30.0;
         RCLCPP_INFO(get_logger(),
-          "外部停车点通过校验共%zu个，选择最贴近长边: (%.2f, %.2f)，该点在通道外，方向保持不变，z = 30.0",
+          "外部停车点通过校验共%zu个，选择最贴近所选侧边: (%.2f, %.2f)，该点在通道外，方向保持不变，z = 30.0",
           valid_external.size(), best_point.x(), best_point.y());
         RCLCPP_INFO(get_logger(), "通道外外部停靠点已选用，map yaw=%.1f°",
-          radToDeg(tf2::getYaw(best.pose.orientation)));
+          radToDeg(tf2::getYaw(result.pose.orientation)));
       }
-      return best;
+      publishDebugMarkers(ctx.robot, ctx.car, ctx.side_line, nullptr, &result);
+      return result;
     }
     RCLCPP_INFO(get_logger(), "有外部停车点，但是所有外部停车点在筛选判断以后均不满足，回退自搜索");
   } else {
     RCLCPP_INFO(get_logger(), "话题无有效外部停车点，使用自搜索");
   }
 
-  // ===== 自搜索：沿 k 方向构造搜索框 =====
-  const Vec2 k_dir(std::cos(k), std::sin(k));
-  Vec2 robot_1;
-  Vec2 robot_2;
-  if (ctx.k_diff2 < M_PI / 2.0) {
-    RCLCPP_INFO(get_logger(), "在机器人前方避车, 额外增加%f米搜索距离", search_radius_extra_dis_);
-    robot_1 = robot + k_dir * (search_radius_max_ + search_radius_extra_dis_);
-    robot_2 = robot + k_dir * (search_radius_min_ + search_radius_extra_dis_);
-  } else {
-    RCLCPP_INFO(get_logger(), "在机器人后方避车");
-    robot_1 = robot + k_dir * search_radius_max_;
-    robot_2 = robot + k_dir * search_radius_min_;
-  }
-
-  const double passage_width = minEdgeLength(task.vertices);
-  RCLCPP_INFO(get_logger(), "通道宽度: %.3f, 半宽: %.3f", passage_width, passage_width / 2.0);
-
-  const double offset_min = outside_min_;
-  const double offset_max = outside_max_;
-  RCLCPP_INFO(get_logger(), "当前搜索偏移: offset_min=%.2f, offset_max=%.2f", offset_min, offset_max);
-
-  std::optional<Vec2> p1_near;
-  std::optional<Vec2> p2_near;
-  std::optional<Vec2> p1_far;
-  std::optional<Vec2> p2_far;
-  const Vec2 & nb0 = nearest_boundary.first;
-  const Vec2 & nb1 = nearest_boundary.second;
-  if (pointInPolygon(robot, task.vertices)) {
-    p1_near = findIntersection(nb0, nb1, robot_1, offset_min);
-    p2_near = findIntersection(nb0, nb1, robot_2, offset_min);
-    p1_far = findIntersection(nb0, nb1, robot_1, offset_max);
-    p2_far = findIntersection(nb0, nb1, robot_2, offset_max);
-  } else {
-    // 机器人在通道外：找最近边，并记录它的长度
-    double min_dis = std::numeric_limits<double>::infinity();
-    double nearest_edge_len = 0.0;
-    for (size_t i = 0; i < 4; ++i) {
-      const Vec2 & p1 = task.vertices[i];
-      const Vec2 & p2 = task.vertices[(i + 1) % 4];
-      const double d = distancePointToSegment(robot, p1, p2);
-      if (d < min_dis) {
-        min_dis = d;
-        nearest_edge_len = (p2 - p1).norm();
+  const auto & side_boundary = boundaryOf(*ctx.query, ctx.side);
+  const double side_begin = side_boundary.samples.front().s;
+  const double side_end = side_boundary.samples.back().s;
+  bool forward = false;
+  std::optional<double> travel_yaw = orientedYaw(*ctx.query, ctx.side, ctx.robot_s, ctx.away_sign);
+  if (!travel_yaw) {
+    for (int step = 1; step <= 12; ++step) {
+      const double probe = ctx.robot_s + ctx.away_sign * 0.05 * step;
+      travel_yaw = orientedYaw(*ctx.query, ctx.side, probe, ctx.away_sign);
+      if (travel_yaw) {
+        break;
       }
     }
-    const double short_edge_len = minEdgeLength(task.vertices);
-    // 最近边长度接近短边长度 → 从短边出去；明显更长 → 从长边出去
-    const bool nearest_is_long = nearest_edge_len > short_edge_len * 1.5;
-    const double dis_robot_to_nearest_bound = min_dis;
+  }
+  if (!travel_yaw) {
+    RCLCPP_ERROR(get_logger(), "机器人处没有指向搜索方向的切线，结束自搜索");
+    return std::nullopt;
+  }
+  forward = angleDiff(*travel_yaw, ctx.robot_yaw) < M_PI / 2.0;
+  const double extra = forward ? search_radius_extra_dis_ : 0.0;
+  if (forward) {
+    RCLCPP_INFO(get_logger(), "在机器人前方避车, 额外增加%f米搜索距离", search_radius_extra_dis_);
+  } else {
+    RCLCPP_INFO(get_logger(), "在机器人后方避车");
+  }
+  const double near_distance = search_radius_min_ + extra;
+  const double far_distance = search_radius_max_ + extra;
+  const double s_near = ctx.robot_s + ctx.away_sign * near_distance;
+  const double s_far = ctx.robot_s + ctx.away_sign * far_distance;
+  if (s_near < side_begin || s_near > side_end || s_far < side_begin || s_far > side_end) {
+    RCLCPP_ERROR(get_logger(), "搜索带越过所选侧边端头，结束自搜索");
+    return std::nullopt;
+  }
 
-    double offset_min_local = offset_min;
-    if (offset_min < dis_robot_to_nearest_bound && dis_robot_to_nearest_bound < offset_max) {
-      offset_min_local = dis_robot_to_nearest_bound;
-    } else if (nearest_is_long && dis_robot_to_nearest_bound >= stop_in_place_min_dist_) {
-      // 从长边出去、且离边够远 → 路肩位置，可原地停
-      RCLCPP_INFO(get_logger(), "机器人在长边外侧 %.2fm，原地停车", dis_robot_to_nearest_bound);
-      PoseStamped ret_pose;
-      ret_pose.header.stamp = now();
-      ret_pose.header.frame_id = "map";
-      ret_pose.pose.position.x = robot.x();
-      ret_pose.pose.position.y = robot.y();
-      const double target_angle = radToDeg(std::atan2(nb1.y() - nb0.y(), nb1.x() - nb0.x()));
-      const double ret_pose_yaw = degToRad(
-        adjustAngle(Vec2(std::cos(ctx.robot_yaw), std::sin(ctx.robot_yaw)), target_angle));
-      ret_pose.pose.orientation = yawToQuaternion(ret_pose_yaw);
-      ret_pose.pose.position.z = 10.0;
-      return ret_pose;
-    } else {
-      RCLCPP_INFO(get_logger(), "出口边是%s, 距离%.2fm，不满足原地停条件，继续搜索",
-        nearest_is_long ? "长边" : "短边", dis_robot_to_nearest_bound);
+  const double lat_lo = std::min(outside_min_, outside_max_);
+  const double lat_hi = std::max(outside_min_, outside_max_);
+  const double s_lo = std::min(s_near, s_far);
+  const double s_hi = std::max(s_near, s_far);
+  RCLCPP_INFO(get_logger(),
+    "沿路搜索带弧长 [%.3f, %.3f]，横向偏移 [%.2f, %.2f]（向外为正）",
+    s_lo, s_hi, lat_lo, lat_hi);
+
+  Ring inner_edge;
+  Ring outer_edge;
+  double min_x = std::numeric_limits<double>::infinity();
+  double max_x = -std::numeric_limits<double>::infinity();
+  double min_y = std::numeric_limits<double>::infinity();
+  double max_y = -std::numeric_limits<double>::infinity();
+  auto include_point = [&](const Vec2 & point) {
+      min_x = std::min(min_x, point.x());
+      max_x = std::max(max_x, point.x());
+      min_y = std::min(min_y, point.y());
+      max_y = std::max(max_y, point.y());
+    };
+  const double sample_step = std::max(0.2, ctx.map.resolution);
+  for (double s = s_lo; s <= s_hi + 1e-6; s += sample_step) {
+    const double station = std::min(s, s_hi);
+    const auto inward = ctx.query->inwardNormal(ctx.side, station);
+    const auto pose = ctx.query->evaluateSide(ctx.side, station);
+    if (inward.status != garage_road_model::QueryStatus::Ok ||
+      pose.status != garage_road_model::QueryStatus::Ok)
+    {
+      continue;
     }
-
-    p1_near = findIntersection(nb0, nb1, robot_1, -offset_min_local);
-    p2_near = findIntersection(nb0, nb1, robot_2, -offset_min_local);
-    p1_far = findIntersection(nb0, nb1, robot_1, -offset_max);
-    p2_far = findIntersection(nb0, nb1, robot_2, -offset_max);
+    const Vec2 outward(-inward.direction.x(), -inward.direction.y());
+    const Vec2 inner = pose.position + outward * lat_lo;
+    const Vec2 outer = pose.position + outward * lat_hi;
+    inner_edge.push_back(inner);
+    outer_edge.push_back(outer);
+    include_point(inner);
+    include_point(outer);
   }
-
-  if (!p1_near || !p2_near || !p1_far || !p2_far) {
-    RCLCPP_INFO(get_logger(), "findIntersection 返回 None，放弃搜索");
+  if (inner_edge.empty()) {
+    RCLCPP_ERROR(get_logger(), "搜索带上没有可用法线，结束自搜索");
     return std::nullopt;
   }
+  Ring search_band = inner_edge;
+  search_band.insert(search_band.end(), outer_edge.rbegin(), outer_edge.rend());
+  publishDebugMarkers(ctx.robot, ctx.car, ctx.side_line, &search_band);
 
-  // 搜索框最前面的短边不能越过通道前方短边
-  const auto forward_short_edge = forwardShortEdge(robot, task.vertices, k);
-  if (!forward_short_edge) {
-    RCLCPP_ERROR(get_logger(), "求不出通道前方短边");
-    return std::nullopt;
-  }
-  Vec2 polygon_center = Vec2::Zero();
-  for (const auto & vertex : task.vertices) {
-    polygon_center += vertex;
-  }
-  polygon_center /= static_cast<double>(task.vertices.size());
-  if (isPointBeyondEdge(*p1_near, *forward_short_edge, polygon_center) ||
-    isPointBeyondEdge(*p1_far, *forward_short_edge, polygon_center))
+  struct CellCandidate
   {
-    RCLCPP_ERROR(get_logger(), "搜索框构造失败：搜索框最前面的短边越过了通道前方短边");
-    return std::nullopt;
-  }
-
-  const Ring find_vertices = sortQuadrilateralVertices({*p1_near, *p1_far, *p2_far, *p2_near});
-  RCLCPP_INFO(get_logger(), "find_vertices: [(%.3f, %.3f),(%.3f, %.3f),(%.3f, %.3f),(%.3f, %.3f)]",
-    find_vertices[0].x(), find_vertices[0].y(), find_vertices[1].x(), find_vertices[1].y(),
-    find_vertices[2].x(), find_vertices[2].y(), find_vertices[3].x(), find_vertices[3].y());
-  publishDebugMarkers(robot, ctx.car, nearest_boundary, &find_vertices);
-
-  // 搜索框内每个栅格中心都是候选点，按离机器人从近到远检查
-  auto centers = searchCellCenters(ctx.map, find_vertices);
-  std::stable_sort(centers.begin(), centers.end(), [&](const Vec2 & lhs, const Vec2 & rhs) {
-      return (lhs - robot).squaredNorm() < (rhs - robot).squaredNorm();
-    });
-  RCLCPP_INFO(get_logger(), "搜索框内一共%zu个候选栅格", centers.size());
-
-  // 搜索框比栅格还窄时框内可能没有栅格中心，至少保留搜索框中心这一个候选点
-  const bool use_box_center = centers.empty();
-  if (use_box_center) {
-    Vec2 box_center = Vec2::Zero();
-    for (const auto & vertex : find_vertices) {
-      box_center += vertex;
+    Vec2 point{Vec2::Zero()};
+    double along_s{0.0};
+    double along_distance{0.0};
+    int order{0};
+  };
+  std::vector<CellCandidate> cells;
+  int ambiguous_cells = 0;
+  if (std::isfinite(min_x)) {
+    const double pad = ctx.map.resolution;
+    auto to_cell = [](double value, double origin, double resolution, int size) {
+        return std::clamp(static_cast<int>(std::floor((value - origin) / resolution)), 0, size - 1);
+      };
+    const int x0 = to_cell(min_x - pad, ctx.map.origin_x, ctx.map.resolution, ctx.map.width);
+    const int x1 = to_cell(max_x + pad, ctx.map.origin_x, ctx.map.resolution, ctx.map.width);
+    const int y0 = to_cell(min_y - pad, ctx.map.origin_y, ctx.map.resolution, ctx.map.height);
+    const int y1 = to_cell(max_y + pad, ctx.map.origin_y, ctx.map.resolution, ctx.map.height);
+    int order = 0;
+    for (int cell_y = y0; cell_y <= y1; ++cell_y) {
+      for (int cell_x = x0; cell_x <= x1; ++cell_x) {
+        const Vec2 center(
+          ctx.map.origin_x + (cell_x + 0.5) * ctx.map.resolution,
+          ctx.map.origin_y + (cell_y + 0.5) * ctx.map.resolution);
+        const int scan_order = order++;
+        const bool inside = garage_road_model::pointInsidePolygon(center, ctx.query->model().boundary, 0.05);
+        const SideAnchor anchor = associateToSide(*ctx.query, ctx.side, center, inside);
+        if (anchor.status == SideAnchor::Status::Ambiguous) {
+          ++ambiguous_cells;
+          continue;
+        }
+        if (anchor.status != SideAnchor::Status::Ok || !anchor.has_lateral) {
+          continue;
+        }
+        if (anchor.s < s_lo || anchor.s > s_hi || anchor.lateral < lat_lo || anchor.lateral > lat_hi) {
+          continue;
+        }
+        CellCandidate cell;
+        cell.point = center;
+        cell.along_s = anchor.s;
+        cell.along_distance = ctx.away_sign * (anchor.s - ctx.robot_s);
+        cell.order = scan_order;
+        cells.push_back(cell);
+      }
     }
-    centers.push_back(box_center / static_cast<double>(find_vertices.size()));
-    RCLCPP_INFO(get_logger(), "搜索框内没有栅格中心，使用搜索框中心(%.3f, %.3f)作为候选点",
-      centers.back().x(), centers.back().y());
   }
 
-  const double final_yaw = computeAvoidanceYaw(k, robot, ctx.car);
-  const auto orientation = yawToQuaternion(final_yaw);
-  const auto kernel = buildFootprintKernel(ctx.map, footprint(), final_yaw);
-  const FootprintKernel * kernel_ptr = use_box_center ? nullptr : &kernel;
+  // 排序规则调整：按沿路距离由近到远，沿路距离相同再保持栅格扫描顺序。
+  // 弯道里隔墙直线距离更近的点，不会因为欧氏距离更小而被优先选中。
+  std::stable_sort(cells.begin(), cells.end(), [](const CellCandidate & lhs, const CellCandidate & rhs) {
+      if (std::abs(lhs.along_distance - rhs.along_distance) > 1e-6) {
+        return lhs.along_distance < rhs.along_distance;
+      }
+      return lhs.order < rhs.order;
+    });
+  RCLCPP_INFO(get_logger(),
+    "自搜索候选 %zu 个，按沿路距离由近到远检查，投影不明确跳过 %d 个",
+    cells.size(), ambiguous_cells);
+
+  if (cells.empty()) {
+    const double mid_s = 0.5 * (s_near + s_far);
+    const double mid_lateral = 0.5 * (outside_min_ + outside_max_);
+    const auto inward = ctx.query->inwardNormal(ctx.side, mid_s);
+    const auto pose = ctx.query->evaluateSide(ctx.side, mid_s);
+    if (inward.status != garage_road_model::QueryStatus::Ok ||
+      pose.status != garage_road_model::QueryStatus::Ok)
+    {
+      RCLCPP_INFO(get_logger(), "搜索带内没有栅格中心，且中心处没有可用法线");
+      return std::nullopt;
+    }
+    const Vec2 outward(-inward.direction.x(), -inward.direction.y());
+    CellCandidate cell;
+    cell.point = pose.position + outward * mid_lateral;
+    cell.along_s = mid_s;
+    cell.along_distance = ctx.away_sign * (mid_s - ctx.robot_s);
+    cells.push_back(cell);
+    RCLCPP_INFO(get_logger(), "搜索带内没有栅格中心，使用搜索带中心(%.3f, %.3f)作为候选点",
+      cell.point.x(), cell.point.y());
+  }
+
   std::map<std::string, int> rejected;
   auto log_rejected = [&]() {
       for (const auto & item : rejected) {
         RCLCPP_INFO(get_logger(), "候选栅格不通过：%s %d个", item.first.c_str(), item.second);
       }
     };
-  for (const auto & center : centers) {
+  for (const auto & cell : cells) {
+    const auto yaw = orientedYaw(*ctx.query, ctx.side, cell.along_s, ctx.away_sign);
+    if (!yaw) {
+      ++rejected["该处切向不明确"];
+      continue;
+    }
     PoseStamped candidate;
     candidate.header.stamp = now();
     candidate.header.frame_id = "map";
-    candidate.pose.position.x = center.x();
-    candidate.pose.position.y = center.y();
-    candidate.pose.orientation = orientation;
+    candidate.pose.position.x = cell.point.x();
+    candidate.pose.position.y = cell.point.y();
+    candidate.pose.orientation = yawToQuaternion(*yaw);
     std::string reason;
-    if (validateCandidate(task, ctx, candidate, false, kernel_ptr, reason)) {
+    // 各候选朝向不同，不能共用一份 footprint 栅格模板。
+    if (validateCandidate(task, ctx, candidate, cell.along_s, false, nullptr, reason)) {
       log_rejected();
       candidate.pose.position.z = 10.0;
+      publishDebugMarkers(ctx.robot, ctx.car, ctx.side_line, &search_band, &candidate);
       return candidate;
     }
     ++rejected[reason];

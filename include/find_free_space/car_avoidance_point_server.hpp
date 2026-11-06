@@ -12,6 +12,8 @@
 #include "capella_ros_msg/action/find_car_avoidance_point.hpp"
 #include "capella_ros_msg/srv/is_car_passable.hpp"
 #include "find_free_space/geometry.hpp"
+#include "garage_road_model/msg/road_model_array.hpp"
+#include "garage_road_model/road_model_query.hpp"
 #include "garage_utils_msgs/msg/polygons.hpp"
 #include "geometry_msgs/msg/polygon_stamped.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
@@ -58,6 +60,8 @@ private:
     std::shared_ptr<const FindCarAvoidancePoint::Goal> goal;
     PoseStamped robot_pose;
     Ring vertices;
+    // 任务开始时的道路模型
+    std::optional<garage_road_model::RoadModelData> road_model;
   };
 
   struct SearchContext
@@ -67,9 +71,21 @@ private:
     Vec2 robot;
     double robot_yaw{0.0};
     Vec2 car;
-    Edge nearest_boundary;
-    double k{0.0};
-    double k_diff2{0.0};
+    std::shared_ptr<garage_road_model::RoadModelQuery> query;
+    garage_road_model::SideId side{garage_road_model::SideId::A};
+    double robot_s{0.0};
+    double car_s{0.0};
+    // +1 向弧长增大的方向远离来车，-1 向弧长减小的方向
+    double away_sign{1.0};
+    Ring side_line;
+  };
+
+  struct ExternalCandidate
+  {
+    PoseStamped pose;
+    double along_s{0.0};
+    double side_distance{0.0};
+    bool inside{false};
   };
 
   // 中心落在栅格中心时，footprint 碰到的栅格相对中心栅格的偏移
@@ -84,6 +100,10 @@ private:
   void globalCostmapCallback(const nav2_msgs::msg::Costmap::ConstSharedPtr msg);
   void specialTerrainCallback(const garage_utils_msgs::msg::Polygons::ConstSharedPtr msg);
   void vehicleStopPointsCallback(const geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
+  void roadModelsCallback(const garage_road_model::msg::RoadModelArray::ConstSharedPtr msg);
+  std::optional<garage_road_model::RoadModelData> matchRoadModel(
+    const Ring & polygon, const std::vector<garage_road_model::RoadModelData> & models,
+    std::string & reason) const;
   void startTaskSubscriptions();
   void stopTaskSubscriptions();
   bool waitForGlobalCostmap(double timeout_sec);
@@ -92,20 +112,18 @@ private:
   void execute(const std::shared_ptr<GoalHandle> goal_handle);
   void runTask(const std::shared_ptr<GoalHandle> & goal_handle);
   void publishDebugMarkers(
-    const Vec2 & robot, const Vec2 & car, const Edge & nearest_boundary,
-    const Ring * find_vertices = nullptr, const PoseStamped * avoidance_point = nullptr);
+    const Vec2 & robot, const Vec2 & car, const Ring & side_line,
+    const Ring * search_band = nullptr, const PoseStamped * avoidance_point = nullptr);
   void publishAllPassagesMarker(const std::vector<geometry_msgs::msg::Polygon> & polygons);
   Ring footprint() const;
 
   // avoidance_search.cpp
   std::optional<SearchContext> prepareAvoidanceSearch(const Task & task);
   std::optional<PoseStamped> findAvoidancePoint(const Task & task);
-  std::vector<PoseStamped> filterExternalStopPoints(const SearchContext & ctx);
-  std::vector<Vec2> searchCellCenters(const MapView & map, const Ring & find_vertices) const;
+  std::vector<ExternalCandidate> filterExternalStopPoints(const SearchContext & ctx);
 
-  // candidate_checks.cpp
   bool validateCandidate(
-    const Task & task, const SearchContext & ctx, const PoseStamped & candidate,
+    const Task & task, const SearchContext & ctx, const PoseStamped & candidate, double along_s,
     bool skip_service_check, const FootprintKernel * kernel, std::string & reason);
   bool checkPointIsFree(const MapView & map, int center_x, int center_y, int radius) const;
   bool isPointInSpecialTerrain(double x, double y) const;
@@ -154,6 +172,7 @@ private:
   rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr global_costmap_sub_;
   rclcpp::Subscription<garage_utils_msgs::msg::Polygons>::SharedPtr special_terrain_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr vehicle_stop_points_sub_;
+  rclcpp::Subscription<garage_road_model::msg::RoadModelArray>::SharedPtr road_models_sub_;
   rclcpp_action::Server<FindCarAvoidancePoint>::SharedPtr action_server_;
   rclcpp::Client<IsCarPassable>::SharedPtr check_avoidance_service_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -165,6 +184,7 @@ private:
   nav2_msgs::msg::Costmap::ConstSharedPtr global_costmap_;
   std::shared_ptr<const std::vector<geometry_msgs::msg::Polygon>> special_terrain_polygons_;
   geometry_msgs::msg::PoseArray::ConstSharedPtr vehicle_avoidance_stop_points_;
+  std::vector<garage_road_model::RoadModelData> cached_road_models_;
 
   std::mutex execute_mutex_;
 };

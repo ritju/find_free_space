@@ -20,6 +20,7 @@ find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(capella_ros_msg REQUIRED)
 find_package(garage_utils_msgs REQUIRED)
+find_package(garage_road_model REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui)
 
@@ -46,8 +47,9 @@ ament_target_dependencies(find_parking_space
   tf2_geometry_msgs
   capella_ros_msg
   garage_utils_msgs
+  garage_road_model
 )
-target_link_libraries(find_parking_space ${OpenCV_LIBS})
+target_link_libraries(find_parking_space garage_road_model::road_model_core ${OpenCV_LIBS})
 
 install(TARGETS find_parking_space
   DESTINATION lib/${PROJECT_NAME})

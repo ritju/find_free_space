@@ -19,6 +19,7 @@
   <depend>tf2_geometry_msgs</depend>
   <depend>capella_ros_msg</depend>
   <depend>garage_utils_msgs</depend>
+  <depend>garage_road_model</depend>
   <depend>eigen</depend>
   <depend>libopencv-dev</depend>
 
