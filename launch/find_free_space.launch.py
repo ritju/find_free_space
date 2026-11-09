@@ -58,6 +58,7 @@ def generate_launch_description():
                         executable='find_parking_space',
                         name='find_free_space_action_server',
                         output='screen',
+                        respawn=True,
                         respawn_delay=2.0,
                         parameters=[params_file,
                                     {'search_radius_min': float(search_radius_min[0]),
