@@ -109,25 +109,24 @@ std::optional<CarAvoidancePointServer::SearchContext> CarAvoidancePointServer::s
   return ctx;
 }
 
-// 停靠朝向：该弧长处的侧边切线，再翻到远离来车的沿路方向。拐角处切线不唯一。
+// 停靠朝向：侧边从 start 到 end 的切线。采样 yaw 随弧长增大，就是这个方向。拐角处切线不唯一。
 std::optional<double> parkingYawAlongSide(
   const garage_road_model::RoadModelQuery & query,
   garage_road_model::SideId side,
-  double s,
-  double away_sign)
+  double s)
 {
   const auto pose = query.evaluateSide(side, s);
   if (pose.status != garage_road_model::QueryStatus::Ok || pose.corner) {
     return std::nullopt;
   }
-  return away_sign < 0.0 ? addAngles(pose.yaw, M_PI) : pose.yaw;
+  return pose.yaw;
 }
 
-// 垂足已经投好。横向仍用法线展开搜索带；停靠朝向改成沿侧边、背对来车的切线。
+// 垂足已经投好。横向仍用法线展开搜索带；搜索沿远离来车的方向，车头另取 start 到 end。
 bool CarAvoidancePointServer::normalAtFoot(SearchContext & ctx)
 {
   const auto pose = ctx.query->evaluateSide(ctx.side, ctx.foot_s);
-  const auto normal = ctx.query->inwardNormal(ctx.side, ctx.foot_s);
+  const auto normal = ctx.query->inwardNormal(ctx.side, ctx.foot_s, ctx.channel);
   if (pose.status != garage_road_model::QueryStatus::Ok || pose.corner) {
     RCLCPP_ERROR(get_logger(), "投影点没有沿侧边的切线：%s",
       pose.corner ? "拐角处切线不唯一" : pose.reason.c_str());
@@ -139,7 +138,7 @@ bool CarAvoidancePointServer::normalAtFoot(SearchContext & ctx)
   }
   const double along_yaw = flipIfFacingCar(pose.yaw, ctx.robot, ctx.car);
   ctx.away_sign = angleDiff(along_yaw, pose.yaw) < M_PI / 2.0 ? 1.0 : -1.0;
-  RCLCPP_INFO(get_logger(), "停靠朝向沿侧边切线，远离来车的方向为弧长%s",
+  RCLCPP_INFO(get_logger(), "搜索沿弧长%s远离来车，车头沿侧边从 start 到 end",
     ctx.away_sign > 0.0 ? "增大" : "减小");
   return true;
 }
@@ -212,7 +211,7 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findExte
     const bool inside = pointInPolygon(point, task.vertices);
     if (inside) {
       const auto foot = nearestFoot(*ctx.query, ctx.side, point);
-      const auto yaw = foot ? parkingYawAlongSide(*ctx.query, ctx.side, foot->s, ctx.away_sign) : std::nullopt;
+      const auto yaw = foot ? parkingYawAlongSide(*ctx.query, ctx.side, foot->s) : std::nullopt;
       if (!yaw) {
         RCLCPP_INFO(get_logger(), "外部停车点(%.2f, %.2f) 在通道内，但该处没有沿侧边的切线，跳过",
           point.x(), point.y());
@@ -263,12 +262,13 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findExte
 std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoidancePoint(
   const Task & task, const SearchContext & ctx)
 {
-  const auto travel_yaw = parkingYawAlongSide(*ctx.query, ctx.side, ctx.foot_s, ctx.away_sign);
-  if (!travel_yaw) {
+  const auto facing_yaw = parkingYawAlongSide(*ctx.query, ctx.side, ctx.foot_s);
+  if (!facing_yaw) {
     RCLCPP_ERROR(get_logger(), "机器人垂足处没有沿侧边的切线，无法判断前后");
     return std::nullopt;
   }
-  const bool ahead = angleDiff(*travel_yaw, ctx.robot_yaw) < M_PI / 2.0;
+  const double retreat_yaw = ctx.away_sign < 0.0 ? addAngles(*facing_yaw, M_PI) : *facing_yaw;
+  const bool ahead = angleDiff(retreat_yaw, ctx.robot_yaw) < M_PI / 2.0;
   const double extra = ahead ? search_radius_extra_dis_ : 0.0;
   const double near_distance = search_radius_min_ + extra;
   const double far_distance = search_radius_max_ + extra;
@@ -332,13 +332,13 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoi
       continue;
     }
     const auto pose = ctx.query->evaluateSide(ctx.side, station);
-    const auto normal = ctx.query->inwardNormal(ctx.side, station);
+    const auto normal = ctx.query->inwardNormal(ctx.side, station, ctx.channel);
     if (pose.status != garage_road_model::QueryStatus::Ok || pose.corner ||
       normal.status != garage_road_model::QueryStatus::Ok)
     {
       continue;
     }
-    const double park_yaw = ctx.away_sign < 0.0 ? addAngles(pose.yaw, M_PI) : pose.yaw;
+    const double park_yaw = pose.yaw;
     const Vec2 outward = -normal.direction;
     inner_edge.push_back(pose.position + outward * lateral_lo);
     outer_edge.push_back(pose.position + outward * lateral_hi);

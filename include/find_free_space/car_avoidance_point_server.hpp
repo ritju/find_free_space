@@ -76,7 +76,7 @@ private:
     std::shared_ptr<garage_road_model::RoadModelQuery> query;
     garage_road_model::SideId side{garage_road_model::SideId::A};
     double foot_s{0.0};
-    // +1 沿弧长增大的方向远离来车，-1 沿弧长减小的方向。停靠朝向是该方向上的侧边切线。
+    // +1 沿弧长增大的方向远离来车，-1 沿弧长减小。只决定搜索带往哪边展开，车头沿 start 到 end。
     double away_sign{1.0};
     Ring side_line;
     Ring channel;
@@ -90,7 +90,7 @@ private:
   void vehicleStopPointsCallback(const geometry_msgs::msg::PoseArray::ConstSharedPtr msg);
   void roadModelsCallback(const garage_road_model::msg::RoadModelArray::ConstSharedPtr msg);
   std::optional<garage_road_model::RoadModelData> matchRoadModel(
-    const Ring & polygon, const std::vector<garage_road_model::RoadModelData> & models,
+    int source_index, const std::vector<garage_road_model::RoadModelData> & models,
     std::string & reason) const;
   void startTaskSubscriptions();
   void stopTaskSubscriptions();

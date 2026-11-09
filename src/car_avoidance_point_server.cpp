@@ -1,4 +1,5 @@
 #include "find_free_space/car_avoidance_point_server.hpp"
+#include "find_free_space/visualization.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -206,41 +207,8 @@ void CarAvoidancePointServer::specialTerrainCallback(const garage_utils_msgs::ms
   }
   RCLCPP_INFO_ONCE(get_logger(), "收到禁扫区: %zu个区域", msg->polygons.size());
 
-  visualization_msgs::msg::Marker marker;
-  marker.header.frame_id = "map";
-  marker.header.stamp = now();
-  marker.id = 10;
-  marker.type = visualization_msgs::msg::Marker::LINE_LIST;
-  marker.scale.x = 0.05;
-  if (msg->polygons.empty()) {
-    marker.action = visualization_msgs::msg::Marker::DELETE;
-    marker_special_terrain_publisher_->publish(marker);
-    return;
-  }
-  marker.action = visualization_msgs::msg::Marker::ADD;
-  marker.color.r = 1.0;
-  marker.color.g = 0.0;
-  marker.color.b = 0.0;
-  marker.color.a = 0.5;
-  for (const auto & polygon : msg->polygons) {
-    const auto & pts = polygon.points;
-    if (pts.size() < 2) {
-      continue;
-    }
-    for (size_t i = 0; i < pts.size(); ++i) {
-      geometry_msgs::msg::Point p1;
-      p1.x = pts[i].x;
-      p1.y = pts[i].y;
-      p1.z = pts[i].z;
-      geometry_msgs::msg::Point p2;
-      p2.x = pts[(i + 1) % pts.size()].x;
-      p2.y = pts[(i + 1) % pts.size()].y;
-      p2.z = pts[(i + 1) % pts.size()].z;
-      marker.points.push_back(p1);
-      marker.points.push_back(p2);
-    }
-  }
-  marker_special_terrain_publisher_->publish(marker);
+  marker_special_terrain_publisher_->publish(makePolygonOutline(
+      now(), 10, 0.05F, 1.F, 0.F, 0.F, 0.5F, msg->polygons));
 }
 
 void CarAvoidancePointServer::vehicleStopPointsCallback(const geometry_msgs::msg::PoseArray::ConstSharedPtr msg)
@@ -277,12 +245,8 @@ void CarAvoidancePointServer::roadModelsCallback(
   for (const auto & item : msg->roads) {
     garage_road_model::RoadModelData road;
     road.source_index = item.source_index;
-    road.boundary = load_points(item.boundary);
     road.start_cap = load_points(item.start_cap);
     road.end_cap = load_points(item.end_cap);
-    road.valid = item.valid;
-    road.stage = item.stage;
-    road.reason = item.reason;
     auto load_side = [&](const garage_road_model::msg::SideBoundary & side) {
         garage_road_model::SideBoundary out;
         out.raw = load_points(side.raw);
@@ -310,64 +274,26 @@ void CarAvoidancePointServer::roadModelsCallback(
     static_cast<unsigned long>(msg->revision), msg->roads.size());
 }
 
-namespace
-{
-
-std::vector<Eigen::Vector2d> cleanRing(const std::vector<Eigen::Vector2d> & points)
-{
-  std::vector<Eigen::Vector2d> ring;
-  for (const auto & point : points) {
-    if (ring.empty() || (ring.back() - point).norm() > 1e-4) {
-      ring.push_back(point);
-    }
-  }
-  if (ring.size() >= 2 && (ring.front() - ring.back()).norm() <= 1e-4) {
-    ring.pop_back();
-  }
-  return ring;
-}
-
-double ringMismatch(const std::vector<Eigen::Vector2d> & lhs, std::vector<Eigen::Vector2d> rhs)
-{
-  if (lhs.size() < 3 || lhs.size() != rhs.size()) {
-    return std::numeric_limits<double>::infinity();
-  }
-  double best = std::numeric_limits<double>::infinity();
-  for (int direction = 0; direction < 2; ++direction) {
-    const int count = static_cast<int>(lhs.size());
-    for (int shift = 0; shift < count; ++shift) {
-      double worst = 0.0;
-      for (int i = 0; i < count; ++i) {
-        worst = std::max(
-          worst, (lhs[static_cast<size_t>(i)] - rhs[static_cast<size_t>((i + shift) % count)]).norm());
-      }
-      best = std::min(best, worst);
-    }
-    std::reverse(rhs.begin(), rhs.end());
-  }
-  return best;
-}
-
-}  // namespace
-
 std::optional<garage_road_model::RoadModelData> CarAvoidancePointServer::matchRoadModel(
-  const Ring & polygon, const std::vector<garage_road_model::RoadModelData> & models,
+  int source_index, const std::vector<garage_road_model::RoadModelData> & models,
   std::string & reason) const
 {
-  const auto ring = cleanRing(polygon);
-  constexpr double kTolerance = 0.05;
+  if (source_index < 0) {
+    reason = "通道下标无效";
+    return std::nullopt;
+  }
   std::vector<size_t> matches;
   for (size_t i = 0; i < models.size(); ++i) {
-    if (ringMismatch(ring, cleanRing(models[i].boundary)) <= kTolerance) {
+    if (models[i].source_index == static_cast<uint32_t>(source_index)) {
       matches.push_back(i);
     }
   }
   if (matches.empty()) {
-    reason = "当前通道没有几何对应的道路模型";
+    reason = "通道下标没有对应的道路模型";
     return std::nullopt;
   }
   if (matches.size() > 1) {
-    reason = "当前通道对应多个道路模型，无法确定";
+    reason = "通道下标对应多个道路模型，无法确定";
     return std::nullopt;
   }
   return models[matches.front()];
@@ -540,13 +466,16 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
 
   RCLCPP_INFO(get_logger(), "寻找当前通行区域...");
   const Vec2 robot(task.robot_pose.pose.position.x, task.robot_pose.pose.position.y);
-  for (const auto & polygon : task.goal->polygons) {
+  int polygon_index = -1;
+  for (size_t i = 0; i < task.goal->polygons.size(); ++i) {
+    const auto & polygon = task.goal->polygons[i];
     Ring current_polygon_vertices;
     for (const auto & point : polygon.points) {
       current_polygon_vertices.emplace_back(point.x, point.y);
     }
     if (pointInPolygon(robot, current_polygon_vertices)) {
       task.vertices = current_polygon_vertices;
+      polygon_index = static_cast<int>(i);
       RCLCPP_INFO(get_logger(), "机器人在通道内，使用当前通道: [%s]", formatRing(task.vertices).c_str());
       break;
     }
@@ -564,18 +493,16 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
     models = cached_road_models_;
   }
   std::string match_reason;
-  auto matched = matchRoadModel(task.vertices, models, match_reason);
-  const bool model_usable = matched && matched->valid &&
+  auto matched = matchRoadModel(polygon_index, models, match_reason);
+  const bool model_usable = matched &&
     matched->side_a.samples.size() >= 2 && matched->side_b.samples.size() >= 2;
   if (model_usable) {
     task.road_model = std::move(*matched);
   } else {
-    if (matched && !matched->valid) {
-      match_reason = matched->reason.empty() ? "模型无效" : matched->reason;
-    } else if (matched) {
-      match_reason = "侧边采样不足";
+    if (matched) {
+      match_reason = "侧边采样为空";
     } else if (match_reason.empty()) {
-      match_reason = "未匹配到有效模型";
+      match_reason = "未匹配到道路模型";
     }
     RCLCPP_ERROR(get_logger(), "没有可用曲线（%s）", match_reason.c_str());
     goal_handle->abort(empty_result);
@@ -595,7 +522,7 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
     if (external->pose.position.z >= 25.0) {
       RCLCPP_INFO(get_logger(), "优先使用通道外外部停靠点，保留上位机朝向，z=%.0f", external->pose.position.z);
     } else {
-      RCLCPP_INFO(get_logger(), "优先使用通道内外部停靠点，朝向为沿侧边背对来车的切线，z=%.0f",
+      RCLCPP_INFO(get_logger(), "优先使用通道内外部停靠点，朝向为沿侧边从 start 到 end 的切线，z=%.0f",
         external->pose.position.z);
     }
     return;
@@ -624,138 +551,24 @@ void CarAvoidancePointServer::publishDebugMarkers(
   const Vec2 & robot, const Vec2 & car, const Ring & side_line,
   const Ring * search_band, const PoseStamped * avoidance_point)
 {
-  using visualization_msgs::msg::Marker;
-  const auto stamp = now();
-
-  Marker car_marker;
-  car_marker.header.frame_id = "map";
-  car_marker.header.stamp = stamp;
-  car_marker.id = 1;
-  car_marker.type = Marker::CUBE;
-  car_marker.action = Marker::ADD;
-  car_marker.scale.x = 0.5;
-  car_marker.scale.y = 0.5;
-  car_marker.scale.z = 0.5;
-  car_marker.color.r = 1.0;
-  car_marker.color.a = 1.0;
-  car_marker.pose.position.x = car.x();
-  car_marker.pose.position.y = car.y();
-  car_marker.pose.orientation.w = 1.0;
-  marker_car_pose_publisher_->publish(car_marker);
-
-  Marker robot_marker;
-  robot_marker.header.frame_id = "map";
-  robot_marker.header.stamp = stamp;
-  robot_marker.id = 2;
-  robot_marker.type = Marker::SPHERE;
-  robot_marker.action = Marker::ADD;
-  robot_marker.scale.x = 0.2;
-  robot_marker.scale.y = 0.2;
-  robot_marker.scale.z = 0.2;
-  robot_marker.color.g = 1.0;
-  robot_marker.color.a = 1.0;
-  robot_marker.pose.position.x = robot.x();
-  robot_marker.pose.position.y = robot.y();
-  robot_marker.pose.orientation.w = 1.0;
-  marker_robot_pose_publisher_->publish(robot_marker);
-
-  Marker side_marker;
-  side_marker.header.frame_id = "map";
-  side_marker.header.stamp = stamp;
-  side_marker.id = 3;
-  side_marker.type = Marker::LINE_STRIP;
-  side_marker.action = Marker::ADD;
-  side_marker.scale.x = 0.2;
-  side_marker.color.g = 1.0;
-  side_marker.color.a = 1.0;
-  for (const auto & point : side_line) {
-    geometry_msgs::msg::Point marker_point;
-    marker_point.x = point.x();
-    marker_point.y = point.y();
-    side_marker.points.push_back(marker_point);
+  const auto markers = makeDebugMarkers(now(), robot, car, side_line, search_band, avoidance_point);
+  marker_car_pose_publisher_->publish(markers.car);
+  marker_robot_pose_publisher_->publish(markers.robot);
+  if (markers.side) {
+    marker_avoidance_side_publisher_->publish(*markers.side);
   }
-  if (side_marker.points.size() >= 2) {
-    marker_avoidance_side_publisher_->publish(side_marker);
+  if (markers.search_band) {
+    marker_searching_rect_publisher_->publish(*markers.search_band);
   }
-
-  if (search_band) {
-    Marker rect_marker;
-    rect_marker.header.frame_id = "map";
-    rect_marker.header.stamp = stamp;
-    rect_marker.id = 4;
-    rect_marker.type = Marker::LINE_LIST;
-    rect_marker.action = Marker::ADD;
-    rect_marker.scale.x = 0.1;
-    rect_marker.color.r = 1.0;
-    rect_marker.color.a = 1.0;
-    const size_t size = search_band->size();
-    for (size_t i = 0; i < size; ++i) {
-      geometry_msgs::msg::Point start;
-      start.x = (*search_band)[i].x();
-      start.y = (*search_band)[i].y();
-      geometry_msgs::msg::Point end;
-      end.x = (*search_band)[(i + 1) % size].x();
-      end.y = (*search_band)[(i + 1) % size].y();
-      rect_marker.points.push_back(start);
-      rect_marker.points.push_back(end);
-    }
-    marker_searching_rect_publisher_->publish(rect_marker);
-  }
-
-  if (avoidance_point) {
-    Marker point_marker;
-    point_marker.header.frame_id = "map";
-    point_marker.header.stamp = stamp;
-    point_marker.id = 5;
-    point_marker.type = Marker::ARROW;
-    point_marker.action = Marker::ADD;
-    point_marker.scale.x = 0.5;
-    point_marker.scale.y = 0.2;
-    point_marker.scale.z = 0.4;
-    point_marker.color.b = 1.0;
-    point_marker.color.a = 1.0;
-    point_marker.pose = avoidance_point->pose;
-    marker_parking_point_publisher_->publish(point_marker);
+  if (markers.parking_point) {
+    marker_parking_point_publisher_->publish(*markers.parking_point);
   }
 }
 
 void CarAvoidancePointServer::publishAllPassagesMarker(const std::vector<geometry_msgs::msg::Polygon> & polygons)
 {
-  visualization_msgs::msg::Marker marker;
-  marker.header.frame_id = "map";
-  marker.header.stamp = now();
-  marker.id = 20;
-  marker.type = visualization_msgs::msg::Marker::LINE_LIST;
-  marker.action = visualization_msgs::msg::Marker::ADD;
-  marker.scale.x = 0.03;
-  marker.color.r = 0.0;
-  marker.color.g = 0.5;
-  marker.color.b = 1.0;
-  marker.color.a = 0.8;
-  if (polygons.empty()) {
-    marker.action = visualization_msgs::msg::Marker::DELETE;
-    marker_all_passages_publisher_->publish(marker);
-    return;
-  }
-  for (const auto & polygon : polygons) {
-    const auto & pts = polygon.points;
-    if (pts.size() < 2) {
-      continue;
-    }
-    for (size_t i = 0; i < pts.size(); ++i) {
-      geometry_msgs::msg::Point p1;
-      p1.x = pts[i].x;
-      p1.y = pts[i].y;
-      p1.z = pts[i].z;
-      geometry_msgs::msg::Point p2;
-      p2.x = pts[(i + 1) % pts.size()].x;
-      p2.y = pts[(i + 1) % pts.size()].y;
-      p2.z = pts[(i + 1) % pts.size()].z;
-      marker.points.push_back(p1);
-      marker.points.push_back(p2);
-    }
-  }
-  marker_all_passages_publisher_->publish(marker);
+  marker_all_passages_publisher_->publish(makePolygonOutline(
+      now(), 20, 0.03F, 0.F, 0.5F, 1.F, 0.8F, polygons));
 }
 
 Ring CarAvoidancePointServer::footprint() const

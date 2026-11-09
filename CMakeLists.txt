@@ -31,6 +31,7 @@ add_executable(find_parking_space
   src/avoidance_search.cpp
   src/candidate_checks.cpp
   src/geometry.cpp
+  src/visualization.cpp
 )
 target_include_directories(find_parking_space PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
