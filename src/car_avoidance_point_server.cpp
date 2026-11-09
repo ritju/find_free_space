@@ -287,15 +287,12 @@ void CarAvoidancePointServer::roadModelsCallback(
         garage_road_model::SideBoundary out;
         out.raw = load_points(side.raw);
         out.length = side.length;
-        out.max_error = side.max_error;
-        out.mean_error = side.mean_error;
         for (const auto & sample : side.samples) {
           garage_road_model::RoadSampleData data;
           data.x = sample.x;
           data.y = sample.y;
           data.yaw = sample.yaw;
           data.s = sample.s;
-          data.curvature = sample.curvature;
           data.corner = sample.corner;
           out.samples.push_back(data);
         }
@@ -598,7 +595,7 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
     if (external->pose.position.z >= 25.0) {
       RCLCPP_INFO(get_logger(), "优先使用通道外外部停靠点，保留上位机朝向，z=%.0f", external->pose.position.z);
     } else {
-      RCLCPP_INFO(get_logger(), "优先使用通道内外部停靠点，朝向为背对来车的法线方向，z=%.0f",
+      RCLCPP_INFO(get_logger(), "优先使用通道内外部停靠点，朝向为沿侧边背对来车的切线，z=%.0f",
         external->pose.position.z);
     }
     return;

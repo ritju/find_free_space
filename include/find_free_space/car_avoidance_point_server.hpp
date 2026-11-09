@@ -76,8 +76,8 @@ private:
     std::shared_ptr<garage_road_model::RoadModelQuery> query;
     garage_road_model::SideId side{garage_road_model::SideId::A};
     double foot_s{0.0};
-    // 投影点法线的两个方向里，背对来车的那个。
-    double normal_yaw{0.0};
+    // +1 沿弧长增大的方向远离来车，-1 沿弧长减小的方向。停靠朝向是该方向上的侧边切线。
+    double away_sign{1.0};
     Ring side_line;
     Ring channel;
   };
