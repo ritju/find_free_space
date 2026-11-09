@@ -18,6 +18,7 @@
 #include "geometry_msgs/msg/polygon_stamped.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "nav2_costmap_2d/costmap_2d.hpp"
 #include "nav2_msgs/msg/costmap.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -67,31 +68,18 @@ private:
   struct SearchContext
   {
     nav2_msgs::msg::Costmap::ConstSharedPtr costmap;
+    std::shared_ptr<nav2_costmap_2d::Costmap2D> nav_costmap;
     MapView map;
     Vec2 robot;
     double robot_yaw{0.0};
     Vec2 car;
     std::shared_ptr<garage_road_model::RoadModelQuery> query;
     garage_road_model::SideId side{garage_road_model::SideId::A};
-    double robot_s{0.0};
-    double car_s{0.0};
-    // +1 向弧长增大的方向远离来车，-1 向弧长减小的方向
-    double away_sign{1.0};
+    double foot_s{0.0};
+    // 投影点法线的两个方向里，背对来车的那个。
+    double normal_yaw{0.0};
     Ring side_line;
-  };
-
-  struct ExternalCandidate
-  {
-    PoseStamped pose;
-    double along_s{0.0};
-    double side_distance{0.0};
-    bool inside{false};
-  };
-
-  // 中心落在栅格中心时，footprint 碰到的栅格相对中心栅格的偏移
-  struct FootprintKernel
-  {
-    std::vector<std::pair<int, int>> offsets;
+    Ring channel;
   };
 
   // car_avoidance_point_server.cpp
@@ -107,6 +95,7 @@ private:
   void startTaskSubscriptions();
   void stopTaskSubscriptions();
   bool waitForGlobalCostmap(double timeout_sec);
+  bool snapshotCostmap(SearchContext & ctx);
   void waitForSpecialTerrain(double timeout_sec);
   std::optional<PoseStamped> getFreshRobotPose();
   void execute(const std::shared_ptr<GoalHandle> goal_handle);
@@ -118,20 +107,21 @@ private:
   Ring footprint() const;
 
   // avoidance_search.cpp
-  std::optional<SearchContext> prepareAvoidanceSearch(const Task & task);
-  std::optional<PoseStamped> findAvoidancePoint(const Task & task);
-  std::vector<ExternalCandidate> filterExternalStopPoints(const SearchContext & ctx);
+  std::optional<SearchContext> selectAvoidanceFoot(const Task & task);
+  bool normalAtFoot(SearchContext & ctx);
+  std::optional<PoseStamped> findAvoidancePoint(const Task & task, const SearchContext & ctx);
+  std::optional<PoseStamped> findExternalPoint(const Task & task, const SearchContext & ctx);
 
   bool validateCandidate(
-    const Task & task, const SearchContext & ctx, const PoseStamped & candidate, double along_s,
-    bool skip_service_check, const FootprintKernel * kernel, std::string & reason);
+    const Task & task, const SearchContext & ctx, const PoseStamped & candidate,
+    bool skip_service_check);
   bool checkPointIsFree(const MapView & map, int center_x, int center_y, int radius) const;
   bool isPointInSpecialTerrain(double x, double y) const;
   bool isFootprintInSpecialTerrain(const Ring & local_footprint, double x, double y, double yaw) const;
   bool polygonCellsFree(const MapView & map, const Ring & polygon) const;
-  FootprintKernel buildFootprintKernel(const MapView & map, const Ring & local_footprint, double yaw) const;
-  bool kernelCellsFree(const MapView & map, const FootprintKernel & kernel, int cell_x, int cell_y) const;
+  bool checkFootprintAtPose(const SearchContext & ctx, const Ring & local_footprint, double x, double y, double yaw) const;
   bool checkPathIsFree(const MapView & map, int current_x, int current_y, int target_x, int target_y) const;
+  bool sweepEnabled(const Ring & local_footprint) const;
   bool checkFootprintSweep(
     const MapView & map, const Ring & local_footprint, const Vec2 & robot, const Vec2 & target,
     double target_yaw) const;
@@ -143,6 +133,7 @@ private:
   double search_radius_min_{3.0};
   double search_radius_max_{4.0};
   double search_radius_extra_dis_{2.5};
+  double search_point_interval_{0.15};
   double outside_min_{0.0};
   double outside_max_{0.5};
   double check_service_max_time_{0.5};
@@ -150,10 +141,10 @@ private:
   bool show_global_costmap_raw_colored_cv2_{false};
   double external_point_max_distance_{8.0};
   double point_free_check_radius_{0.2};
-  double stop_in_place_min_dist_{2.0};
+  double footprint_sweep_long_step_{999.0};
+  double footprint_sweep_short_step_{999.0};
   double max_robot_pose_age_{1.0};
   double robot_pose_wait_timeout_{1.5};
-  bool strict_check_mode_{false};
 
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_car_pose_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_robot_pose_publisher_;

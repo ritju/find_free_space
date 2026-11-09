@@ -5,6 +5,9 @@
 #include <limits>
 #include <numeric>
 
+#include "tf2/LinearMath/Quaternion.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+
 namespace find_free_space
 {
 
@@ -44,6 +47,13 @@ double degToRad(double degrees)
 double radToDeg(double radians)
 {
   return radians * (180.0 / M_PI);
+}
+
+geometry_msgs::msg::Quaternion yawToQuaternion(double yaw)
+{
+  tf2::Quaternion quaternion;
+  quaternion.setRPY(0.0, 0.0, yaw);
+  return tf2::toMsg(quaternion);
 }
 
 double distancePointToSegment(const Vec2 & point, const Vec2 & a, const Vec2 & b)

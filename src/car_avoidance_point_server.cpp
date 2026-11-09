@@ -11,8 +11,8 @@
 #include <opencv2/imgproc.hpp>
 
 #include "tf2/exceptions.h"
-#include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "tf2/utils.h"
 
 namespace find_free_space
 {
@@ -102,6 +102,7 @@ void CarAvoidancePointServer::initParams()
   search_radius_min_ = declare_parameter("search_radius_min", 3.0);
   search_radius_max_ = declare_parameter("search_radius_max", 4.0);
   search_radius_extra_dis_ = declare_parameter("search_radius_extra_dis", 2.5);
+  search_point_interval_ = declare_parameter("search_point_interval", 0.15);
   outside_min_ = declare_parameter("outside_min", 0.0);
   outside_max_ = declare_parameter("outside_max", 0.5);
   check_service_max_time_ = declare_parameter("check_service_max_time", 0.5);
@@ -109,16 +110,17 @@ void CarAvoidancePointServer::initParams()
   show_global_costmap_raw_colored_cv2_ = declare_parameter("show_global_costmap_raw_colored_cv2", false);
   external_point_max_distance_ = declare_parameter("external_point_max_distance", 8.0);
   point_free_check_radius_ = declare_parameter("point_free_check_radius", 0.2);
-  stop_in_place_min_dist_ = declare_parameter("stop_in_place_min_dist", 2.0);
+  footprint_sweep_long_step_ = declare_parameter("footprint_sweep_long_step", 999.0);
+  footprint_sweep_short_step_ = declare_parameter("footprint_sweep_short_step", 999.0);
   max_robot_pose_age_ = declare_parameter("max_robot_pose_age", 1.0);
   robot_pose_wait_timeout_ = declare_parameter("robot_pose_wait_timeout", 1.5);
-  strict_check_mode_ = declare_parameter("strict_check_mode", false);
 
   RCLCPP_INFO(get_logger(), "topic_name_global_costmap: %s", topic_name_global_costmap_.c_str());
   RCLCPP_INFO(get_logger(), "topic_name_footprint: %s", topic_name_footprint_.c_str());
   RCLCPP_INFO(get_logger(), "search_radius_min: %f", search_radius_min_);
   RCLCPP_INFO(get_logger(), "search_radius_max: %f", search_radius_max_);
   RCLCPP_INFO(get_logger(), "search_radius_extra_dis: %f", search_radius_extra_dis_);
+  RCLCPP_INFO(get_logger(), "search_point_interval: %f", search_point_interval_);
   RCLCPP_INFO(get_logger(), "outside_min: %f", outside_min_);
   RCLCPP_INFO(get_logger(), "outside_max: %f", outside_max_);
   RCLCPP_INFO(get_logger(), "check_service_max_time: %f", check_service_max_time_);
@@ -126,10 +128,10 @@ void CarAvoidancePointServer::initParams()
   RCLCPP_INFO(get_logger(), "show_global_costmap_raw_colored_cv2: %d", show_global_costmap_raw_colored_cv2_);
   RCLCPP_INFO(get_logger(), "external_point_max_distance: %f", external_point_max_distance_);
   RCLCPP_INFO(get_logger(), "point_free_check_radius: %f", point_free_check_radius_);
-  RCLCPP_INFO(get_logger(), "stop_in_place_min_dist: %f", stop_in_place_min_dist_);
+  RCLCPP_INFO(get_logger(), "footprint_sweep_long_step: %f", footprint_sweep_long_step_);
+  RCLCPP_INFO(get_logger(), "footprint_sweep_short_step: %f", footprint_sweep_short_step_);
   RCLCPP_INFO(get_logger(), "max_robot_pose_age: %f", max_robot_pose_age_);
   RCLCPP_INFO(get_logger(), "robot_pose_wait_timeout: %f", robot_pose_wait_timeout_);
-  RCLCPP_INFO(get_logger(), "strict_check_mode: %d", strict_check_mode_);
 }
 
 void CarAvoidancePointServer::footprintCallback(const geometry_msgs::msg::PolygonStamped::ConstSharedPtr msg)
@@ -417,6 +419,39 @@ bool CarAvoidancePointServer::waitForGlobalCostmap(double timeout_sec)
   return global_costmap_ != nullptr;
 }
 
+bool CarAvoidancePointServer::snapshotCostmap(SearchContext & ctx)
+{
+  nav2_msgs::msg::Costmap::ConstSharedPtr costmap;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    costmap = global_costmap_;
+  }
+  if (!costmap || costmap->metadata.size_x == 0 || costmap->metadata.size_y == 0 ||
+    costmap->data.size() < static_cast<size_t>(costmap->metadata.size_x) * costmap->metadata.size_y)
+  {
+    RCLCPP_ERROR(get_logger(), "全局代价地图未收到");
+    return false;
+  }
+
+  ctx.costmap = costmap;
+  ctx.map = MapView{
+    costmap->data.data(),
+    costmap->metadata.origin.position.x,
+    costmap->metadata.origin.position.y,
+    costmap->metadata.resolution,
+    static_cast<int>(costmap->metadata.size_x),
+    static_cast<int>(costmap->metadata.size_y)};
+  ctx.nav_costmap = std::make_shared<nav2_costmap_2d::Costmap2D>(
+    costmap->metadata.size_x, costmap->metadata.size_y, costmap->metadata.resolution,
+    costmap->metadata.origin.position.x, costmap->metadata.origin.position.y);
+  for (unsigned int y = 0; y < costmap->metadata.size_y; ++y) {
+    for (unsigned int x = 0; x < costmap->metadata.size_x; ++x) {
+      ctx.nav_costmap->setCost(x, y, ctx.map.at(static_cast<int>(x), static_cast<int>(y)));
+    }
+  }
+  return true;
+}
+
 void CarAvoidancePointServer::waitForSpecialTerrain(double timeout_sec)
 {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_sec);
@@ -531,34 +566,46 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
     std::lock_guard<std::mutex> lock(data_mutex_);
     models = cached_road_models_;
   }
-  if (models.empty()) {
-    RCLCPP_ERROR(get_logger(), "模型缺失：尚未收到 /garage_road_models");
-    goal_handle->abort(empty_result);
-    return;
-  }
   std::string match_reason;
   auto matched = matchRoadModel(task.vertices, models, match_reason);
-  if (!matched) {
-    RCLCPP_ERROR(get_logger(), "模型缺失：%s", match_reason.c_str());
+  const bool model_usable = matched && matched->valid &&
+    matched->side_a.samples.size() >= 2 && matched->side_b.samples.size() >= 2;
+  if (model_usable) {
+    task.road_model = std::move(*matched);
+  } else {
+    if (matched && !matched->valid) {
+      match_reason = matched->reason.empty() ? "模型无效" : matched->reason;
+    } else if (matched) {
+      match_reason = "侧边采样不足";
+    } else if (match_reason.empty()) {
+      match_reason = "未匹配到有效模型";
+    }
+    RCLCPP_ERROR(get_logger(), "没有可用曲线（%s）", match_reason.c_str());
     goal_handle->abort(empty_result);
     return;
   }
-  if (!matched->valid) {
-    const bool building = matched->reason.find("BUILDING") != std::string::npos;
-    RCLCPP_ERROR(get_logger(), "模型无效：%s%s",
-      building ? "道路模型正在生成，" : "", matched->reason.c_str());
+
+  auto search = selectAvoidanceFoot(task);
+  if (!search || !normalAtFoot(*search) || !snapshotCostmap(*search)) {
     goal_handle->abort(empty_result);
     return;
   }
-  if (matched->side_a.samples.size() < 2 || matched->side_b.samples.size() < 2) {
-    RCLCPP_ERROR(get_logger(), "侧边无法查询：两条拟合侧边都要有至少两个采样点");
-    goal_handle->abort(empty_result);
+
+  if (const auto external = findExternalPoint(task, *search)) {
+    auto result = std::make_shared<FindCarAvoidancePoint::Result>();
+    result->pose = *external;
+    goal_handle->succeed(result);
+    if (external->pose.position.z >= 25.0) {
+      RCLCPP_INFO(get_logger(), "优先使用通道外外部停靠点，保留上位机朝向，z=%.0f", external->pose.position.z);
+    } else {
+      RCLCPP_INFO(get_logger(), "优先使用通道内外部停靠点，朝向为背对来车的法线方向，z=%.0f",
+        external->pose.position.z);
+    }
     return;
   }
-  task.road_model = std::move(*matched);
 
   RCLCPP_INFO(get_logger(), "寻找停靠点...");
-  const auto avoidance_point = findAvoidancePoint(task);
+  const auto avoidance_point = findAvoidancePoint(task, *search);
   if (!avoidance_point) {
     RCLCPP_ERROR(get_logger(), "未找到避让点");
     goal_handle->abort(empty_result);

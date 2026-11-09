@@ -8,10 +8,13 @@ find_free_space_action_server:
     outside_min: 0.2
     outside_max: 0.35            # 宽度方向只有0.15m
     search_radius_extra_dis: 2.0 # 前避车时额外增加的寻找距离
+    search_point_interval: 0.15  # 搜索带里沿路和横向的布点间隔，米
 
+    external_point_max_distance: 8.0  # 外部停靠点距机器人的最大直线距离（米）
     check_service_max_time: 1.0
     show_global_costmap_raw_cv2: false
     show_global_costmap_raw_colored_cv2: false
     max_robot_pose_age: 1.0          # 机器人位姿超过 1 秒没更新的位姿，不当成有效位姿
     robot_pose_wait_timeout: 1.5     # 等待新鲜位姿超时
-    strict_check_mode: false         # 严格检查模式：true 检查机器人到候选点的整个扫掠区域，false 只检查连线
+    footprint_sweep_long_step: 999.0   # 大于车身长边时不检查从机器人到目标的扫掠
+    footprint_sweep_short_step: 999.0

@@ -14,6 +14,7 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
+find_package(nav2_costmap_2d REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -41,6 +42,7 @@ ament_target_dependencies(find_parking_space
   rclcpp_action
   geometry_msgs
   nav2_msgs
+  nav2_costmap_2d
   visualization_msgs
   tf2
   tf2_ros

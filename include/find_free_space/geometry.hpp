@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include "geometry_msgs/msg/quaternion.hpp"
 
 namespace find_free_space
 {
@@ -16,6 +17,9 @@ using Edge = std::pair<Vec2, Vec2>;
 
 double degToRad(double degrees);
 double radToDeg(double radians);
+
+// 把平面朝向换成四元数。
+geometry_msgs::msg::Quaternion yawToQuaternion(double yaw);
 
 // 点到线段（不是无限长直线）的最短距离
 double distancePointToSegment(const Vec2 & point, const Vec2 & a, const Vec2 & b);

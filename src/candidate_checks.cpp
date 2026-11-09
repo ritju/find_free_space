@@ -7,8 +7,10 @@
 
 #include <opencv2/imgproc.hpp>
 
-#include "tf2/utils.h"
+#include "geometry_msgs/msg/point.hpp"
+#include "nav2_costmap_2d/footprint_collision_checker.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "tf2/utils.h"
 
 namespace find_free_space
 {
@@ -31,18 +33,26 @@ std::vector<cv::Point2f> toContour(const geometry_msgs::msg::Polygon & polygon)
 }  // namespace
 
 bool CarAvoidancePointServer::validateCandidate(
-  const Task & task, const SearchContext & ctx, const PoseStamped & candidate, double along_s,
-  bool skip_service_check, const FootprintKernel * kernel, std::string & reason)
+  const Task & task,
+   const SearchContext & ctx,
+    const PoseStamped & candidate,
+  bool skip_service_check)
 {
   const MapView & map = ctx.map;
   const double x = candidate.pose.position.x;
   const double y = candidate.pose.position.y;
 
-  // 车和点必须分居机器人沿路的两侧。比较的是所选侧边上的弧长，不是 base_link 的 x。
-  const double point_delta = along_s - ctx.robot_s;
-  const double car_delta = ctx.car_s - ctx.robot_s;
-  if (point_delta * car_delta >= -1e-4) {
-    reason = "与车在沿路同侧";
+  auto local_x = [&](double world_x, double world_y) {
+      const double dx = world_x - ctx.robot.x();
+      const double dy = world_y - ctx.robot.y();
+      return dx * std::cos(ctx.robot_yaw) + dy * std::sin(ctx.robot_yaw);
+    };
+  const double car_local_x = local_x(ctx.car.x(), ctx.car.y());
+  const double point_local_x = local_x(x, y);
+  if (car_local_x * point_local_x >= 0.0) {
+    RCLCPP_INFO(get_logger(),
+      "候选点(%.2f,%.2f) 与车在机器人同侧(car_local_x=%.2f, point_local_x=%.2f)，拒绝",
+      x, y, car_local_x, point_local_x);
     return false;
   }
 
@@ -51,13 +61,13 @@ bool CarAvoidancePointServer::validateCandidate(
   const int point_y_p = static_cast<int>(std::clamp((y - map.origin_y) / map.resolution, 0.0, map.height - 1.0));
   const int point_free_radius_pixels = std::max(1, static_cast<int>(point_free_check_radius_ / map.resolution));
   if (!checkPointIsFree(map, point_x_p, point_y_p, point_free_radius_pixels)) {
-    reason = "周围" + std::to_string(point_free_check_radius_) + "m内有障碍";
+    RCLCPP_INFO(get_logger(), "候选点(%.2f,%.2f) 周围%.1fm内有障碍", x, y, point_free_check_radius_);
     return false;
   }
 
   // 不在禁扫区
   if (isPointInSpecialTerrain(x, y)) {
-    reason = "在禁扫区内";
+    RCLCPP_INFO(get_logger(), "候选点(%.2f,%.2f) 在禁扫区内", x, y);
     return false;
   }
 
@@ -65,40 +75,28 @@ bool CarAvoidancePointServer::validateCandidate(
   const double pose_yaw = tf2::getYaw(candidate.pose.orientation);
   const Ring local_footprint = footprint();
   if (isFootprintInSpecialTerrain(local_footprint, x, y, pose_yaw)) {
-    reason = "footprint与禁扫区重叠";
+    RCLCPP_INFO(get_logger(), "候选点(%.2f,%.2f) footprint与禁扫区重叠", x, y);
     return false;
   }
 
-  // 这一轮保持现有直线可达性检查，不增加绕弯到达能力；实际执行仍由现有 welt_model 负责。
-  // 默认只检查中心连线和目标处 footprint。strict_check_mode 才额外做固定目标朝向的直线扫掠，
-  // 直线检查通过也不表示整车一定能沿这条直线开到。
-  // 机器人到候选点的连线无障碍
   const int robot_x_p = static_cast<int>(
     std::clamp((ctx.robot.x() - map.origin_x) / map.resolution, 0.0, map.width - 1.0));
   const int robot_y_p = static_cast<int>(
     std::clamp((ctx.robot.y() - map.origin_y) / map.resolution, 0.0, map.height - 1.0));
   if (!checkPathIsFree(map, robot_x_p, robot_y_p, point_x_p, point_y_p)) {
-    reason = "连线有障碍";
+    RCLCPP_INFO(get_logger(), "候选点(%.2f,%.2f) 连线有障碍", x, y);
     return false;
   }
 
-  // footprint 覆盖的栅格都安全
-  if (!local_footprint.empty()) {
-    const bool footprint_free = kernel ?
-      kernelCellsFree(
-      map, *kernel,
-      static_cast<int>(std::floor((x - map.origin_x) / map.resolution)),
-      static_cast<int>(std::floor((y - map.origin_y) / map.resolution))) :
-      polygonCellsFree(map, transformFootprint(local_footprint, x, y, pose_yaw));
-    if (!footprint_free) {
-      reason = "footprint撞障碍";
-      return false;
-    }
+  if (!local_footprint.empty() && !checkFootprintAtPose(ctx, local_footprint, x, y, pose_yaw)) {
+    RCLCPP_INFO(get_logger(), "候选点(%.2f,%.2f) footprint撞障碍", x, y);
+    return false;
   }
 
-  // 严格检查模式：机器人到候选点的整个扫掠区域安全
-  if (strict_check_mode_ && !checkFootprintSweep(map, local_footprint, ctx.robot, Vec2(x, y), pose_yaw)) {
-    reason = "扫掠区域有障碍";
+  if (sweepEnabled(local_footprint) &&
+    !checkFootprintSweep(map, local_footprint, ctx.robot, Vec2(x, y), pose_yaw))
+  {
+    RCLCPP_INFO(get_logger(), "候选点(%.2f,%.2f) 扫掠区域有障碍", x, y);
     return false;
   }
 
@@ -120,7 +118,7 @@ bool CarAvoidancePointServer::validateCandidate(
   if (check_result && elapsed < check_service_max_time_) {
     return true;
   }
-  reason = "服务检查不通过";
+  RCLCPP_INFO(get_logger(), "候选点(%.2f,%.2f) 服务检查不通过", x, y);
   return false;
 }
 
@@ -234,57 +232,38 @@ bool CarAvoidancePointServer::polygonCellsFree(const MapView & map, const Ring &
   return true;
 }
 
-CarAvoidancePointServer::FootprintKernel CarAvoidancePointServer::buildFootprintKernel(
-  const MapView & map, const Ring & local_footprint, double yaw) const
+bool CarAvoidancePointServer::checkFootprintAtPose(
+  const SearchContext & ctx, const Ring & local_footprint, double x, double y, double yaw) const
 {
-  FootprintKernel kernel;
-  if (local_footprint.empty()) {
-    return kernel;
+  if (!ctx.nav_costmap || local_footprint.empty()) {
+    return local_footprint.empty();
   }
-  // 以栅格 (0, 0) 的中心为 footprint 中心，偏移对任意栅格中心都成立
-  const double center_x = map.origin_x + 0.5 * map.resolution;
-  const double center_y = map.origin_y + 0.5 * map.resolution;
-  const Ring polygon = transformFootprint(local_footprint, center_x, center_y, yaw);
-  double min_x = std::numeric_limits<double>::infinity();
-  double max_x = -std::numeric_limits<double>::infinity();
-  double min_y = std::numeric_limits<double>::infinity();
-  double max_y = -std::numeric_limits<double>::infinity();
-  for (const auto & point : polygon) {
-    min_x = std::min(min_x, point.x());
-    max_x = std::max(max_x, point.x());
-    min_y = std::min(min_y, point.y());
-    max_y = std::max(max_y, point.y());
+  std::vector<geometry_msgs::msg::Point> footprint;
+  footprint.reserve(local_footprint.size());
+  for (const auto & point : local_footprint) {
+    geometry_msgs::msg::Point corner;
+    corner.x = point.x();
+    corner.y = point.y();
+    footprint.push_back(corner);
   }
-  const int x0 = static_cast<int>(std::floor((min_x - map.origin_x) / map.resolution));
-  const int x1 = static_cast<int>(std::floor((max_x - map.origin_x) / map.resolution));
-  const int y0 = static_cast<int>(std::floor((min_y - map.origin_y) / map.resolution));
-  const int y1 = static_cast<int>(std::floor((max_y - map.origin_y) / map.resolution));
-  for (int cell_y = y0; cell_y <= y1; ++cell_y) {
-    for (int cell_x = x0; cell_x <= x1; ++cell_x) {
-      const double cx = map.origin_x + (cell_x + 0.5) * map.resolution;
-      const double cy = map.origin_y + (cell_y + 0.5) * map.resolution;
-      if (cellIntersectsConvex(cx, cy, map.resolution, polygon)) {
-        kernel.offsets.emplace_back(cell_x, cell_y);
-      }
-    }
+  nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *> checker(ctx.nav_costmap.get());
+  const double boundary_cost = checker.footprintCostAtPose(x, y, yaw, footprint);
+  if (boundary_cost < 0.0 || boundary_cost > static_cast<double>(kMaxFreeCost)) {
+    return false;
   }
-  return kernel;
+  return polygonCellsFree(ctx.map, transformFootprint(local_footprint, x, y, yaw));
 }
 
-bool CarAvoidancePointServer::kernelCellsFree(
-  const MapView & map, const FootprintKernel & kernel, int cell_x, int cell_y) const
+bool CarAvoidancePointServer::sweepEnabled(const Ring & local_footprint) const
 {
-  for (const auto & offset : kernel.offsets) {
-    const int x = cell_x + offset.first;
-    const int y = cell_y + offset.second;
-    if (x < 0 || y < 0 || x >= map.width || y >= map.height) {
-      continue;
-    }
-    if (map.at(x, y) > kMaxFreeCost) {
-      return false;
-    }
+  if (local_footprint.size() < 2) {
+    return false;
   }
-  return true;
+  double longest = 0.0;
+  for (size_t i = 0; i < local_footprint.size(); ++i) {
+    longest = std::max(longest, (local_footprint[(i + 1) % local_footprint.size()] - local_footprint[i]).norm());
+  }
+  return footprint_sweep_long_step_ <= longest;
 }
 
 bool CarAvoidancePointServer::checkPathIsFree(
