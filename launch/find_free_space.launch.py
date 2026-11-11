@@ -44,8 +44,8 @@ def generate_launch_description():
 
         get_environment_value(search_radius_min, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MIN', 3.0)    # 搜素框的范围
         get_environment_value(search_radius_max, 'GARAGE_FIND_PARKING_POINT_SEARCH_RADIUS_MAX', 4.0)
-        get_environment_value(outside_min, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MIN', 0.0)     # 搜素框的偏移范围
-        get_environment_value(outside_max, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MAX', 0.5)
+        get_environment_value(outside_min, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MIN', -0.5)     # 搜素框的偏移范围
+        get_environment_value(outside_max, 'GARAGE_FIND_PARKING_POINT_OUTSIDE_MAX', 0.0)
         get_environment_value(search_point_interval, 'GARAGE_FIND_PARKING_POINT_SEARCH_POINT_INTERVAL', 0.15)    # 搜素框的下采样点
         # footprint_sweep_long_step: 默认999.0不启用; 设<=footprint长边才启用; 0=全像素填充==
         get_environment_value(footprint_sweep_long_step, 'GARAGE_FOOTPRINT_SWEEP_LONG_STEP', 0.0)
