@@ -33,9 +33,9 @@ def get_environment_value(var, env, default):
 
 def generate_launch_description():
         search_radius_min = [3.0]
-        search_radius_max = [3.5]
-        outside_min = [0.8]
-        outside_max = [1.0]
+        search_radius_max = [4.0]
+        outside_min = [-0.5]
+        outside_max = [0.0]
         search_point_interval = [0.15]
         footprint_sweep_long_step = [0.0]
         footprint_sweep_short_step = [0.0]
