@@ -156,6 +156,7 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter("search_interval", 0.3)                   # 搜索角度间隔
         self.declare_parameter("search_radius_min", 3.0)                 # 搜索半径最小值
         self.declare_parameter("search_radius_max", 4.0)                 # 搜索半径最大值
+        self.declare_parameter("near_search_radius_scale", 1.2)          # 双侧打开时近侧沿边远端倍率
         self.declare_parameter("search_radius_extra_dis", 2.5)           # 搜索半径额外增加距离
         self.declare_parameter("outside_min", 0.0)                       # 搜索框外侧最小偏移
         self.declare_parameter("outside_max", 0.5)                       # 搜索框外侧最大偏移
@@ -182,6 +183,7 @@ class CarAvoidancePointActionServer(Node):
         self.search_interval = self.get_parameter("search_interval").value
         self.search_radius_min = self.get_parameter("search_radius_min").value
         self.search_radius_max = self.get_parameter("search_radius_max").value
+        self.near_search_radius_scale = self.get_parameter("near_search_radius_scale").value
         self.search_radius_extra_dis = self.get_parameter("search_radius_extra_dis").value
         self.outside_min = self.get_parameter("outside_min").value
         self.outside_max = self.get_parameter("outside_max").value
@@ -209,6 +211,7 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'search_interval: {self.search_interval}')
         self.get_logger().info(f'search_radius_min: {self.search_radius_min}')
         self.get_logger().info(f'search_radius_max: {self.search_radius_max}')
+        self.get_logger().info(f'near_search_radius_scale: {self.near_search_radius_scale}')
         self.get_logger().info(f'search_radius_extra_dis: {self.search_radius_extra_dis}')
         self.get_logger().info(f'outside_min: {self.outside_min}')
         self.get_logger().info(f'outside_max: {self.outside_max}')
@@ -913,7 +916,8 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().error('找不到两条长边')
             return None
 
-        near_max = self.search_radius_max * (2.0 if self.enable_dual_side else 1.0)
+        near_scale = self.near_search_radius_scale if self.enable_dual_side else 1.0
+        near_max = self.search_radius_max * near_scale
         near_point = self._search_box_on_boundary(
             robot_pose, edges[0], near_max, True, '近侧', 1,
             costmap, origin_x, origin_y, resolution, width, height

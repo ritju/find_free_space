@@ -7,6 +7,7 @@ find_free_space_action_server:
 
     search_radius_min: 3.0
     search_radius_max: 4.0      # 长度方向只有0.3m
+    near_search_radius_scale: 1.2  # 双侧打开时近侧沿边远端倍率，4.0*1.2=4.8m
     outside_min: -0.5
     outside_max: 0.0            # 宽度方向只有0.15m
     search_point_interval: 0.15  # 采样间隔0.15m → 长度0.3/0.15=2点，宽度0.15/0.15=1点
