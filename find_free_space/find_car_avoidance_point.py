@@ -156,12 +156,10 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter("search_interval", 0.3)                   # 搜索角度间隔
         self.declare_parameter("search_radius_min", 3.0)                 # 搜索半径最小值
         self.declare_parameter("search_radius_max", 4.0)                 # 搜索半径最大值
+        self.declare_parameter("near_search_radius_scale", 1.2)          # 双侧打开时近侧沿边远端倍率
         self.declare_parameter("search_radius_extra_dis", 2.5)           # 搜索半径额外增加距离
         self.declare_parameter("outside_min", 0.0)                       # 搜索框外侧最小偏移
         self.declare_parameter("outside_max", 0.5)                       # 搜索框外侧最大偏移
-        self.declare_parameter("inside_step", 0.1)                       # 每轮往内移动步长
-        self.declare_parameter('inward_offset', 0.0)                     # 搜索框初始位置离多边形边线往内多少米（0=紧贴边线）
-        self.declare_parameter('max_inward_offset', 1.5)                 # 搜索框最大往内偏移距离
         self.declare_parameter("check_service_max_time", 0.5)            # 车辆通过性检查超时
         self.declare_parameter('show_global_costmap_raw_cv2', False)     # 显示原始代价地图
         self.declare_parameter('show_global_costmap_raw_colored_cv2', False)  # 显示彩色代价地图
@@ -182,15 +180,13 @@ class CarAvoidancePointActionServer(Node):
         self.search_interval = self.get_parameter("search_interval").value
         self.search_radius_min = self.get_parameter("search_radius_min").value
         self.search_radius_max = self.get_parameter("search_radius_max").value
+        self.near_search_radius_scale = self.get_parameter("near_search_radius_scale").value
         self.search_radius_extra_dis = self.get_parameter("search_radius_extra_dis").value
         self.outside_min = self.get_parameter("outside_min").value
         self.outside_max = self.get_parameter("outside_max").value
-        self.inside_step = self.get_parameter("inside_step").value
         self.check_service_max_time = self.get_parameter("check_service_max_time").value
         self.show_global_costmap_raw_cv2 = self.get_parameter('show_global_costmap_raw_cv2').value
         self.show_global_costmap_raw_colored_cv2 = self.get_parameter('show_global_costmap_raw_colored_cv2').value
-        self.inward_offset = self.get_parameter('inward_offset').value
-        self.max_inward_offset = self.get_parameter('max_inward_offset').value
         self.search_point_interval = self.get_parameter("search_point_interval").value
         self.footprint_sweep_long_step = self.get_parameter('footprint_sweep_long_step').value
         self.footprint_sweep_short_step = self.get_parameter('footprint_sweep_short_step').value
@@ -209,15 +205,13 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'search_interval: {self.search_interval}')
         self.get_logger().info(f'search_radius_min: {self.search_radius_min}')
         self.get_logger().info(f'search_radius_max: {self.search_radius_max}')
+        self.get_logger().info(f'near_search_radius_scale: {self.near_search_radius_scale}')
         self.get_logger().info(f'search_radius_extra_dis: {self.search_radius_extra_dis}')
         self.get_logger().info(f'outside_min: {self.outside_min}')
         self.get_logger().info(f'outside_max: {self.outside_max}')
-        self.get_logger().info(f'inside_step: {self.inside_step}')
         self.get_logger().info(f'check_service_max_time: {self.check_service_max_time}')
         self.get_logger().info(f'show_global_costmap_raw_cv2: {self.show_global_costmap_raw_cv2}')
         self.get_logger().info(f'show_global_costmap_raw_colored_cv2: {self.show_global_costmap_raw_colored_cv2}')
-        self.get_logger().info(f'inward_offset: {self.inward_offset}')
-        self.get_logger().info(f'max_inward_offset: {self.max_inward_offset}')
         self.get_logger().info(f'search_point_interval: {self.search_point_interval}')
         self.get_logger().info(f'footprint_sweep_long_step: {self.footprint_sweep_long_step}  # 默认999.0=不启用扫掠检查')
         self.get_logger().info(f'footprint_sweep_short_step: {self.footprint_sweep_short_step} # 默认999.0=只扫两条长边')
@@ -847,15 +841,15 @@ class CarAvoidancePointActionServer(Node):
                 ext_is_inside = self.is_point_inside_parallelogram(
                     ext_pose.pose.position.x, ext_pose.pose.position.y, self.vertices
                 )
-                if ext_is_inside:
-                    # 通道内：先按避让方向覆盖 yaw，再校验（与自搜索点一致）
-                    final_yaw = self._compute_avoidance_yaw(
-                        k, robot_x, robot_y, car_pose.x, car_pose.y
-                    )
-                    quat = Quaternion()
-                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, final_yaw)
-                    ext_pose.pose.orientation = quat
-                else:
+                # 朝向平行于通道长边，取朝向车辆的那一头。
+                # 车在左边、看见车时车头朝左，箭头就朝左。
+                final_yaw = self._compute_avoidance_yaw(
+                    k, robot_x, robot_y, car_pose.x, car_pose.y
+                )
+                quat = Quaternion()
+                quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, final_yaw)
+                ext_pose.pose.orientation = quat
+                if not ext_is_inside:
                     self.get_logger().info(
                         f'外部停车点({ext_pose.pose.position.x:.2f}, '
                         f'{ext_pose.pose.position.y:.2f}) 在通道外，将跳过服务检查'
@@ -884,23 +878,16 @@ class CarAvoidancePointActionServer(Node):
                 )
                 if is_inside:
                     best.pose.position.z = 20.0
-                    self.get_logger().info(
-                        f'外部停车点通过校验共{len(valid_external)}个，'
-                        f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
-                        f'该点在通道内，使用避让方向，z = 20.0'
-                    )
+                    where = '通道内'
                 else:
-                    # 通道外的固定停靠点：方向值保持不变
                     best.pose.position.z = 30.0
-                    self.get_logger().info(
-                        f'外部停车点通过校验共{len(valid_external)}个，'
-                        f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
-                        f'该点在通道外，方向保持不变，z = 30.0'
-                    )
-                    map_yaw_deg = math.degrees(self.get_yaw_from_pose(best))
-                    self.get_logger().info(
-                        f'通道外外部停靠点已选用，map yaw={map_yaw_deg:.1f}°'
-                    )
+                    where = '通道外'
+                map_yaw_deg = math.degrees(self.get_yaw_from_pose(best))
+                self.get_logger().info(
+                    f'外部停车点通过校验共{len(valid_external)}个，'
+                    f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
+                    f'该点在{where}，朝向沿长边朝向车辆，map yaw={map_yaw_deg:.1f}°，z = {best.pose.position.z:.1f}'
+                )
                 self._result_side = 3
                 return best
 
@@ -913,7 +900,8 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().error('找不到两条长边')
             return None
 
-        near_max = self.search_radius_max * (2.0 if self.enable_dual_side else 1.0)
+        near_scale = self.near_search_radius_scale if self.enable_dual_side else 1.0
+        near_max = self.search_radius_max * near_scale
         near_point = self._search_box_on_boundary(
             robot_pose, edges[0], near_max, True, '近侧', 1,
             costmap, origin_x, origin_y, resolution, width, height
@@ -1701,9 +1689,9 @@ class CarAvoidancePointActionServer(Node):
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
     def _compute_avoidance_yaw(self, k, robot_x, robot_y, car_x, car_y):
-        """沿通道长边方向，取和机器人当前车头一致的 yaw：倒进停靠点，车走后直接接着开，不用掉头。"""
-        robot_yaw = self.get_yaw_from_pose(self.robot_pose)
-        return k if self.angle_diff(k, robot_yaw) <= math.pi / 2 else k + math.pi
+        """沿通道长边，取朝向车辆的那一头。看见车时车头看哪边，箭头就指哪边。"""
+        to_car = math.atan2(car_y - robot_y, car_x - robot_x)
+        return k if self.angle_diff(k, to_car) <= math.pi / 2 else k + math.pi
 
     def process_points(self, robot_pose, vertices, points, direction):
         car_x = self.action_goal_handle_msg.car_pose.pose.position.x
