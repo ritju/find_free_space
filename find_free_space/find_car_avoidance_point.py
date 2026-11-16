@@ -2,7 +2,9 @@ import rclpy
 from rclpy.action import ActionServer
 from rclpy.node import Node
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor, ExternalShutdownException
+from rclpy.clock import Clock, ClockType
+from rclpy.parameter import Parameter
 from rclpy.action import ActionServer,GoalResponse,CancelResponse
 from rclpy.qos import qos_profile_sensor_data, DurabilityPolicy,ReliabilityPolicy,QoSProfile,HistoryPolicy
 from geometry_msgs.msg import PoseStamped, Pose, Quaternion, Point, PoseArray
@@ -24,7 +26,7 @@ from collections import defaultdict
 # from nav2_costmap_2d import Costmap2D
 
 from visualization_msgs.msg import Marker
-from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+from rclpy.qos import QoSProfile
 
 
 class _GoalCanceled(Exception):
@@ -52,67 +54,33 @@ class CarAvoidancePointActionServer(Node):
 
         self.init_params()
 
-        # publish markers for debug
-        marker_qos = QoSProfile(depth=1,
-                        durability=QoSDurabilityPolicy.RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL)
-        self.marker_car_pose_publisher = self.create_publisher(
-            Marker,
-            "marker_car_pose",
-            marker_qos          
-        )
 
-        self.marker_robot_pose_publisher = self.create_publisher(
-            Marker,
-            "marker_robot_pose",
-            marker_qos
+        self._marker_topics = (
+            'marker_car_pose', 'marker_robot_pose', 'marker_avoidance_side',
+            'marker_searching_rect', 'marker_parking_point',
+            'marker_special_terrain', 'marker_all_passages',
         )
-
-        self.marker_avoidance_side_publisher = self.create_publisher(
-            Marker,
-            "marker_avoidance_side",
-            marker_qos
-        )
-
-        self.marker_searching_rect_publisher = self.create_publisher(
-            Marker,
-            "marker_searching_rect",
-            marker_qos
-        )
-
-        self.marker_parking_point_publisher = self.create_publisher(
-            Marker,
-            "marker_parking_point",
-            marker_qos
-        )
-
-        self.marker_special_terrain_publisher = self.create_publisher(
-            Marker,
-            "marker_special_terrain",
-            marker_qos
-        )
-
-        self.marker_all_passages_publisher = self.create_publisher(
-            Marker,
-            "marker_all_passages",
-            marker_qos
-        )
+        for topic in self._marker_topics:
+            setattr(self, topic + '_publisher', None)
+        self._resource_lock = threading.RLock()
+        self._task_token = None
+        self._data_lock = threading.RLock()
+        self._data_node = None
+        self._data_executor = None
+        self._data_thread = None
+        self._data_stop = threading.Event()
+        self._idle_since = None
 
         callback_gp1 = MutuallyExclusiveCallbackGroup()
         callback_gp2 = MutuallyExclusiveCallbackGroup()
         callback_gp3 = MutuallyExclusiveCallbackGroup()
         callback_gp4 = MutuallyExclusiveCallbackGroup()
         self._costmap_cb_group = callback_gp2
-
-        self.footprint_sub_ = self.create_subscription(
-            PolygonStamped, 
-            self.topic_name_footprint,
-            self.footprint_sub_callback,
-            1,
-            callback_group=callback_gp4)
+        self._service_cb_group = callback_gp3
+        self._footprint_cb_group = callback_gp4
+        self.footprint_sub_ = None
 
         self.robot_pose = PoseStamped()
-        self.max_robot_pose_age = 1.0  # 最大允许时间
-        self.robot_pose_wait_timeout = 1.5
 
         self.polygons = []
         self.vertices = []
@@ -122,22 +90,23 @@ class CarAvoidancePointActionServer(Node):
         # action
         action_server_feedback_qos = QoSProfile(depth=1)
         action_server_feedback_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        # rclpy 的执行回调不受回调组约束，两个目标会并行跑、共用成员变量，所以用锁串行。
         self._goal_lock = threading.Lock()
+        self._goal_reserved = False
         self._active_goal = None
         self.action_server = ActionServer(self,FindCarAvoidancePoint,'/find_car_avoidance_point_action',
                                         self.action_goal_callback,
                                         callback_group=callback_gp1,
+                                        goal_callback=self._goal_callback,
                                         cancel_callback=self._cancel_callback,
                                         feedback_pub_qos_profile=action_server_feedback_qos)#
         # tf2
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_buffer = None
+        self.tf_listener = None
         # 有请求时再订，空闲不订
         self.global_costmap_sub = None
         self.global_costmap = None
         # 检查pose能否避让的服务
-        self.check_avoidance_service = self.create_client(IsCarPassable, '/check_car_passable',callback_group=callback_gp3)
+        self.check_avoidance_service = None
 
         # 禁扫区多边形（/cleaning_tool_retraction_areas）
         # 待命不订阅，任务期由 _start_special_terrain_sub 挂载
@@ -148,6 +117,140 @@ class CarAvoidancePointActionServer(Node):
         # 待命不订阅，任务期由 _start_vehicle_stop_points_sub 挂载
         self.vehicle_avoidance_stop_points = None
         self.vehicle_stop_points_sub = None
+
+        # 使用墙上单调时间；仿真暂停也能退订。完全空闲时定时器取消。
+        self._idle_timer = self.create_timer(
+            0.1, self._expire_task_resources, clock=Clock(clock_type=ClockType.STEADY_TIME))
+        self._idle_timer.cancel()
+
+    def _expire_task_resources(self):
+        with self._goal_lock:
+            if (not self._goal_reserved and self._idle_since is not None and
+                    time.monotonic() - self._idle_since >= self.subscription_idle_timeout):
+                self._idle_timer.cancel()
+                self._stop_task_resources()
+                self._idle_since = None
+
+    def destroy_node(self):
+        self._idle_timer.cancel()
+        self._stop_task_resources()
+        return super().destroy_node()
+
+    def _task_callback(self, callback):
+        """业务数据在独立执行器接收；清理前必须先停止并等待该执行器。"""
+        token = self._task_token
+
+        def guarded_callback(msg):
+            with self._data_lock:
+                if token is not None and token is self._task_token:
+                    callback(msg)
+
+        return guarded_callback
+
+    def _start_task_resources(self):
+        with self._resource_lock:
+            # 复用订阅，但每次请求仍等待新地图和 footprint，不沿用上次任务快照。
+            with self._data_lock:
+                self.global_costmap = None
+                self.footprint_vertices = []
+                self._static_check_info_logged = False
+            if self._data_node is not None:
+                return
+            self._task_token = object()
+            # 独立节点避免主 Action 执行器持有待销毁的订阅 handler。
+            self._data_node = Node(
+                self.get_name() + '_inputs', namespace=self.get_namespace(),
+                context=self.context, use_global_arguments=False,
+                cli_args=['--ros-args', '-r', '/tf:=' + self.resolve_topic_name('/tf'),
+                          '-r', '/tf_static:=' + self.resolve_topic_name('/tf_static')],
+                parameter_overrides=[Parameter(
+                    'use_sim_time', value=self.get_parameter('use_sim_time').value)],
+                start_parameter_services=False, enable_rosout=False)
+            self._data_executor = SingleThreadedExecutor(context=self.context)
+            self._data_executor.add_node(self._data_node)
+            marker_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            for topic in self._marker_topics:
+                setattr(self, topic + '_publisher', self.create_publisher(Marker, topic, marker_qos))
+            self.check_avoidance_service = self._data_node.create_client(
+                IsCarPassable, self.resolve_service_name('/check_car_passable'), callback_group=self._service_cb_group)
+            # 同一轮连续请求复用 TF 缓存，读取时仍检查位姿的新鲜度。
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self._data_node)
+            self.footprint_sub_ = self._data_node.create_subscription(
+                PolygonStamped, self.resolve_topic_name(self.topic_name_footprint),
+                self._task_callback(self.footprint_sub_callback), 1,
+                callback_group=self._footprint_cb_group)
+            self._start_global_costmap_sub()
+            self._start_special_terrain_sub()
+            self._start_vehicle_stop_points_sub()
+            self._data_stop.clear()
+            self._data_thread = threading.Thread(
+                target=self._spin_task_inputs, name='find_input_executor', daemon=True)
+            self._data_thread.start()
+
+    def _spin_task_inputs(self):
+        try:
+            while not self._data_stop.is_set() and self.context.ok():
+                self._data_executor.spin_once(timeout_sec=0.1)
+        except ExternalShutdownException:
+            pass  # ROS 整体关闭；业务订阅仍由 join 后的清理流程释放。
+
+    def _stop_task_resources(self):
+        with self._resource_lock:
+            # 此锁只保护生命周期；数据回调用独立锁，shutdown/join 不会锁死。
+            self._data_stop.set()
+            if self._data_thread is not None:
+                self._data_thread.join()
+                self._data_thread = None
+            if self._data_executor is not None:
+                self._data_executor.shutdown()
+            self._task_token = None
+            self._stop_global_costmap_sub()
+            self._stop_special_terrain_sub()
+            self._stop_vehicle_stop_points_sub()
+            if self.footprint_sub_ is not None:
+                self._data_node.destroy_subscription(self.footprint_sub_)
+                self.footprint_sub_ = None
+            if self.tf_listener is not None:
+                # Python 的订阅回调持有 listener，不能只赋 None 等待析构。
+                self.tf_listener.unregister()
+                self.tf_listener = None
+            self.tf_buffer = None
+            if self.check_avoidance_service is not None:
+                self._data_node.destroy_client(self.check_avoidance_service)
+                self.check_avoidance_service = None
+            for topic in self._marker_topics:
+                publisher = getattr(self, topic + '_publisher')
+                if publisher is not None:
+                    self.destroy_publisher(publisher)
+                    setattr(self, topic + '_publisher', None)
+            if self.show_global_costmap_raw_cv2 or self.show_global_costmap_raw_colored_cv2:
+                try:
+                    cv2.destroyAllWindows()
+                except cv2.error:
+                    pass  # 无窗口/无 GUI 后端也必须完成其余清理。
+            if self._data_node is not None:
+                self._data_node.destroy_node()
+                self._data_node = None
+            self._data_executor = None
+            self.footprint_vertices = []
+            self.robot_width = 0.0
+            self.robot_pose = PoseStamped()
+            self.polygons = []
+            self.vertices = []
+            self.action_goal_handle_msg = None
+            self._static_check_info_logged = False
+
+    def _wait_for_data(self, ready, timeout_sec):
+        # 使用墙上单调时间，仿真时钟暂停也能超时、响应取消。
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            self._check_canceled()
+            if ready():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
 
     def init_params(self):
         self.declare_parameter("topic_name_global_costmap", "")          # 全局代价地图话题名
@@ -172,6 +275,8 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter('stop_in_place_min_dist', 2.0)           # 机器人在通道外长边方向、且离长边超过这个距离才允许原地停
         self.declare_parameter('max_robot_pose_age', 1.0)               # 机器人位姿最大允许年龄
         self.declare_parameter('robot_pose_wait_timeout', 1.5)          # 等待新鲜位姿超时
+        self.declare_parameter('subscription_idle_timeout', 10.0)     # 连续空闲多久后释放订阅（秒）
+        self.declare_parameter('task_data_wait_timeout', 2.0)          # 唤醒后等待地图、footprint 等数据超时
         self.declare_parameter('enable_dual_side', True)                # 为 true 时近侧拉长，并允许按请求搜远侧
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
@@ -195,6 +300,12 @@ class CarAvoidancePointActionServer(Node):
         self.stop_in_place_min_dist = self.get_parameter('stop_in_place_min_dist').value
         self.max_robot_pose_age = self.get_parameter('max_robot_pose_age').value
         self.robot_pose_wait_timeout = self.get_parameter('robot_pose_wait_timeout').value
+        self.subscription_idle_timeout = self.get_parameter('subscription_idle_timeout').value
+        self.task_data_wait_timeout = self.get_parameter('task_data_wait_timeout').value
+        for name in ('subscription_idle_timeout', 'task_data_wait_timeout', 'robot_pose_wait_timeout', 'max_robot_pose_age'):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} 必须为有限正数')
         self.enable_dual_side = bool(self.get_parameter('enable_dual_side').value)
         self._enable_far_side = False
         self._result_side = 0
@@ -220,10 +331,15 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'stop_in_place_min_dist: {self.stop_in_place_min_dist}')
         self.get_logger().info(f'max_robot_pose_age: {self.max_robot_pose_age}')
         self.get_logger().info(f'robot_pose_wait_timeout: {self.robot_pose_wait_timeout}')
+        self.get_logger().info(f'task_data_wait_timeout: {self.task_data_wait_timeout}')
         self.get_logger().info(f'enable_dual_side: {self.enable_dual_side}')
     
     def footprint_sub_callback(self, msg):
+        if self.footprint_vertices:
+            return  # 每次请求取一次尺寸，保留订阅供下一次复用。
         points = msg.polygon.points
+        if len(points) < 4:
+            return
         edges_distance = np.array([
             round(np.linalg.norm(
                 np.array([points[i].x, points[i].y]) - 
@@ -231,6 +347,8 @@ class CarAvoidancePointActionServer(Node):
             ), 2)
             for i in range(4)
         ])
+        if not np.all(np.isfinite(edges_distance)) or np.any(edges_distance <= 0):
+            return
         self.robot_width = np.min(edges_distance)
         # 用边长构造以机器人中心为原点的局部坐标 footprint
         half_long = np.max(edges_distance) / 2.0
@@ -243,10 +361,13 @@ class CarAvoidancePointActionServer(Node):
         ]
         fp_str = ', '.join([f'({v[0]:.3f}, {v[1]:.3f})' for v in self.footprint_vertices])
         self.get_logger().info(f"robot_width: {self.robot_width:.3f}, footprint_vertices (local): [{fp_str}]")
-        # 取消订阅
-        self.destroy_subscription(self.footprint_sub_)
 
     def global_costmap_callback(self, msg):
+        meta = msg.metadata
+        if (meta.size_x == 0 or meta.size_y == 0 or
+                not math.isfinite(meta.resolution) or meta.resolution <= 0 or
+                len(msg.data) != meta.size_x * meta.size_y):
+            return
         # self.get_logger().info('获取全局代价图')
         self.global_costmap = msg
 
@@ -279,15 +400,16 @@ class CarAvoidancePointActionServer(Node):
         """获取一份新鲜的 map->base_link 位姿，超时或过期返回 None"""
         if timeout_sec is None:
             timeout_sec = self.robot_pose_wait_timeout
-        deadline = self.get_clock().now() + rclpy.duration.Duration(seconds=timeout_sec)
-        while self.get_clock().now() < deadline:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            self._check_canceled()
             try:
                 trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
                 stamp = rclpy.time.Time.from_msg(trans.header.stamp, clock_type=self.get_clock().clock_type)
                 age = (self.get_clock().now() - stamp).nanoseconds / 1e9
-                if age > self.max_robot_pose_age:
+                if age < 0 or age > self.max_robot_pose_age:
                     self.get_logger().warn(
-                        f'TF 位姿过旧 age={age:.2f}s', throttle_duration_sec=1.0)
+                        f'TF 位姿时间无效 age={age:.2f}s', throttle_duration_sec=1.0)
                     time.sleep(0.05)
                     continue
                 pose = PoseStamped()
@@ -304,39 +426,37 @@ class CarAvoidancePointActionServer(Node):
 
     def _start_global_costmap_sub(self):
         if self.global_costmap_sub is None:
-            self.global_costmap_sub = self.create_subscription(
+            self.global_costmap_sub = self._data_node.create_subscription(
                 Costmap,
-                self.topic_name_global_costmap,
-                self.global_costmap_callback,
+                self.resolve_topic_name(self.topic_name_global_costmap),
+                self._task_callback(self.global_costmap_callback),
                 10,
                 callback_group=self._costmap_cb_group)
 
     def _stop_global_costmap_sub(self):
         if self.global_costmap_sub is not None:
-            self.destroy_subscription(self.global_costmap_sub)
+            self._data_node.destroy_subscription(self.global_costmap_sub)
             self.global_costmap_sub = None
         self.global_costmap = None
 
-    def _wait_for_global_costmap(self, timeout_sec=2.0):
-        deadline = time.time() + timeout_sec
-        while self.global_costmap is None and time.time() < deadline:
-            time.sleep(0.05)
-        return self.global_costmap is not None
+    def _wait_for_global_costmap(self):
+        return self._wait_for_data(
+            lambda: self.global_costmap is not None, self.task_data_wait_timeout)
 
     def _start_special_terrain_sub(self):
         if self.special_terrain_sub is None:
             qos_transient = QoSProfile(depth=1)
             qos_transient.durability = DurabilityPolicy.TRANSIENT_LOCAL
-            self.special_terrain_sub = self.create_subscription(
+            self.special_terrain_sub = self._data_node.create_subscription(
                 Polygons,
-                '/cleaning_tool_retraction_areas',
-                self._special_terrain_callback,
+                self.resolve_topic_name('/cleaning_tool_retraction_areas'),
+                self._task_callback(self._special_terrain_callback),
                 qos_transient,
             )
 
     def _stop_special_terrain_sub(self):
         if self.special_terrain_sub is not None:
-            self.destroy_subscription(self.special_terrain_sub)
+            self._data_node.destroy_subscription(self.special_terrain_sub)
             self.special_terrain_sub = None
         self.special_terrain_polygons = None
 
@@ -345,25 +465,23 @@ class CarAvoidancePointActionServer(Node):
             qos_stop_points = QoSProfile(depth=1)
             qos_stop_points.durability = DurabilityPolicy.TRANSIENT_LOCAL
             qos_stop_points.reliability = ReliabilityPolicy.RELIABLE
-            self.vehicle_stop_points_sub = self.create_subscription(
+            self.vehicle_stop_points_sub = self._data_node.create_subscription(
                 PoseArray,
-                '/vehicle_avoidance_stop_points',
-                self._vehicle_stop_points_callback,
+                self.resolve_topic_name('/vehicle_avoidance_stop_points'),
+                self._task_callback(self._vehicle_stop_points_callback),
                 qos_stop_points,
             )
 
     def _stop_vehicle_stop_points_sub(self):
         if self.vehicle_stop_points_sub is not None:
-            self.destroy_subscription(self.vehicle_stop_points_sub)
+            self._data_node.destroy_subscription(self.vehicle_stop_points_sub)
             self.vehicle_stop_points_sub = None
         self.vehicle_avoidance_stop_points = None
 
-    def _wait_for_special_terrain(self, timeout_sec=2.0):
+    def _wait_for_special_terrain(self):
         """等待禁扫区第一条数据"""
-        deadline = time.time() + timeout_sec
-        while self.special_terrain_polygons is None and time.time() < deadline:
-            time.sleep(0.05)
-        if self.special_terrain_polygons is None:
+        if not self._wait_for_data(
+                lambda: self.special_terrain_polygons is not None, self.task_data_wait_timeout):
             self.get_logger().warn('等待禁扫区超时，本次任务不拦截禁扫区')
 
     def get_vertices_callback(self):
@@ -423,34 +541,65 @@ class CarAvoidancePointActionServer(Node):
                 min_dis = dis
         return min_dis
 
+    def _goal_callback(self, goal_request):
+        with self._goal_lock:
+            if self._goal_reserved:
+                return GoalResponse.REJECT
+            self._goal_reserved = True
+            return GoalResponse.ACCEPT
+
     def _cancel_callback(self, cancel_request):
         self.get_logger().info('收到找点取消请求')
         return CancelResponse.ACCEPT
 
     def _check_canceled(self):
+        if not self.context.ok():
+            raise RuntimeError('ROS 已关闭，停止找点')
         goal = self._active_goal
         if goal is not None and goal.is_cancel_requested:
             raise _GoalCanceled()
 
     def action_goal_callback(self, goal_handle):
-        with self._goal_lock:
-            self._active_goal = goal_handle
-            try:
-                self._check_canceled()
-                return self._execute_goal(goal_handle)
-            except _GoalCanceled:
-                self.get_logger().info('找点任务已取消')
+        self._active_goal = goal_handle
+        try:
+            self._check_canceled()
+            return self._execute_goal(goal_handle)
+        except _GoalCanceled:
+            self.get_logger().info('找点任务已取消')
+            goal_handle.canceled()
+            return FindCarAvoidancePoint.Result()
+        except Exception as exc:
+            self.get_logger().error(f'找点任务失败: {exc}')
+            if self.context.ok() and goal_handle.is_cancel_requested:
                 goal_handle.canceled()
-                return FindCarAvoidancePoint.Result()
-            finally:
+            elif self.context.ok() and goal_handle.is_active:
+                goal_handle.abort()
+            return FindCarAvoidancePoint.Result()
+        finally:
+            with self._goal_lock:
                 self._active_goal = None
+                if self._data_node is not None:
+                    self._idle_since = time.monotonic()
+                    self._idle_timer.reset()
+                else:
+                    self._idle_since = None
+                    self._idle_timer.cancel()
+                self._goal_reserved = False
 
     def _execute_goal(self, goal_handle):
         self.get_logger().info('开始寻找避让点...')
-        self._start_global_costmap_sub()
-        self._start_special_terrain_sub()
-        self._start_vehicle_stop_points_sub()
         try:
+            # 创建过程中发生异常也走 finally，清理已经创建的部分资源。
+            try:
+                self._start_task_resources()
+            except Exception:
+                self._stop_task_resources()
+                raise
+            if not self._wait_for_data(
+                    lambda: bool(self.footprint_vertices), self.task_data_wait_timeout):
+                self.get_logger().error('等待有效 footprint 超时，本次不执行找点')
+                goal_handle.abort()
+                return FindCarAvoidancePoint.Result()
             if not self._wait_for_global_costmap():
                 self.get_logger().error('等待全局代价地图超时')
                 goal_handle.abort()
@@ -513,6 +662,7 @@ class CarAvoidancePointActionServer(Node):
             # 寻找停靠点
             self.get_logger().info('寻找停靠点...')
             avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
+            self._check_canceled()
             if avoidance_point is not None:
                 ap = avoidance_point.pose
                 yaw = math.degrees(self.get_yaw_from_pose(avoidance_point))
@@ -552,9 +702,7 @@ class CarAvoidancePointActionServer(Node):
                 goal_handle.abort()
                 return FindCarAvoidancePoint.Result()
         finally:
-            self._stop_global_costmap_sub()
-            self._stop_special_terrain_sub()
-            self._stop_vehicle_stop_points_sub()
+            self.action_goal_handle_msg = None
 
     def calculate_total_passage_width(self, vertices):
 
@@ -618,12 +766,14 @@ class CarAvoidancePointActionServer(Node):
         发布调试 marker。
         返回 None 表示准备失败。
         """
-        if self.global_costmap is None:
+        # 回调可能收到下一帧；同次搜索的尺寸和数据取自同一份消息。
+        costmap_msg = self.global_costmap
+        if costmap_msg is None:
             self.get_logger().error('全局代价地图未收到')
             return None
 
         # 地图数据
-        map_info = self.global_costmap.metadata
+        map_info = costmap_msg.metadata
         origin_x = map_info.origin.position.x
         origin_y = map_info.origin.position.y
         resolution = map_info.resolution
@@ -635,7 +785,7 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'width: {width}', once=True)
         self.get_logger().info(f'height: {height}', once=True)
 
-        map_data = np.array(self.global_costmap.data)
+        map_data = np.array(costmap_msg.data)
         costmap = np.ascontiguousarray(map_data.reshape((height, width)).astype(np.uint8))
 
         robot_x = robot_pose.pose.position.x
@@ -1179,22 +1329,26 @@ class CarAvoidancePointActionServer(Node):
 
     # 发送服务，判断避让点是否能够让车通过
     def check_avoidance(self, avoidance_msg):
-        while not self.check_avoidance_service.wait_for_service(timeout_sec=1.0):
-            self._check_canceled()
-            self.get_logger().info('服务未就绪，等待中...')
-    
         # 超过 check_service_max_time 的结果本来就不采用，等太久只会拖住取消。
         timeout = max(2.0, 4.0 * self.check_service_max_time)
-        deadline = time.time() + timeout
+        if not self._wait_for_data(self.check_avoidance_service.service_is_ready, timeout):
+            self.get_logger().warn(f'通过性服务 {timeout:.1f} 秒未就绪，按不可通过处理')
+            return False
+        deadline = time.monotonic() + timeout
         future = self.check_avoidance_service.call_async(avoidance_msg)
-        while not future.done():
-            self._check_canceled()
-            if time.time() > deadline:
-                self.get_logger().warn(f'通过性服务 {timeout:.1f} 秒没有返回，按不可通过处理')
-                return False
-            time.sleep(0.01)
-        result = future.result()
-        return result is not None and result.is_car_passable
+        try:
+            while not future.done():
+                self._check_canceled()
+                if time.monotonic() > deadline:
+                    self.get_logger().warn(f'通过性服务 {timeout:.1f} 秒没有返回，按不可通过处理')
+                    return False
+                time.sleep(0.01)
+            result = future.result()
+            return result is not None and result.is_car_passable
+        finally:
+            if not future.done():
+                self.check_avoidance_service.remove_pending_request(future)
+                future.cancel()
         # rclpy.spin_until_future_complete(self, future)
         # if future.result().is_car_passable:
         #     self.get_logger().info('成功找到避让点。')
@@ -2207,4 +2361,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-    

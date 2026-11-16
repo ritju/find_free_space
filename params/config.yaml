@@ -19,6 +19,8 @@ find_free_space_action_server:
     enable_dual_side: true           # 双侧找点。环境变量显式设为 false/0 时由 launch 关掉
     max_robot_pose_age: 1.0          # 机器人位姿超过 1 秒没更新的位姿，不当成有效位姿
     robot_pose_wait_timeout: 1.5     # 等待新鲜位姿超时
+    subscription_idle_timeout: 10.0  # 最后一次任务结束后，连续空闲 10 秒退订
+    task_data_wait_timeout: 2.0     # 每项启动数据（footprint、地图等）的等待上限，使用单调时间
 
     #  GARAGE_FOOTPRINT_SWEEP_LONG_STEP     沿移动方向的采样间隔
     footprint_sweep_long_step: 0.3
