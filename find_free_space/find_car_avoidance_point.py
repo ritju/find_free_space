@@ -991,14 +991,14 @@ class CarAvoidancePointActionServer(Node):
                 ext_is_inside = self.is_point_inside_parallelogram(
                     ext_pose.pose.position.x, ext_pose.pose.position.y, self.vertices
                 )
-                # 朝向平行于通道长边，取朝向车辆的那一头。
-                # 车在左边、看见车时车头朝左，箭头就朝左。
-                final_yaw = self._compute_avoidance_yaw(
-                    k, robot_x, robot_y, car_pose.x, car_pose.y
-                )
-                quat = Quaternion()
-                quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, final_yaw)
-                ext_pose.pose.orientation = quat
+                # 通道内沿长边取背离车辆的一头。通道外保持外部点原来的朝向。
+                if ext_is_inside:
+                    final_yaw = self._compute_avoidance_yaw(
+                        k, robot_x, robot_y, car_pose.x, car_pose.y, away_from_car=True
+                    )
+                    quat = Quaternion()
+                    quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, final_yaw)
+                    ext_pose.pose.orientation = quat
                 if not ext_is_inside:
                     self.get_logger().info(
                         f'外部停车点({ext_pose.pose.position.x:.2f}, '
@@ -1029,14 +1029,16 @@ class CarAvoidancePointActionServer(Node):
                 if is_inside:
                     best.pose.position.z = 20.0
                     where = '通道内'
+                    heading = '朝向沿长边背离车辆'
                 else:
                     best.pose.position.z = 30.0
                     where = '通道外'
+                    heading = '保持原方向'
                 map_yaw_deg = math.degrees(self.get_yaw_from_pose(best))
                 self.get_logger().info(
                     f'外部停车点通过校验共{len(valid_external)}个，'
                     f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
-                    f'该点在{where}，朝向沿长边朝向车辆，map yaw={map_yaw_deg:.1f}°，z = {best.pose.position.z:.1f}'
+                    f'该点在{where}，{heading}，map yaw={map_yaw_deg:.1f}°，z = {best.pose.position.z:.1f}'
                 )
                 self._result_side = 3
                 return best
@@ -1177,12 +1179,9 @@ class CarAvoidancePointActionServer(Node):
                 ret_pose.header.frame_id = 'map'
                 ret_pose.pose.position.x = robot_x
                 ret_pose.pose.position.y = robot_y
-                target_angle = math.degrees(math.atan2(
-                    boundary[1][1] - boundary[0][1],
-                    boundary[1][0] - boundary[0][0]
-                ))
-                yaw = self.get_yaw_from_pose(robot_pose)
-                ret_pose_yaw = math.radians(self.adjust_angle((math.cos(yaw), math.sin(yaw)), target_angle))
+                ret_pose_yaw = self._compute_avoidance_yaw(
+                    k, robot_x, robot_y, car_pose.x, car_pose.y, away_from_car=True
+                )
                 quat = Quaternion()
                 quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, ret_pose_yaw)
                 ret_pose.pose.orientation = quat
@@ -1842,10 +1841,14 @@ class CarAvoidancePointActionServer(Node):
 
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
-    def _compute_avoidance_yaw(self, k, robot_x, robot_y, car_x, car_y):
-        """沿通道长边，取朝向车辆的那一头。看见车时车头看哪边，箭头就指哪边。"""
+    def _compute_avoidance_yaw(self, k, robot_x, robot_y, car_x, car_y, away_from_car=False):
+        """沿通道长边二选一。to_car 是机器人指向车辆的方向。
+        默认取与 to_car 夹角不超过 90° 的一头，朝向车辆。
+        away_from_car 为真时取夹角大于 90° 的一头，背离车辆。"""
         to_car = math.atan2(car_y - robot_y, car_x - robot_x)
-        return k if self.angle_diff(k, to_car) <= math.pi / 2 else k + math.pi
+        facing_car = self.angle_diff(k, to_car) <= math.pi / 2
+        use_k = (not facing_car) if away_from_car else facing_car
+        return k if use_k else k + math.pi
 
     def process_points(self, robot_pose, vertices, points, direction):
         car_x = self.action_goal_handle_msg.car_pose.pose.position.x
@@ -1853,8 +1856,9 @@ class CarAvoidancePointActionServer(Node):
         robot_x = robot_pose.pose.position.x
         robot_y = robot_pose.pose.position.y
 
+        # 自搜索点沿长边，取背离车辆的一头。
         final_yaw = self._compute_avoidance_yaw(
-            direction, robot_x, robot_y, car_x, car_y
+            direction, robot_x, robot_y, car_x, car_y, away_from_car=True
         )
         final_angle = math.degrees(final_yaw)
 
