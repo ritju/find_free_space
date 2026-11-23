@@ -112,7 +112,7 @@ bool CarAvoidancePointServer::validateCandidate(
   request->size = task.goal->car_size;
   request->find_parking_point = true;
   const auto start_time = std::chrono::steady_clock::now();
-  const bool check_result = checkAvoidance(request);
+  const bool check_result = checkAvoidance(request, task);
   const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
   RCLCPP_INFO(get_logger(), "候选点(%.2f,%.2f) 服务检查 result=%d, time=%.3fs", x, y, check_result, elapsed);
   if (check_result && elapsed < check_service_max_time_) {
@@ -311,13 +311,22 @@ bool CarAvoidancePointServer::checkFootprintSweep(
   return polygonCellsFree(map, convexHull(std::move(corners)));
 }
 
-bool CarAvoidancePointServer::checkAvoidance(const IsCarPassable::Request::SharedPtr request)
+bool CarAvoidancePointServer::checkAvoidance(const IsCarPassable::Request::SharedPtr request, const Task & task)
 {
-  while (!check_avoidance_service_->wait_for_service(std::chrono::seconds(1))) {
-    RCLCPP_INFO(get_logger(), "服务未就绪，等待中...");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(check_service_max_time_);
+  auto expired = [&]() {
+      return task.handle->is_canceling() || !rclcpp::ok() || std::chrono::steady_clock::now() >= deadline;
+    };
+  while (!check_avoidance_service_->wait_for_service(std::chrono::milliseconds(30))) {
+    if (expired()) {return false;}
   }
   auto future = check_avoidance_service_->async_send_request(request);
-  future.wait();
+  while (future.wait_for(std::chrono::milliseconds(30)) != std::future_status::ready) {
+    if (expired()) {
+      check_avoidance_service_->remove_pending_request(future);
+      return false;
+    }
+  }
   return future.get()->is_car_passable;
 }
 

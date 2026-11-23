@@ -75,7 +75,7 @@ CarAvoidancePointServer::CarAvoidancePointServer()
       return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
     },
     [](const std::shared_ptr<GoalHandle>) {
-      return rclcpp_action::CancelResponse::REJECT;
+      return rclcpp_action::CancelResponse::ACCEPT;
     },
     [this](const std::shared_ptr<GoalHandle> goal_handle) {
       std::thread{[this, goal_handle]() {execute(goal_handle);}}.detach();
@@ -326,10 +326,10 @@ void CarAvoidancePointServer::stopTaskSubscriptions()
   vehicle_avoidance_stop_points_.reset();
 }
 
-bool CarAvoidancePointServer::waitForGlobalCostmap(double timeout_sec)
+bool CarAvoidancePointServer::waitForGlobalCostmap(double timeout_sec, const std::shared_ptr<GoalHandle> & handle)
 {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_sec);
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (!handle->is_canceling() && std::chrono::steady_clock::now() < deadline) {
     {
       std::lock_guard<std::mutex> lock(data_mutex_);
       if (global_costmap_) {
@@ -375,10 +375,10 @@ bool CarAvoidancePointServer::snapshotCostmap(SearchContext & ctx)
   return true;
 }
 
-void CarAvoidancePointServer::waitForSpecialTerrain(double timeout_sec)
+void CarAvoidancePointServer::waitForSpecialTerrain(double timeout_sec, const std::shared_ptr<GoalHandle> & handle)
 {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_sec);
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (!handle->is_canceling() && std::chrono::steady_clock::now() < deadline) {
     {
       std::lock_guard<std::mutex> lock(data_mutex_);
       if (special_terrain_polygons_) {
@@ -393,10 +393,10 @@ void CarAvoidancePointServer::waitForSpecialTerrain(double timeout_sec)
   }
 }
 
-std::optional<CarAvoidancePointServer::PoseStamped> CarAvoidancePointServer::getFreshRobotPose()
+std::optional<CarAvoidancePointServer::PoseStamped> CarAvoidancePointServer::getFreshRobotPose(const std::shared_ptr<GoalHandle> & handle)
 {
   const auto deadline = now() + rclcpp::Duration::from_seconds(robot_pose_wait_timeout_);
-  while (now() < deadline) {
+  while (!handle->is_canceling() && now() < deadline) {
     try {
       const auto trans = tf_buffer_->lookupTransform("map", "base_link", tf2::TimePointZero);
       const double age = (now() - rclcpp::Time(trans.header.stamp)).seconds();
@@ -434,7 +434,9 @@ void CarAvoidancePointServer::execute(const std::shared_ptr<GoalHandle> goal_han
   } catch (const std::exception & e) {
     RCLCPP_ERROR(get_logger(), "Error raised in execute callback: %s", e.what());
   }
-  if (goal_handle->is_active()) {
+  if (goal_handle->is_canceling()) {
+    goal_handle->canceled(std::make_shared<FindCarAvoidancePoint::Result>());
+  } else if (goal_handle->is_active()) {
     goal_handle->abort(std::make_shared<FindCarAvoidancePoint::Result>());
   }
   stopTaskSubscriptions();
@@ -442,24 +444,22 @@ void CarAvoidancePointServer::execute(const std::shared_ptr<GoalHandle> goal_han
 
 void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_handle)
 {
-  auto empty_result = std::make_shared<FindCarAvoidancePoint::Result>();
-  if (!waitForGlobalCostmap(2.0)) {
+  if (!waitForGlobalCostmap(2.0, goal_handle)) {
     RCLCPP_ERROR(get_logger(), "等待全局代价地图超时");
-    goal_handle->abort(empty_result);
     return;
   }
-  waitForSpecialTerrain(2.0);
+  waitForSpecialTerrain(2.0, goal_handle);
 
   // 获取一份新鲜的机器人位姿，任务全程固定使用
-  const auto robot_pose = getFreshRobotPose();
+  const auto robot_pose = getFreshRobotPose(goal_handle);
   if (!robot_pose) {
     RCLCPP_ERROR(get_logger(), "无法获取新鲜的机器人位姿，abort");
-    goal_handle->abort(empty_result);
     return;
   }
 
   Task task;
   task.goal = goal_handle->get_goal();
+  task.handle = goal_handle;
   task.robot_pose = *robot_pose;
   RCLCPP_INFO(get_logger(), "polygons: %zu个通道", task.goal->polygons.size());
   publishAllPassagesMarker(task.goal->polygons);
@@ -482,7 +482,6 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
   }
   if (task.vertices.empty()) {
     RCLCPP_ERROR(get_logger(), "未找到用于寻找停靠点的通道");
-    goal_handle->abort(empty_result);
     return;
   }
   RCLCPP_INFO(get_logger(), "当前通行区域: [%s]", formatRing(task.vertices).c_str());
@@ -505,34 +504,39 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
       match_reason = "未匹配到道路模型";
     }
     RCLCPP_ERROR(get_logger(), "没有可用曲线（%s）", match_reason.c_str());
-    goal_handle->abort(empty_result);
     return;
   }
 
   auto search = selectAvoidanceFoot(task);
-  if (!search || !normalAtFoot(*search) || !snapshotCostmap(*search)) {
-    goal_handle->abort(empty_result);
+  if (!search || !snapshotCostmap(*search)) {
     return;
   }
 
   if (const auto external = findExternalPoint(task, *search)) {
     auto result = std::make_shared<FindCarAvoidancePoint::Result>();
     result->pose = *external;
+    result->side = 3;
+    if (goal_handle->is_canceling()) {return;}
     goal_handle->succeed(result);
     if (external->pose.position.z >= 25.0) {
       RCLCPP_INFO(get_logger(), "优先使用通道外外部停靠点，保留上位机朝向，z=%.0f", external->pose.position.z);
     } else {
-      RCLCPP_INFO(get_logger(), "优先使用通道内外部停靠点，朝向为沿侧边从 start 到 end 的切线，z=%.0f",
+      RCLCPP_INFO(get_logger(), "优先使用通道内外部停靠点，车头沿侧边背离来车，z=%.0f",
         external->pose.position.z);
     }
     return;
   }
 
   RCLCPP_INFO(get_logger(), "寻找停靠点...");
-  const auto avoidance_point = findAvoidancePoint(task, *search);
+  uint8_t side = 1;
+  auto avoidance_point = normalAtFoot(*search) ? findAvoidancePoint(task, *search) : std::nullopt;
+  if (!avoidance_point && !goal_handle->is_canceling() && task.goal->enable_far_side && selectFarFoot(*search)) {
+    RCLCPP_INFO(get_logger(), "近侧无可用点，搜索远侧");
+    side = 2;
+    avoidance_point = findAvoidancePoint(task, *search);
+  }
   if (!avoidance_point) {
     RCLCPP_ERROR(get_logger(), "未找到避让点");
-    goal_handle->abort(empty_result);
     return;
   }
   const auto & ap = avoidance_point->pose;
@@ -541,6 +545,8 @@ void CarAvoidancePointServer::runTask(const std::shared_ptr<GoalHandle> & goal_h
 
   auto result = std::make_shared<FindCarAvoidancePoint::Result>();
   result->pose = *avoidance_point;
+  result->side = side;
+  if (goal_handle->is_canceling()) {return;}
   goal_handle->succeed(result);
   const auto & rp = result->pose.pose;
   RCLCPP_INFO(get_logger(), "成功找到避让点*****: x=%.3f, y=%.3f, z=%.3f, yaw=%.3f°",

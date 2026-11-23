@@ -59,6 +59,7 @@ private:
   struct Task
   {
     std::shared_ptr<const FindCarAvoidancePoint::Goal> goal;
+    std::shared_ptr<GoalHandle> handle;
     PoseStamped robot_pose;
     Ring vertices;
     // 任务开始时的道路模型
@@ -76,7 +77,8 @@ private:
     std::shared_ptr<garage_road_model::RoadModelQuery> query;
     garage_road_model::SideId side{garage_road_model::SideId::A};
     double foot_s{0.0};
-    // +1 沿弧长增大的方向远离来车，-1 沿弧长减小。只决定搜索带往哪边展开，车头沿 start 到 end。
+    std::optional<double> far_foot_s;
+    // +1 沿弧长增大的方向远离来车，-1 沿弧长减小。决定搜索带沿侧边往哪边展开。
     double away_sign{1.0};
     Ring side_line;
     Ring channel;
@@ -94,10 +96,10 @@ private:
     std::string & reason) const;
   void startTaskSubscriptions();
   void stopTaskSubscriptions();
-  bool waitForGlobalCostmap(double timeout_sec);
+  bool waitForGlobalCostmap(double timeout_sec, const std::shared_ptr<GoalHandle> & handle);
   bool snapshotCostmap(SearchContext & ctx);
-  void waitForSpecialTerrain(double timeout_sec);
-  std::optional<PoseStamped> getFreshRobotPose();
+  void waitForSpecialTerrain(double timeout_sec, const std::shared_ptr<GoalHandle> & handle);
+  std::optional<PoseStamped> getFreshRobotPose(const std::shared_ptr<GoalHandle> & handle);
   void execute(const std::shared_ptr<GoalHandle> goal_handle);
   void runTask(const std::shared_ptr<GoalHandle> & goal_handle);
   void publishDebugMarkers(
@@ -108,6 +110,7 @@ private:
 
   // avoidance_search.cpp
   std::optional<SearchContext> selectAvoidanceFoot(const Task & task);
+  bool selectFarFoot(SearchContext & ctx);
   bool normalAtFoot(SearchContext & ctx);
   std::optional<PoseStamped> findAvoidancePoint(const Task & task, const SearchContext & ctx);
   std::optional<PoseStamped> findExternalPoint(const Task & task, const SearchContext & ctx);
@@ -125,7 +128,7 @@ private:
   bool checkFootprintSweep(
     const MapView & map, const Ring & local_footprint, const Vec2 & robot, const Vec2 & target,
     double target_yaw) const;
-  bool checkAvoidance(const IsCarPassable::Request::SharedPtr request);
+  bool checkAvoidance(const IsCarPassable::Request::SharedPtr request, const Task & task);
 
   // 参数
   std::string topic_name_global_costmap_;

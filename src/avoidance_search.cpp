@@ -25,17 +25,15 @@ double flipIfFacingCar(double yaw, const Vec2 & robot, const Vec2 & car)
   return dot < 0.0 ? yaw : addAngles(yaw, M_PI);
 }
 
-// 通道内部参考点，用来判断搜索框有没有越过短边。
-Vec2 shortEdgeInteriorPoint(const Ring & vertices)
+// 在停车点处从切线的两个朝向中选出背离来车的一侧。
+std::optional<double> parkingYawAwayFromCar(double tangent_yaw, const Vec2 & point, const Vec2 & car)
 {
-  Vec2 center = Vec2::Zero();
-  for (const auto & point : vertices) {
-    center += point;
+  const Vec2 tangent(std::cos(tangent_yaw), std::sin(tangent_yaw));
+  const double projection = tangent.dot(car - point);
+  if (!std::isfinite(projection) || std::abs(projection) <= 1e-6) {
+    return std::nullopt;
   }
-  if (!vertices.empty()) {
-    center /= static_cast<double>(vertices.size());
-  }
-  return center;
+  return projection < 0.0 ? tangent_yaw : addAngles(tangent_yaw, M_PI);
 }
 
 // 根据传入的 A 或 B 长边编号，从道路模型中取出对应的长边数据，供后续投影和搜索使用。
@@ -96,6 +94,10 @@ std::optional<CarAvoidancePointServer::SearchContext> CarAvoidancePointServer::s
     return std::nullopt;
   }
   const Foot chosen = (!foot_a || (foot_b && foot_b->distance < foot_a->distance)) ? *foot_b : *foot_a;
+  const auto & opposite = chosen.side == garage_road_model::SideId::A ? foot_b : foot_a;
+  if (opposite) {
+    ctx.far_foot_s = opposite->s;
+  }
   ctx.side = chosen.side;
   ctx.foot_s = chosen.s;
   for (const auto & sample : avoidanceLongSide(*ctx.query, ctx.side).samples) {
@@ -109,8 +111,39 @@ std::optional<CarAvoidancePointServer::SearchContext> CarAvoidancePointServer::s
   return ctx;
 }
 
-// 停靠朝向：侧边从 start 到 end 的切线。采样 yaw 随弧长增大，就是这个方向。拐角处切线不唯一。
-std::optional<double> parkingYawAlongSide(
+// 切到同一横截面上的另一侧，避免 U 形通道投影到相邻走廊。
+bool CarAvoidancePointServer::selectFarFoot(SearchContext & ctx)
+{
+  if (!ctx.far_foot_s) {return false;}
+  const auto far = ctx.side == garage_road_model::SideId::A ?
+    garage_road_model::SideId::B : garage_road_model::SideId::A;
+  const auto section = ctx.query->localCrossSection(ctx.side, ctx.foot_s, ctx.channel);
+  if (section.status == garage_road_model::QueryStatus::Ok) {
+    const auto foot = ctx.query->projectOnSide(far, section.far_point, 0.0, -1.0);
+    if (foot.status != garage_road_model::QueryStatus::Ok) {return false;}
+    ctx.foot_s = foot.s;
+  } else {
+    const auto pose = ctx.query->evaluateSide(far, *ctx.far_foot_s);
+    if (pose.status != garage_road_model::QueryStatus::Ok) {return false;}
+    const Vec2 delta = pose.position - ctx.robot;
+    const int steps = std::max(1, static_cast<int>(std::ceil(delta.norm() / 0.05)));
+    for (int i = 1; i < steps; ++i) {
+      if (!pointInPolygon(ctx.robot + (static_cast<double>(i) / steps) * delta, ctx.channel)) {
+        return false;
+      }
+    }
+    ctx.foot_s = *ctx.far_foot_s;
+  }
+  ctx.side = far;
+  ctx.side_line.clear();
+  for (const auto & sample : avoidanceLongSide(*ctx.query, far).samples) {
+    ctx.side_line.emplace_back(sample.x, sample.y);
+  }
+  return normalAtFoot(ctx);
+}
+
+// 拟合侧边的切线沿弧长递增，拐角处切线不唯一。
+std::optional<double> sideTangentYaw(
   const garage_road_model::RoadModelQuery & query,
   garage_road_model::SideId side,
   double s)
@@ -122,7 +155,7 @@ std::optional<double> parkingYawAlongSide(
   return pose.yaw;
 }
 
-// 垂足已经投好。横向仍用法线展开搜索带；搜索沿远离来车的方向，车头另取 start 到 end。
+// 垂足已经投好。横向仍用法线展开搜索带；搜索沿远离来车的方向。
 bool CarAvoidancePointServer::normalAtFoot(SearchContext & ctx)
 {
   const auto pose = ctx.query->evaluateSide(ctx.side, ctx.foot_s);
@@ -138,7 +171,7 @@ bool CarAvoidancePointServer::normalAtFoot(SearchContext & ctx)
   }
   const double along_yaw = flipIfFacingCar(pose.yaw, ctx.robot, ctx.car);
   ctx.away_sign = angleDiff(along_yaw, pose.yaw) < M_PI / 2.0 ? 1.0 : -1.0;
-  RCLCPP_INFO(get_logger(), "搜索沿弧长%s远离来车，车头沿侧边从 start 到 end",
+  RCLCPP_INFO(get_logger(), "搜索沿弧长%s远离来车",
     ctx.away_sign > 0.0 ? "增大" : "减小");
   return true;
 }
@@ -207,13 +240,15 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findExte
   };
   std::vector<Passed> passed;
   for (auto & candidate : filtered) {
+    if (task.handle->is_canceling()) {return std::nullopt;}
     const Vec2 point(candidate.pose.pose.position.x, candidate.pose.pose.position.y);
     const bool inside = pointInPolygon(point, task.vertices);
     if (inside) {
       const auto foot = nearestFoot(*ctx.query, ctx.side, point);
-      const auto yaw = foot ? parkingYawAlongSide(*ctx.query, ctx.side, foot->s) : std::nullopt;
+      const auto tangent = foot ? sideTangentYaw(*ctx.query, ctx.side, foot->s) : std::nullopt;
+      const auto yaw = tangent ? parkingYawAwayFromCar(*tangent, point, ctx.car) : std::nullopt;
       if (!yaw) {
-        RCLCPP_INFO(get_logger(), "外部停车点(%.2f, %.2f) 在通道内，但该处没有沿侧边的切线，跳过",
+        RCLCPP_INFO(get_logger(), "外部停车点(%.2f, %.2f) 在通道内，无法沿侧边确定背离来车的朝向，跳过",
           point.x(), point.y());
         continue;
       }
@@ -262,7 +297,7 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findExte
 std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoidancePoint(
   const Task & task, const SearchContext & ctx)
 {
-  const auto facing_yaw = parkingYawAlongSide(*ctx.query, ctx.side, ctx.foot_s);
+  const auto facing_yaw = sideTangentYaw(*ctx.query, ctx.side, ctx.foot_s);
   if (!facing_yaw) {
     RCLCPP_ERROR(get_logger(), "机器人垂足处没有沿侧边的切线，无法判断前后");
     return std::nullopt;
@@ -281,17 +316,10 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoi
   const double interval = std::max(search_point_interval_, 1e-3);
   const double lateral_lo = std::min(outside_min_, outside_max_);
   const double lateral_hi = std::max(outside_min_, outside_max_);
-  const Vec2 interior = shortEdgeInteriorPoint(ctx.channel);
   std::vector<PoseStamped> candidates;
   Ring search_band;
 
-  const auto foot = ctx.query->evaluateSide(ctx.side, ctx.foot_s);
-  if (foot.status != garage_road_model::QueryStatus::Ok) {
-    RCLCPP_ERROR(get_logger(), "避车长边垂足处没有切线，无法生成搜索框");
-    return std::nullopt;
-  }
-  const double along_yaw = flipIfFacingCar(foot.yaw, ctx.robot, ctx.car);
-  const double away_sign = angleDiff(along_yaw, foot.yaw) < M_PI / 2.0 ? 1.0 : -1.0;
+  const double away_sign = ctx.away_sign;
   const auto & boundary = avoidanceLongSide(*ctx.query, ctx.side);
   const double side_begin = boundary.samples.front().s;
   const double side_end = boundary.samples.back().s;
@@ -301,7 +329,9 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoi
     return std::nullopt;
   }
   const auto front_pose = ctx.query->evaluateSide(ctx.side, s_front);
-  if (front_pose.status == garage_road_model::QueryStatus::Ok) {
+  const double remaining = away_sign > 0.0 ? side_end - s_front : s_front - side_begin;
+  if (remaining <= std::max(std::abs(lateral_lo), std::abs(lateral_hi)) &&
+      front_pose.status == garage_road_model::QueryStatus::Ok) {
     const Vec2 left(-std::sin(front_pose.yaw), std::cos(front_pose.yaw));
     Vec2 outward = Vec2::Zero();
     if (pointInPolygon(front_pose.position + 0.15 * left, ctx.channel)) {
@@ -311,6 +341,9 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoi
     }
     const auto & cap = away_sign > 0.0 ? ctx.query->model().end_cap : ctx.query->model().start_cap;
     if (outward.squaredNorm() > 0.5 && cap.size() >= 2) {
+      const auto & inside_sample = away_sign > 0.0 ?
+        boundary.samples[boundary.samples.size() - 2] : boundary.samples[1];
+      const Vec2 interior(inside_sample.x, inside_sample.y);
       const Edge cap_edge{cap.front(), cap.back()};
       const Vec2 inner = front_pose.position + outward * lateral_lo;
       const Vec2 outer = front_pose.position + outward * lateral_hi;
@@ -327,6 +360,7 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoi
   Ring inner_edge;
   Ring outer_edge;
   for (int i = 0; i <= along_steps; ++i) {
+    if (task.handle->is_canceling()) {return std::nullopt;}
     const double station = ctx.foot_s + away_sign * (near_distance + interval * i);
     if (station < side_begin - 1e-6 || station > side_end + 1e-6) {
       continue;
@@ -338,7 +372,6 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoi
     {
       continue;
     }
-    const double park_yaw = pose.yaw;
     const Vec2 outward = -normal.direction;
     inner_edge.push_back(pose.position + outward * lateral_lo);
     outer_edge.push_back(pose.position + outward * lateral_hi);
@@ -348,12 +381,14 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoi
         continue;
       }
       const Vec2 point = pose.position + outward * lateral;
+      const auto park_yaw = parkingYawAwayFromCar(pose.yaw, point, ctx.car);
+      if (!park_yaw) {continue;}
       PoseStamped candidate;
       candidate.header.stamp = now();
       candidate.header.frame_id = "map";
       candidate.pose.position.x = point.x();
       candidate.pose.position.y = point.y();
-      candidate.pose.orientation = yawToQuaternion(park_yaw);
+      candidate.pose.orientation = yawToQuaternion(*park_yaw);
       candidates.push_back(candidate);
     }
   }
@@ -370,6 +405,7 @@ std::optional<geometry_msgs::msg::PoseStamped> CarAvoidancePointServer::findAvoi
   }
   RCLCPP_INFO(get_logger(), "一共%zu个候选避让点", candidates.size());
   for (const auto & candidate : candidates) {
+    if (task.handle->is_canceling()) {return std::nullopt;}
     if (validateCandidate(task, ctx, candidate, false)) {
       PoseStamped result = candidate;
       result.pose.position.z = 10.0;
