@@ -2,9 +2,7 @@ import rclpy
 from rclpy.action import ActionServer
 from rclpy.node import Node
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor, ExternalShutdownException
-from rclpy.clock import Clock, ClockType
-from rclpy.parameter import Parameter
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionServer,GoalResponse,CancelResponse
 from rclpy.qos import qos_profile_sensor_data, DurabilityPolicy,ReliabilityPolicy,QoSProfile,HistoryPolicy
 from geometry_msgs.msg import PoseStamped, Pose, Quaternion, Point, PoseArray
@@ -12,7 +10,6 @@ from capella_ros_msg.srv import IsCarPassable
 from garage_utils_msgs.msg import Polygons
 import tf2_ros
 import numpy as np
-import threading
 import time
 import math
 import cv2
@@ -26,11 +23,7 @@ from collections import defaultdict
 # from nav2_costmap_2d import Costmap2D
 
 from visualization_msgs.msg import Marker
-from rclpy.qos import QoSProfile
-
-
-class _GoalCanceled(Exception):
-    pass
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 
 
 class CarAvoidancePointActionServer(Node):
@@ -54,33 +47,67 @@ class CarAvoidancePointActionServer(Node):
 
         self.init_params()
 
-
-        self._marker_topics = (
-            'marker_car_pose', 'marker_robot_pose', 'marker_avoidance_side',
-            'marker_searching_rect', 'marker_parking_point',
-            'marker_special_terrain', 'marker_all_passages',
+        # publish markers for debug
+        marker_qos = QoSProfile(depth=1,
+                        durability=QoSDurabilityPolicy.RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL)
+        self.marker_car_pose_publisher = self.create_publisher(
+            Marker,
+            "marker_car_pose",
+            marker_qos          
         )
-        for topic in self._marker_topics:
-            setattr(self, topic + '_publisher', None)
-        self._resource_lock = threading.RLock()
-        self._task_token = None
-        self._data_lock = threading.RLock()
-        self._data_node = None
-        self._data_executor = None
-        self._data_thread = None
-        self._data_stop = threading.Event()
-        self._idle_since = None
+
+        self.marker_robot_pose_publisher = self.create_publisher(
+            Marker,
+            "marker_robot_pose",
+            marker_qos
+        )
+
+        self.marker_avoidance_side_publisher = self.create_publisher(
+            Marker,
+            "marker_avoidance_side",
+            marker_qos
+        )
+
+        self.marker_searching_rect_publisher = self.create_publisher(
+            Marker,
+            "marker_searching_rect",
+            marker_qos
+        )
+
+        self.marker_parking_point_publisher = self.create_publisher(
+            Marker,
+            "marker_parking_point",
+            marker_qos
+        )
+
+        self.marker_special_terrain_publisher = self.create_publisher(
+            Marker,
+            "marker_special_terrain",
+            marker_qos
+        )
+
+        self.marker_all_passages_publisher = self.create_publisher(
+            Marker,
+            "marker_all_passages",
+            marker_qos
+        )
 
         callback_gp1 = MutuallyExclusiveCallbackGroup()
         callback_gp2 = MutuallyExclusiveCallbackGroup()
         callback_gp3 = MutuallyExclusiveCallbackGroup()
         callback_gp4 = MutuallyExclusiveCallbackGroup()
         self._costmap_cb_group = callback_gp2
-        self._service_cb_group = callback_gp3
-        self._footprint_cb_group = callback_gp4
-        self.footprint_sub_ = None
+
+        self.footprint_sub_ = self.create_subscription(
+            PolygonStamped, 
+            self.topic_name_footprint,
+            self.footprint_sub_callback,
+            1,
+            callback_group=callback_gp4)
 
         self.robot_pose = PoseStamped()
+        self.max_robot_pose_age = 1.0  # 最大允许时间
+        self.robot_pose_wait_timeout = 1.5
 
         self.polygons = []
         self.vertices = []
@@ -90,23 +117,18 @@ class CarAvoidancePointActionServer(Node):
         # action
         action_server_feedback_qos = QoSProfile(depth=1)
         action_server_feedback_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        self._goal_lock = threading.Lock()
-        self._goal_reserved = False
-        self._active_goal = None
         self.action_server = ActionServer(self,FindCarAvoidancePoint,'/find_car_avoidance_point_action',
                                         self.action_goal_callback,
                                         callback_group=callback_gp1,
-                                        goal_callback=self._goal_callback,
-                                        cancel_callback=self._cancel_callback,
                                         feedback_pub_qos_profile=action_server_feedback_qos)#
         # tf2
-        self.tf_buffer = None
-        self.tf_listener = None
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         # 有请求时再订，空闲不订
         self.global_costmap_sub = None
         self.global_costmap = None
         # 检查pose能否避让的服务
-        self.check_avoidance_service = None
+        self.check_avoidance_service = self.create_client(IsCarPassable, '/check_car_passable',callback_group=callback_gp3)
 
         # 禁扫区多边形（/cleaning_tool_retraction_areas）
         # 待命不订阅，任务期由 _start_special_terrain_sub 挂载
@@ -118,140 +140,6 @@ class CarAvoidancePointActionServer(Node):
         self.vehicle_avoidance_stop_points = None
         self.vehicle_stop_points_sub = None
 
-        # 使用墙上单调时间；仿真暂停也能退订。完全空闲时定时器取消。
-        self._idle_timer = self.create_timer(
-            0.1, self._expire_task_resources, clock=Clock(clock_type=ClockType.STEADY_TIME))
-        self._idle_timer.cancel()
-
-    def _expire_task_resources(self):
-        with self._goal_lock:
-            if (not self._goal_reserved and self._idle_since is not None and
-                    time.monotonic() - self._idle_since >= self.subscription_idle_timeout):
-                self._idle_timer.cancel()
-                self._stop_task_resources()
-                self._idle_since = None
-
-    def destroy_node(self):
-        self._idle_timer.cancel()
-        self._stop_task_resources()
-        return super().destroy_node()
-
-    def _task_callback(self, callback):
-        """业务数据在独立执行器接收；清理前必须先停止并等待该执行器。"""
-        token = self._task_token
-
-        def guarded_callback(msg):
-            with self._data_lock:
-                if token is not None and token is self._task_token:
-                    callback(msg)
-
-        return guarded_callback
-
-    def _start_task_resources(self):
-        with self._resource_lock:
-            # 复用订阅，但每次请求仍等待新地图和 footprint，不沿用上次任务快照。
-            with self._data_lock:
-                self.global_costmap = None
-                self.footprint_vertices = []
-                self._static_check_info_logged = False
-            if self._data_node is not None:
-                return
-            self._task_token = object()
-            # 独立节点避免主 Action 执行器持有待销毁的订阅 handler。
-            self._data_node = Node(
-                self.get_name() + '_inputs', namespace=self.get_namespace(),
-                context=self.context, use_global_arguments=False,
-                cli_args=['--ros-args', '-r', '/tf:=' + self.resolve_topic_name('/tf'),
-                          '-r', '/tf_static:=' + self.resolve_topic_name('/tf_static')],
-                parameter_overrides=[Parameter(
-                    'use_sim_time', value=self.get_parameter('use_sim_time').value)],
-                start_parameter_services=False, enable_rosout=False)
-            self._data_executor = SingleThreadedExecutor(context=self.context)
-            self._data_executor.add_node(self._data_node)
-            marker_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-            for topic in self._marker_topics:
-                setattr(self, topic + '_publisher', self.create_publisher(Marker, topic, marker_qos))
-            self.check_avoidance_service = self._data_node.create_client(
-                IsCarPassable, self.resolve_service_name('/check_car_passable'), callback_group=self._service_cb_group)
-            # 同一轮连续请求复用 TF 缓存，读取时仍检查位姿的新鲜度。
-            self.tf_buffer = tf2_ros.Buffer()
-            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self._data_node)
-            self.footprint_sub_ = self._data_node.create_subscription(
-                PolygonStamped, self.resolve_topic_name(self.topic_name_footprint),
-                self._task_callback(self.footprint_sub_callback), 1,
-                callback_group=self._footprint_cb_group)
-            self._start_global_costmap_sub()
-            self._start_special_terrain_sub()
-            self._start_vehicle_stop_points_sub()
-            self._data_stop.clear()
-            self._data_thread = threading.Thread(
-                target=self._spin_task_inputs, name='find_input_executor', daemon=True)
-            self._data_thread.start()
-
-    def _spin_task_inputs(self):
-        try:
-            while not self._data_stop.is_set() and self.context.ok():
-                self._data_executor.spin_once(timeout_sec=0.1)
-        except ExternalShutdownException:
-            pass  # ROS 整体关闭；业务订阅仍由 join 后的清理流程释放。
-
-    def _stop_task_resources(self):
-        with self._resource_lock:
-            # 此锁只保护生命周期；数据回调用独立锁，shutdown/join 不会锁死。
-            self._data_stop.set()
-            if self._data_thread is not None:
-                self._data_thread.join()
-                self._data_thread = None
-            if self._data_executor is not None:
-                self._data_executor.shutdown()
-            self._task_token = None
-            self._stop_global_costmap_sub()
-            self._stop_special_terrain_sub()
-            self._stop_vehicle_stop_points_sub()
-            if self.footprint_sub_ is not None:
-                self._data_node.destroy_subscription(self.footprint_sub_)
-                self.footprint_sub_ = None
-            if self.tf_listener is not None:
-                # Python 的订阅回调持有 listener，不能只赋 None 等待析构。
-                self.tf_listener.unregister()
-                self.tf_listener = None
-            self.tf_buffer = None
-            if self.check_avoidance_service is not None:
-                self._data_node.destroy_client(self.check_avoidance_service)
-                self.check_avoidance_service = None
-            for topic in self._marker_topics:
-                publisher = getattr(self, topic + '_publisher')
-                if publisher is not None:
-                    self.destroy_publisher(publisher)
-                    setattr(self, topic + '_publisher', None)
-            if self.show_global_costmap_raw_cv2 or self.show_global_costmap_raw_colored_cv2:
-                try:
-                    cv2.destroyAllWindows()
-                except cv2.error:
-                    pass  # 无窗口/无 GUI 后端也必须完成其余清理。
-            if self._data_node is not None:
-                self._data_node.destroy_node()
-                self._data_node = None
-            self._data_executor = None
-            self.footprint_vertices = []
-            self.robot_width = 0.0
-            self.robot_pose = PoseStamped()
-            self.polygons = []
-            self.vertices = []
-            self.action_goal_handle_msg = None
-            self._static_check_info_logged = False
-
-    def _wait_for_data(self, ready, timeout_sec):
-        # 使用墙上单调时间，仿真时钟暂停也能超时、响应取消。
-        deadline = time.monotonic() + timeout_sec
-        while True:
-            self._check_canceled()
-            if ready():
-                return True
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.05)
-
     def init_params(self):
         self.declare_parameter("topic_name_global_costmap", "")          # 全局代价地图话题名
         self.declare_parameter("service_name_check_car_passble", "")     # 车辆可通过性检查服务名
@@ -259,10 +147,12 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter("search_interval", 0.3)                   # 搜索角度间隔
         self.declare_parameter("search_radius_min", 3.0)                 # 搜索半径最小值
         self.declare_parameter("search_radius_max", 4.0)                 # 搜索半径最大值
-        self.declare_parameter("near_search_radius_scale", 1.2)          # 双侧打开时近侧沿边远端倍率
         self.declare_parameter("search_radius_extra_dis", 2.5)           # 搜索半径额外增加距离
         self.declare_parameter("outside_min", 0.0)                       # 搜索框外侧最小偏移
         self.declare_parameter("outside_max", 0.5)                       # 搜索框外侧最大偏移
+        self.declare_parameter("inside_step", 0.1)                       # 每轮往内移动步长
+        self.declare_parameter('inward_offset', 0.0)                     # 搜索框初始位置离多边形边线往内多少米（0=紧贴边线）
+        self.declare_parameter('max_inward_offset', 1.5)                 # 搜索框最大往内偏移距离
         self.declare_parameter("check_service_max_time", 0.5)            # 车辆通过性检查超时
         self.declare_parameter('show_global_costmap_raw_cv2', False)     # 显示原始代价地图
         self.declare_parameter('show_global_costmap_raw_colored_cv2', False)  # 显示彩色代价地图
@@ -275,9 +165,6 @@ class CarAvoidancePointActionServer(Node):
         self.declare_parameter('stop_in_place_min_dist', 2.0)           # 机器人在通道外长边方向、且离长边超过这个距离才允许原地停
         self.declare_parameter('max_robot_pose_age', 1.0)               # 机器人位姿最大允许年龄
         self.declare_parameter('robot_pose_wait_timeout', 1.5)          # 等待新鲜位姿超时
-        self.declare_parameter('subscription_idle_timeout', 10.0)     # 连续空闲多久后释放订阅（秒）
-        self.declare_parameter('task_data_wait_timeout', 2.0)          # 唤醒后等待地图、footprint 等数据超时
-        self.declare_parameter('enable_dual_side', True)                # 为 true 时近侧拉长，并允许按请求搜远侧
 
         self.topic_name_global_costmap = self.get_parameter("topic_name_global_costmap").value
         self.service_name_check_car_passble = self.get_parameter("service_name_check_car_passble").value
@@ -285,13 +172,15 @@ class CarAvoidancePointActionServer(Node):
         self.search_interval = self.get_parameter("search_interval").value
         self.search_radius_min = self.get_parameter("search_radius_min").value
         self.search_radius_max = self.get_parameter("search_radius_max").value
-        self.near_search_radius_scale = self.get_parameter("near_search_radius_scale").value
         self.search_radius_extra_dis = self.get_parameter("search_radius_extra_dis").value
         self.outside_min = self.get_parameter("outside_min").value
         self.outside_max = self.get_parameter("outside_max").value
+        self.inside_step = self.get_parameter("inside_step").value
         self.check_service_max_time = self.get_parameter("check_service_max_time").value
         self.show_global_costmap_raw_cv2 = self.get_parameter('show_global_costmap_raw_cv2').value
         self.show_global_costmap_raw_colored_cv2 = self.get_parameter('show_global_costmap_raw_colored_cv2').value
+        self.inward_offset = self.get_parameter('inward_offset').value
+        self.max_inward_offset = self.get_parameter('max_inward_offset').value
         self.search_point_interval = self.get_parameter("search_point_interval").value
         self.footprint_sweep_long_step = self.get_parameter('footprint_sweep_long_step').value
         self.footprint_sweep_short_step = self.get_parameter('footprint_sweep_short_step').value
@@ -300,15 +189,6 @@ class CarAvoidancePointActionServer(Node):
         self.stop_in_place_min_dist = self.get_parameter('stop_in_place_min_dist').value
         self.max_robot_pose_age = self.get_parameter('max_robot_pose_age').value
         self.robot_pose_wait_timeout = self.get_parameter('robot_pose_wait_timeout').value
-        self.subscription_idle_timeout = self.get_parameter('subscription_idle_timeout').value
-        self.task_data_wait_timeout = self.get_parameter('task_data_wait_timeout').value
-        for name in ('subscription_idle_timeout', 'task_data_wait_timeout', 'robot_pose_wait_timeout', 'max_robot_pose_age'):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f'{name} 必须为有限正数')
-        self.enable_dual_side = bool(self.get_parameter('enable_dual_side').value)
-        self._enable_far_side = False
-        self._result_side = 0
 
         self.get_logger().info(f'topic_name_global_costmap: {self.topic_name_global_costmap}')
         self.get_logger().info(f'service_name_check_car_passble: {self.service_name_check_car_passble}')
@@ -316,13 +196,15 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'search_interval: {self.search_interval}')
         self.get_logger().info(f'search_radius_min: {self.search_radius_min}')
         self.get_logger().info(f'search_radius_max: {self.search_radius_max}')
-        self.get_logger().info(f'near_search_radius_scale: {self.near_search_radius_scale}')
         self.get_logger().info(f'search_radius_extra_dis: {self.search_radius_extra_dis}')
         self.get_logger().info(f'outside_min: {self.outside_min}')
         self.get_logger().info(f'outside_max: {self.outside_max}')
+        self.get_logger().info(f'inside_step: {self.inside_step}')
         self.get_logger().info(f'check_service_max_time: {self.check_service_max_time}')
         self.get_logger().info(f'show_global_costmap_raw_cv2: {self.show_global_costmap_raw_cv2}')
         self.get_logger().info(f'show_global_costmap_raw_colored_cv2: {self.show_global_costmap_raw_colored_cv2}')
+        self.get_logger().info(f'inward_offset: {self.inward_offset}')
+        self.get_logger().info(f'max_inward_offset: {self.max_inward_offset}')
         self.get_logger().info(f'search_point_interval: {self.search_point_interval}')
         self.get_logger().info(f'footprint_sweep_long_step: {self.footprint_sweep_long_step}  # 默认999.0=不启用扫掠检查')
         self.get_logger().info(f'footprint_sweep_short_step: {self.footprint_sweep_short_step} # 默认999.0=只扫两条长边')
@@ -331,15 +213,9 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'stop_in_place_min_dist: {self.stop_in_place_min_dist}')
         self.get_logger().info(f'max_robot_pose_age: {self.max_robot_pose_age}')
         self.get_logger().info(f'robot_pose_wait_timeout: {self.robot_pose_wait_timeout}')
-        self.get_logger().info(f'task_data_wait_timeout: {self.task_data_wait_timeout}')
-        self.get_logger().info(f'enable_dual_side: {self.enable_dual_side}')
     
     def footprint_sub_callback(self, msg):
-        if self.footprint_vertices:
-            return  # 每次请求取一次尺寸，保留订阅供下一次复用。
         points = msg.polygon.points
-        if len(points) < 4:
-            return
         edges_distance = np.array([
             round(np.linalg.norm(
                 np.array([points[i].x, points[i].y]) - 
@@ -347,8 +223,6 @@ class CarAvoidancePointActionServer(Node):
             ), 2)
             for i in range(4)
         ])
-        if not np.all(np.isfinite(edges_distance)) or np.any(edges_distance <= 0):
-            return
         self.robot_width = np.min(edges_distance)
         # 用边长构造以机器人中心为原点的局部坐标 footprint
         half_long = np.max(edges_distance) / 2.0
@@ -361,13 +235,10 @@ class CarAvoidancePointActionServer(Node):
         ]
         fp_str = ', '.join([f'({v[0]:.3f}, {v[1]:.3f})' for v in self.footprint_vertices])
         self.get_logger().info(f"robot_width: {self.robot_width:.3f}, footprint_vertices (local): [{fp_str}]")
+        # 取消订阅
+        self.destroy_subscription(self.footprint_sub_)
 
     def global_costmap_callback(self, msg):
-        meta = msg.metadata
-        if (meta.size_x == 0 or meta.size_y == 0 or
-                not math.isfinite(meta.resolution) or meta.resolution <= 0 or
-                len(msg.data) != meta.size_x * meta.size_y):
-            return
         # self.get_logger().info('获取全局代价图')
         self.global_costmap = msg
 
@@ -400,16 +271,14 @@ class CarAvoidancePointActionServer(Node):
         """获取一份新鲜的 map->base_link 位姿，超时或过期返回 None"""
         if timeout_sec is None:
             timeout_sec = self.robot_pose_wait_timeout
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            self._check_canceled()
+        deadline = self.get_clock().now() + rclpy.duration.Duration(seconds=timeout_sec)
+        while self.get_clock().now() < deadline:
             try:
                 trans = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-                stamp = rclpy.time.Time.from_msg(trans.header.stamp, clock_type=self.get_clock().clock_type)
-                age = (self.get_clock().now() - stamp).nanoseconds / 1e9
-                if age < 0 or age > self.max_robot_pose_age:
+                age = (self.get_clock().now() - trans.header.stamp).nanoseconds / 1e9
+                if age > self.max_robot_pose_age:
                     self.get_logger().warn(
-                        f'TF 位姿时间无效 age={age:.2f}s', throttle_duration_sec=1.0)
+                        f'TF 位姿过旧 age={age:.2f}s', throttle_duration_sec=1.0)
                     time.sleep(0.05)
                     continue
                 pose = PoseStamped()
@@ -426,37 +295,39 @@ class CarAvoidancePointActionServer(Node):
 
     def _start_global_costmap_sub(self):
         if self.global_costmap_sub is None:
-            self.global_costmap_sub = self._data_node.create_subscription(
+            self.global_costmap_sub = self.create_subscription(
                 Costmap,
-                self.resolve_topic_name(self.topic_name_global_costmap),
-                self._task_callback(self.global_costmap_callback),
+                self.topic_name_global_costmap,
+                self.global_costmap_callback,
                 10,
                 callback_group=self._costmap_cb_group)
 
     def _stop_global_costmap_sub(self):
         if self.global_costmap_sub is not None:
-            self._data_node.destroy_subscription(self.global_costmap_sub)
+            self.destroy_subscription(self.global_costmap_sub)
             self.global_costmap_sub = None
         self.global_costmap = None
 
-    def _wait_for_global_costmap(self):
-        return self._wait_for_data(
-            lambda: self.global_costmap is not None, self.task_data_wait_timeout)
+    def _wait_for_global_costmap(self, timeout_sec=2.0):
+        deadline = time.time() + timeout_sec
+        while self.global_costmap is None and time.time() < deadline:
+            time.sleep(0.05)
+        return self.global_costmap is not None
 
     def _start_special_terrain_sub(self):
         if self.special_terrain_sub is None:
             qos_transient = QoSProfile(depth=1)
             qos_transient.durability = DurabilityPolicy.TRANSIENT_LOCAL
-            self.special_terrain_sub = self._data_node.create_subscription(
+            self.special_terrain_sub = self.create_subscription(
                 Polygons,
-                self.resolve_topic_name('/cleaning_tool_retraction_areas'),
-                self._task_callback(self._special_terrain_callback),
+                '/cleaning_tool_retraction_areas',
+                self._special_terrain_callback,
                 qos_transient,
             )
 
     def _stop_special_terrain_sub(self):
         if self.special_terrain_sub is not None:
-            self._data_node.destroy_subscription(self.special_terrain_sub)
+            self.destroy_subscription(self.special_terrain_sub)
             self.special_terrain_sub = None
         self.special_terrain_polygons = None
 
@@ -465,23 +336,25 @@ class CarAvoidancePointActionServer(Node):
             qos_stop_points = QoSProfile(depth=1)
             qos_stop_points.durability = DurabilityPolicy.TRANSIENT_LOCAL
             qos_stop_points.reliability = ReliabilityPolicy.RELIABLE
-            self.vehicle_stop_points_sub = self._data_node.create_subscription(
+            self.vehicle_stop_points_sub = self.create_subscription(
                 PoseArray,
-                self.resolve_topic_name('/vehicle_avoidance_stop_points'),
-                self._task_callback(self._vehicle_stop_points_callback),
+                '/vehicle_avoidance_stop_points',
+                self._vehicle_stop_points_callback,
                 qos_stop_points,
             )
 
     def _stop_vehicle_stop_points_sub(self):
         if self.vehicle_stop_points_sub is not None:
-            self._data_node.destroy_subscription(self.vehicle_stop_points_sub)
+            self.destroy_subscription(self.vehicle_stop_points_sub)
             self.vehicle_stop_points_sub = None
         self.vehicle_avoidance_stop_points = None
 
-    def _wait_for_special_terrain(self):
+    def _wait_for_special_terrain(self, timeout_sec=2.0):
         """等待禁扫区第一条数据"""
-        if not self._wait_for_data(
-                lambda: self.special_terrain_polygons is not None, self.task_data_wait_timeout):
+        deadline = time.time() + timeout_sec
+        while self.special_terrain_polygons is None and time.time() < deadline:
+            time.sleep(0.05)
+        if self.special_terrain_polygons is None:
             self.get_logger().warn('等待禁扫区超时，本次任务不拦截禁扫区')
 
     def get_vertices_callback(self):
@@ -541,65 +414,12 @@ class CarAvoidancePointActionServer(Node):
                 min_dis = dis
         return min_dis
 
-    def _goal_callback(self, goal_request):
-        with self._goal_lock:
-            if self._goal_reserved:
-                return GoalResponse.REJECT
-            self._goal_reserved = True
-            return GoalResponse.ACCEPT
-
-    def _cancel_callback(self, cancel_request):
-        self.get_logger().info('收到找点取消请求')
-        return CancelResponse.ACCEPT
-
-    def _check_canceled(self):
-        if not self.context.ok():
-            raise RuntimeError('ROS 已关闭，停止找点')
-        goal = self._active_goal
-        if goal is not None and goal.is_cancel_requested:
-            raise _GoalCanceled()
-
     def action_goal_callback(self, goal_handle):
-        self._active_goal = goal_handle
-        try:
-            self._check_canceled()
-            return self._execute_goal(goal_handle)
-        except _GoalCanceled:
-            self.get_logger().info('找点任务已取消')
-            goal_handle.canceled()
-            return FindCarAvoidancePoint.Result()
-        except Exception as exc:
-            self.get_logger().error(f'找点任务失败: {exc}')
-            if self.context.ok() and goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-            elif self.context.ok() and goal_handle.is_active:
-                goal_handle.abort()
-            return FindCarAvoidancePoint.Result()
-        finally:
-            with self._goal_lock:
-                self._active_goal = None
-                if self._data_node is not None:
-                    self._idle_since = time.monotonic()
-                    self._idle_timer.reset()
-                else:
-                    self._idle_since = None
-                    self._idle_timer.cancel()
-                self._goal_reserved = False
-
-    def _execute_goal(self, goal_handle):
         self.get_logger().info('开始寻找避让点...')
+        self._start_global_costmap_sub()
+        self._start_special_terrain_sub()
+        self._start_vehicle_stop_points_sub()
         try:
-            # 创建过程中发生异常也走 finally，清理已经创建的部分资源。
-            try:
-                self._start_task_resources()
-            except Exception:
-                self._stop_task_resources()
-                raise
-            if not self._wait_for_data(
-                    lambda: bool(self.footprint_vertices), self.task_data_wait_timeout):
-                self.get_logger().error('等待有效 footprint 超时，本次不执行找点')
-                goal_handle.abort()
-                return FindCarAvoidancePoint.Result()
             if not self._wait_for_global_costmap():
                 self.get_logger().error('等待全局代价地图超时')
                 goal_handle.abort()
@@ -615,11 +435,6 @@ class CarAvoidancePointActionServer(Node):
 
             # self.get_logger().info(f'goal_handle.request..{goal_handle.request}')
             self.action_goal_handle_msg = goal_handle.request
-            self._enable_far_side = bool(getattr(self.action_goal_handle_msg, 'enable_far_side', False))
-            self._result_side = 0
-            self.get_logger().info(
-                f'enable_dual_side={self.enable_dual_side}, enable_far_side={self._enable_far_side}'
-            )
             self.vehicle_width = self.action_goal_handle_msg.car_size.y
             # car_pose 有效性检查：frame_id 为空表示消息未填充
             car_pose = self.action_goal_handle_msg.car_pose
@@ -662,7 +477,6 @@ class CarAvoidancePointActionServer(Node):
             # 寻找停靠点
             self.get_logger().info('寻找停靠点...')
             avoidance_point = self.find_avoidance_point(self.robot_pose, self.vertices)
-            self._check_canceled()
             if avoidance_point is not None:
                 ap = avoidance_point.pose
                 yaw = math.degrees(self.get_yaw_from_pose(avoidance_point))
@@ -686,8 +500,6 @@ class CarAvoidancePointActionServer(Node):
                 # goal_handle.abort()
                 result = FindCarAvoidancePoint.Result()
                 result.pose = avoidance_point
-                result.side = int(self._result_side)
-                self.get_logger().info(f'找点结果 side={result.side}')
                 
                 rp = result.pose.pose
                 yaw = math.degrees(self.get_yaw_from_pose(result.pose))
@@ -702,7 +514,9 @@ class CarAvoidancePointActionServer(Node):
                 goal_handle.abort()
                 return FindCarAvoidancePoint.Result()
         finally:
-            self.action_goal_handle_msg = None
+            self._stop_global_costmap_sub()
+            self._stop_special_terrain_sub()
+            self._stop_vehicle_stop_points_sub()
 
     def calculate_total_passage_width(self, vertices):
 
@@ -766,14 +580,12 @@ class CarAvoidancePointActionServer(Node):
         发布调试 marker。
         返回 None 表示准备失败。
         """
-        # 回调可能收到下一帧；同次搜索的尺寸和数据取自同一份消息。
-        costmap_msg = self.global_costmap
-        if costmap_msg is None:
+        if self.global_costmap is None:
             self.get_logger().error('全局代价地图未收到')
             return None
 
         # 地图数据
-        map_info = costmap_msg.metadata
+        map_info = self.global_costmap.metadata
         origin_x = map_info.origin.position.x
         origin_y = map_info.origin.position.y
         resolution = map_info.resolution
@@ -785,7 +597,7 @@ class CarAvoidancePointActionServer(Node):
         self.get_logger().info(f'width: {width}', once=True)
         self.get_logger().info(f'height: {height}', once=True)
 
-        map_data = np.array(costmap_msg.data)
+        map_data = np.array(self.global_costmap.data)
         costmap = np.ascontiguousarray(map_data.reshape((height, width)).astype(np.uint8))
 
         robot_x = robot_pose.pose.position.x
@@ -987,19 +799,18 @@ class CarAvoidancePointActionServer(Node):
             self.get_logger().info(f'尝试外部停车点，共{len(external_candidates)}个')
             valid_external = []    # 所有的满足的外部停车点
             for ext_pose in external_candidates:
-                self._check_canceled()
                 ext_is_inside = self.is_point_inside_parallelogram(
                     ext_pose.pose.position.x, ext_pose.pose.position.y, self.vertices
                 )
-                # 通道内沿长边取背离车辆的一头。通道外保持外部点原来的朝向。
                 if ext_is_inside:
+                    # 通道内：先按避让方向覆盖 yaw，再校验（与自搜索点一致）
                     final_yaw = self._compute_avoidance_yaw(
-                        k, robot_x, robot_y, car_pose.x, car_pose.y, away_from_car=True
+                        k, robot_x, robot_y, car_pose.x, car_pose.y
                     )
                     quat = Quaternion()
                     quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, final_yaw)
                     ext_pose.pose.orientation = quat
-                if not ext_is_inside:
+                else:
                     self.get_logger().info(
                         f'外部停车点({ext_pose.pose.position.x:.2f}, '
                         f'{ext_pose.pose.position.y:.2f}) 在通道外，将跳过服务检查'
@@ -1028,130 +839,89 @@ class CarAvoidancePointActionServer(Node):
                 )
                 if is_inside:
                     best.pose.position.z = 20.0
-                    where = '通道内'
-                    heading = '朝向沿长边背离车辆'
+                    self.get_logger().info(
+                        f'外部停车点通过校验共{len(valid_external)}个，'
+                        f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
+                        f'该点在通道内，使用避让方向，z = 20.0'
+                    )
                 else:
+                    # 通道外的固定停靠点：方向值保持不变
                     best.pose.position.z = 30.0
-                    where = '通道外'
-                    heading = '保持原方向'
-                map_yaw_deg = math.degrees(self.get_yaw_from_pose(best))
-                self.get_logger().info(
-                    f'外部停车点通过校验共{len(valid_external)}个，'
-                    f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
-                    f'该点在{where}，{heading}，map yaw={map_yaw_deg:.1f}°，z = {best.pose.position.z:.1f}'
-                )
-                self._result_side = 3
+                    self.get_logger().info(
+                        f'外部停车点通过校验共{len(valid_external)}个，'
+                        f'选择最贴近长边: ({best.pose.position.x:.2f}, {best.pose.position.y:.2f})，'
+                        f'该点在通道外，方向保持不变，z = 30.0'
+                    )
+                    map_yaw_deg = math.degrees(self.get_yaw_from_pose(best))
+                    self.get_logger().info(
+                        f'通道外外部停靠点已选用，map yaw={map_yaw_deg:.1f}°'
+                    )
                 return best
 
             self.get_logger().info('有外部停车点，但是所有外部停车点在筛选判断以后均不满足，回退自搜索')
         else:
             self.get_logger().info('话题无有效外部停车点，使用自搜索')
-        # ===== 外部点逻辑结束，近侧长边，必要时再搜远侧 =====
-        edges = self.find_long_edges_by_distance(robot_pose, self.vertices)
-        if not edges:
-            self.get_logger().error('找不到两条长边')
-            return None
+        # ===== 外部点逻辑结束，继续原有搜索矩形逻辑 =====
 
-        near_scale = self.near_search_radius_scale if self.enable_dual_side else 1.0
-        near_max = self.search_radius_max * near_scale
-        near_point = self._search_box_on_boundary(
-            robot_pose, edges[0], near_max, True, '近侧', 1,
-            costmap, origin_x, origin_y, resolution, width, height
-        )
-        if near_point is not None:
-            return near_point
-
-        if self.enable_dual_side and self._enable_far_side and len(edges) > 1:
-            self.get_logger().info('近侧没找到，开始搜远侧长边')
-            return self._search_box_on_boundary(
-                robot_pose, edges[1], self.search_radius_max, False, '远侧', 2,
-                costmap, origin_x, origin_y, resolution, width, height
-            )
-
-        self.get_logger().info('当前搜索区域没有找到避让点')
-        return None
-
-    def find_long_edges_by_distance(self, robot_pose, vertices):
-        """两条长边按到机器人的距离排序，近的在前。返回值和 find_nearest_boundary 一样。"""
-        edges = [
-            (vertices[0], vertices[1]),
-            (vertices[1], vertices[2]),
-            (vertices[2], vertices[3]),
-            (vertices[3], vertices[0]),
-        ]
-
-        def calc_edge_length(edge):
-            p1, p2 = edge
-            return np.linalg.norm(np.array(p2) - np.array(p1))
-
-        edge_lengths = [calc_edge_length(edge) for edge in edges]
-        sorted_edges = sorted(zip(edges, edge_lengths), key=lambda item: -item[1])
-        long_edges = [edge for edge, _ in sorted_edges[:2]]
-
-        robot_point = np.array([robot_pose.pose.position.x, robot_pose.pose.position.y])
-        scored = []
-        for edge in long_edges:
-            p1, p2 = np.array(edge[0]), np.array(edge[1])
-            a = p1[1] - p2[1]
-            b = p2[0] - p1[0]
-            c = p1[0] * p2[1] - p2[0] * p1[1]
-            distance = abs(a * robot_point[0] + b * robot_point[1] + c) / math.sqrt(a ** 2 + b ** 2)
-            scored.append((distance, (p1, p2)))
-        scored.sort(key=lambda item: item[0])
-        return [edge for _, edge in scored]
-
-    def _direction_along_boundary(self, boundary, robot_pose):
-        """沿指定长边的搜索方向。翻转规则和原来的近侧准备一致。"""
-        robot_x = robot_pose.pose.position.x
-        robot_y = robot_pose.pose.position.y
-        y_ = boundary[0][1] - boundary[1][1]
-        x_ = boundary[0][0] - boundary[1][0]
-        k = np.arctan2(y_, x_)
-        car_pose = self.action_goal_handle_msg.car_pose.pose.position
-        car_robot_k = np.arctan2(robot_y - car_pose.y, robot_x - car_pose.x)
-        if self.angle_diff(k, car_robot_k) > math.pi / 2:
-            k = self.add_angles(k, math.pi)
-        yaw = self.get_yaw_from_pose(robot_pose)
-        k_diff2 = self.angle_diff(k, yaw)
-        return k, k_diff2
-
-    def _search_box_on_boundary(
-        self, robot_pose, boundary, radius_max, allow_stop_in_place, label, side,
-        costmap, origin_x, origin_y, resolution, width, height
-    ):
-        """在一条长边上按原来的矩形规则找一个点。side：1 近侧，2 远侧。"""
-        robot_x = robot_pose.pose.position.x
-        robot_y = robot_pose.pose.position.y
-        car_pose = self.action_goal_handle_msg.car_pose.pose.position
-        k, k_diff2 = self._direction_along_boundary(boundary, robot_pose)
-        self.get_logger().info(
-            f'{label}：沿边 {self.search_radius_min:.2f}~{radius_max:.2f} m，'
-            f'k={k:.3f}，k_diff2={k_diff2:.3f}'
-        )
-
+        robot_x1 = 0.0
+        robot_y1 = 0.0
+        robot_x2 = 0.0
+        robot_y2 = 0.0
         if k_diff2 < math.pi / 2:
-            self.get_logger().info(
-                f'{label}：在机器人前方避车，额外增加 {self.search_radius_extra_dis} 米'
-            )
-            along_max = radius_max + self.search_radius_extra_dis
-            along_min = self.search_radius_min + self.search_radius_extra_dis
+            self.get_logger().info(f'在机器人前方避车, 额外增加{self.search_radius_extra_dis}米搜索距离')
+            robot_x1 = robot_x + math.cos(k) * (self.search_radius_max + self.search_radius_extra_dis)
+            robot_y1 = robot_y + math.sin(k) * (self.search_radius_max + self.search_radius_extra_dis)
+            robot_x2 = robot_x + math.cos(k) * (self.search_radius_min + self.search_radius_extra_dis)
+            robot_y2 = robot_y + math.sin(k) * (self.search_radius_min + self.search_radius_extra_dis)
         else:
-            self.get_logger().info(f'{label}：在机器人后方避车')
-            along_max = radius_max
-            along_min = self.search_radius_min
+            self.get_logger().info(f'在机器人后方避车')
+            robot_x1 = robot_x + math.cos(k) * self.search_radius_max
+            robot_y1 = robot_y + math.sin(k) * self.search_radius_max
+            robot_x2 = robot_x + math.cos(k) * self.search_radius_min
+            robot_y2 = robot_y + math.sin(k) * self.search_radius_min
 
+        # robot_x1 = robot_x + math.cos(k) * self.search_radius_max
+        # robot_y1 = robot_y + math.sin(k) * self.search_radius_max
+        # robot_x2 = robot_x + math.cos(k) * self.search_radius_min
+        # robot_y2 = robot_y + math.sin(k) * self.search_radius_min    
+
+        # 计算通道宽度和终止条件
         passage_width = self.calculate_total_passage_width(self.vertices)
-        self.get_logger().info(f'{label}：通道宽度 {passage_width:.3f}')
+        half_width = passage_width / 2.0
+        self.get_logger().info(f'通道宽度: {passage_width:.3f}, 半宽: {half_width:.3f}')
+
+        # 单次搜索：只在当前偏移位置搜索一次
+        avoidance_pose_result = None
 
         offset_min = self.outside_min
         offset_max = self.outside_max
+
         self.get_logger().info(
-            f'{label}：搜索偏移 offset_min={offset_min:.2f}, offset_max={offset_max:.2f}'
+            f'当前搜索偏移: offset_min={offset_min:.2f}, offset_max={offset_max:.2f}'
         )
 
+        # 根据机器人是否在通道内部，决定偏移方向
         if self.is_point_inside_parallelogram(robot_x, robot_y, self.vertices):
-            near_off, far_off = offset_min, offset_max
+            # 机器人在通道内部
+            p1_near = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x1, robot_y1], offset_min
+            )
+            p2_near = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x2, robot_y2], offset_min
+            )
+            p1_far = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x1, robot_y1], offset_max
+            )
+            p2_far = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x2, robot_y2], offset_max
+            )
         else:
+            # 机器人在通道外部
+            # 复用 dis_point_to_line 找最近边，并记录它的长度
             verts = self.vertices
             min_dis = float('inf')
             nearest_edge_len = 0.0
@@ -1163,112 +933,114 @@ class CarAvoidancePointActionServer(Node):
                     min_dis = d
                     nearest_edge_len = self.dis_point_to_point(p1[0], p1[1], p2[0], p2[1])
 
-            short_edge_len = self.calculate_total_passage_width(verts)
+            short_edge_len = self.calculate_total_passage_width(verts)  # 复用：最短边长度
+            # 最近边长度接近短边长度 → 从短边出去；明显更长 → 从长边出去
             nearest_is_long = nearest_edge_len > short_edge_len * 1.5
-            dis_robot_to_nearest_bound = min_dis
+
+            dis_robot_to_nearest_bound = min_dis  # 复用这个值，下面 offset_min_local 也用它
 
             offset_min_local = offset_min
             if offset_min < dis_robot_to_nearest_bound < offset_max:
                 offset_min_local = dis_robot_to_nearest_bound
-            elif allow_stop_in_place and nearest_is_long and dis_robot_to_nearest_bound >= self.stop_in_place_min_dist:
+            elif nearest_is_long and dis_robot_to_nearest_bound >= self.stop_in_place_min_dist:
+                # 从长边出去、且离边够远 → 路肩位置，可原地停
                 self.get_logger().info(
-                    f'{label}：机器人在长边外侧 {dis_robot_to_nearest_bound:.2f} m，原地停车，z = 10.0'
+                    f"机器人在长边外侧 {dis_robot_to_nearest_bound:.2f}m，原地停车"
                 )
                 ret_pose = PoseStamped()
                 ret_pose.header.stamp = self.get_clock().now().to_msg()
-                ret_pose.header.frame_id = 'map'
+                ret_pose.header.frame_id = "map"
                 ret_pose.pose.position.x = robot_x
                 ret_pose.pose.position.y = robot_y
-                ret_pose_yaw = self._compute_avoidance_yaw(
-                    k, robot_x, robot_y, car_pose.x, car_pose.y, away_from_car=True
-                )
+                target_angle = math.degrees(math.atan2(
+                    nearest_boundary[1][1] - nearest_boundary[0][1],
+                    nearest_boundary[1][0] - nearest_boundary[0][0]
+                ))
+                yaw = self.get_yaw_from_pose(robot_pose)
+                ret_pose_yaw = math.radians(self.adjust_angle((math.cos(yaw), math.sin(yaw)), target_angle))
                 quat = Quaternion()
                 quat.x, quat.y, quat.z, quat.w = quaternion_from_euler(0, 0, ret_pose_yaw)
                 ret_pose.pose.orientation = quat
                 ret_pose.pose.position.z = 10.0
-                self._result_side = 1
                 return ret_pose
             else:
                 self.get_logger().info(
-                    f'{label}：出口边是{"长边" if nearest_is_long else "短边"}，'
-                    f'距离 {dis_robot_to_nearest_bound:.2f} m，继续搜索'
+                    f"出口边是{'长边' if nearest_is_long else '短边'}, 距离{dis_robot_to_nearest_bound:.2f}m，"
+                    f"不满足原地停条件，继续搜索"
                 )
 
-            near_off, far_off = -offset_min_local, -offset_max
-
-        def search_box(top):
-            x1 = robot_x + math.cos(k) * top
-            y1 = robot_y + math.sin(k) * top
-            x2 = robot_x + math.cos(k) * along_min
-            y2 = robot_y + math.sin(k) * along_min
-            return (
-                self.findIntersection(boundary[0], boundary[1], [x1, y1], near_off),
-                self.findIntersection(boundary[0], boundary[1], [x2, y2], near_off),
-                self.findIntersection(boundary[0], boundary[1], [x1, y1], far_off),
-                self.findIntersection(boundary[0], boundary[1], [x2, y2], far_off),
+            p1_near = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x1, robot_y1], -offset_min_local
+            )
+            p2_near = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x2, robot_y2], -offset_min_local
+            )
+            p1_far = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x1, robot_y1], -offset_max
+            )
+            p2_far = self.findIntersection(
+                nearest_boundary[0], nearest_boundary[1],
+                [robot_x2, robot_y2], -offset_max
             )
 
-        p1_near, p2_near, p1_far, p2_far = search_box(along_max)
         if p1_near is None or p2_near is None or p1_far is None or p2_far is None:
-            self.get_logger().info(f'{label}：findIntersection 返回 None，这一侧没找到')
+            self.get_logger().info('findIntersection 返回 None，放弃搜索')
             return None
 
+        # 搜索框最前面的短边不能越过通道前方短边
         forward_short_edge = self.get_forward_short_edge(robot_x, robot_y, self.vertices, k)
         polygon_center = np.mean(np.array(self.vertices), axis=0)
-
-        def beyond_edge(p_near, p_far):
-            return self.is_point_beyond_edge(
-                [p_near[0], p_near[1]], forward_short_edge, polygon_center
-            ) or self.is_point_beyond_edge(
-                [p_far[0], p_far[1]], forward_short_edge, polygon_center
+        if self.is_point_beyond_edge(
+            [p1_near[0], p1_near[1]],
+            forward_short_edge,
+            polygon_center
+        ) or self.is_point_beyond_edge(
+            [p1_far[0], p1_far[1]],
+            forward_short_edge,
+            polygon_center
+        ):
+            self.get_logger().error(
+                '搜索框构造失败：搜索框最前面的短边越过了通道前方短边'
             )
-
-        # 加大的那段越过通道前方短边时只裁掉越界部分，原来的范围越界才算这一侧没有点。
-        min_top = along_max - max(0.0, radius_max - self.search_radius_max)
-        full_top = along_max
-        while beyond_edge(p1_near, p1_far):
-            if along_max <= min_top + 1e-6:
-                self.get_logger().error(f'{label}：搜索框越过通道前方短边')
-                return None
-            along_max = max(min_top, along_max - 0.1)
-            p1_near, p2_near, p1_far, p2_far = search_box(along_max)
-        if along_max < full_top:
-            self.get_logger().info(
-                f'{label}：搜索框越过前方短边，沿边上限从 {full_top:.2f} m 裁到 {along_max:.2f} m'
-            )
+            return None
 
         find_vertices = self.sort_quadrilateral_vertices([
             p1_near, p1_far, p2_far, p2_near
         ])
+
         fv = find_vertices
         self.get_logger().info(
-            f'{label} find_vertices: [({fv[0][0]:.3f}, {fv[0][1]:.3f}),({fv[1][0]:.3f}, {fv[1][1]:.3f}),'
+            f'find_vertices: [({fv[0][0]:.3f}, {fv[0][1]:.3f}),({fv[1][0]:.3f}, {fv[1][1]:.3f}),'
             f'({fv[2][0]:.3f}, {fv[2][1]:.3f}),({fv[3][0]:.3f}, {fv[3][1]:.3f})]'
         )
+
+        # 发布搜索区域 marker
         self._publish_debug_markers(
-            robot_x, robot_y, car_pose, boundary, find_vertices=find_vertices
+            robot_x, robot_y, car_pose, nearest_boundary,
+            find_vertices=find_vertices
         )
 
-        search_posestamped_list = self.select_points_in_parallelogram(
-            find_vertices, self.search_point_interval, k
-        )
-        self.get_logger().info(f'{label}：候选点 {len(search_posestamped_list)} 个')
+        # 在当前搜索区域内找避让点
+        search_posestamped_list = self.select_points_in_parallelogram(find_vertices, self.search_point_interval, k)
+        self.get_logger().info(f'search_posestamped length: {len(search_posestamped_list)}')
 
-        for avoidance_pose in search_posestamped_list:
-            self._check_canceled()
-            if self._validate_candidate(
-                avoidance_pose, costmap, robot_x, robot_y,
-                origin_x, origin_y, resolution, width, height, boundary
-            ):
-                avoidance_pose.pose.position.z = 10.0
-                self._result_side = side
-                self.get_logger().info(
-                    f'{label}找到避让点 ({avoidance_pose.pose.position.x:.2f}, '
-                    f'{avoidance_pose.pose.position.y:.2f})，side={side}'
-                )
-                return avoidance_pose
+        if len(search_posestamped_list) > 0:
+            self.get_logger().info(f'一共{len(search_posestamped_list)}个候选避让点')
 
-        self.get_logger().info(f'{label}：这个搜索区域没有找到避让点')
+            for avoidance_pose in search_posestamped_list:
+                if self._validate_candidate(
+                    avoidance_pose, costmap, robot_x, robot_y,
+                    origin_x, origin_y, resolution, width, height, nearest_boundary
+                ):
+                    avoidance_pose_result = avoidance_pose
+                    avoidance_pose_result.pose.position.z = 10.0
+                    return avoidance_pose_result
+
+        # 单次搜索结束，没找到
+        self.get_logger().info('当前搜索区域没有找到避让点')
         return None
 
     def get_yaw_from_pose(self, pose_stamped):
@@ -1328,26 +1100,14 @@ class CarAvoidancePointActionServer(Node):
 
     # 发送服务，判断避让点是否能够让车通过
     def check_avoidance(self, avoidance_msg):
-        # 超过 check_service_max_time 的结果本来就不采用，等太久只会拖住取消。
-        timeout = max(2.0, 4.0 * self.check_service_max_time)
-        if not self._wait_for_data(self.check_avoidance_service.service_is_ready, timeout):
-            self.get_logger().warn(f'通过性服务 {timeout:.1f} 秒未就绪，按不可通过处理')
-            return False
-        deadline = time.monotonic() + timeout
-        future = self.check_avoidance_service.call_async(avoidance_msg)
-        try:
-            while not future.done():
-                self._check_canceled()
-                if time.monotonic() > deadline:
-                    self.get_logger().warn(f'通过性服务 {timeout:.1f} 秒没有返回，按不可通过处理')
-                    return False
-                time.sleep(0.01)
-            result = future.result()
-            return result is not None and result.is_car_passable
-        finally:
-            if not future.done():
-                self.check_avoidance_service.remove_pending_request(future)
-                future.cancel()
+        while not self.check_avoidance_service.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('服务未就绪，等待中...')
+    
+        # future = self.check_avoidance_service.call_async(avoidance_msg)
+        # self.get_logger().info(f'判断是否能通过:{avoidance_msg.robot_pose.pose.position}')
+        result = self.check_avoidance_service.call(avoidance_msg)
+        # self.get_logger().info(f'result.is_car_passable:{result.is_car_passable}')
+        return result.is_car_passable
         # rclpy.spin_until_future_complete(self, future)
         # if future.result().is_car_passable:
         #     self.get_logger().info('成功找到避让点。')
@@ -1841,14 +1601,13 @@ class CarAvoidancePointActionServer(Node):
 
         return target_angle if np.abs(np.arccos(cos_theta_1)) < np.abs(np.arccos(cos_theta_2)) else target_angle_2
     
-    def _compute_avoidance_yaw(self, k, robot_x, robot_y, car_x, car_y, away_from_car=False):
-        """沿通道长边二选一。to_car 是机器人指向车辆的方向。
-        默认取与 to_car 夹角不超过 90° 的一头，朝向车辆。
-        away_from_car 为真时取夹角大于 90° 的一头，背离车辆。"""
-        to_car = math.atan2(car_y - robot_y, car_x - robot_x)
-        facing_car = self.angle_diff(k, to_car) <= math.pi / 2
-        use_k = (not facing_car) if away_from_car else facing_car
-        return k if use_k else k + math.pi
+    def _compute_avoidance_yaw(self, k, robot_x, robot_y, car_x, car_y):
+        """沿通道长边方向，选择与来车方向背对的 yaw（与自搜索点一致）"""
+        to_car_x = car_x - robot_x
+        to_car_y = car_y - robot_y
+        k_vec = (math.cos(k), math.sin(k))
+        dot = k_vec[0] * to_car_x + k_vec[1] * to_car_y
+        return k if dot < 0 else k + math.pi
 
     def process_points(self, robot_pose, vertices, points, direction):
         car_x = self.action_goal_handle_msg.car_pose.pose.position.x
@@ -1856,9 +1615,8 @@ class CarAvoidancePointActionServer(Node):
         robot_x = robot_pose.pose.position.x
         robot_y = robot_pose.pose.position.y
 
-        # 自搜索点沿长边，取背离车辆的一头。
         final_yaw = self._compute_avoidance_yaw(
-            direction, robot_x, robot_y, car_x, car_y, away_from_car=True
+            direction, robot_x, robot_y, car_x, car_y
         )
         final_angle = math.degrees(final_yaw)
 
@@ -2365,3 +2123,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+    

@@ -1,0 +1,38 @@
+ros2 topic pub --once  /car_information capella_ros_msg/CarDetectArray "results:
+- pose:
+    header:
+      frame_id: 'map'
+      stamp:
+        sec: 0
+        nanosec: 0
+    pose:
+      position:
+        x: -1.0  # 示例：地图系下x坐标（替换为实际值）
+        y: 36.0  # 示例：地图系下y坐标（替换为实际值）
+        z: 100.0  # 代码中定义100代表前摄像头
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        w: 1.0  # 默认无旋转
+  size:
+    x: 5.0  # 代码中固定车辆长度
+    y: 2.3  # 代码中固定车辆宽度
+    z: 0.0
+  speed:
+    header:
+      frame_id: 'base_link'
+      stamp:
+        sec: 0
+        nanosec: 0
+    twist:
+      linear:
+        x: 0.0  # 示例：x方向速度（-1=靠近，1=远离，0=静止）
+        y: 0.0  # 示例：y方向速度
+        z: 0.0
+      angular:
+        x: 0.0
+        y: 0.0
+        z: 0.0"
+
+
