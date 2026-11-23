@@ -6,24 +6,25 @@ find_free_space_action_server:
     search_interval: 0.5
 
     search_radius_min: 3.0
-    search_radius_max: 3.3      # 长度方向只有0.3m
-    outside_min: 0.2
-    outside_max: 0.35            # 宽度方向只有0.15m
-    search_point_interval: 0.15  # 采样间隔0.15m → 长度0.3/0.15=2点，宽度0.15/0.15=1点
+    search_radius_max: 4.0      # 长度方向只有0.3m
+    near_search_radius_scale: 1.2  # 双侧打开时近侧沿边远端倍率，4.0*1.2=4.8m
+    outside_min: -2.0
+    outside_max: 2.0            # 宽度方向只有0.15m
+    search_point_interval: 0.4  # 采样间隔0.15m → 长度0.3/0.15=2点，宽度0.15/0.15=1点
     search_radius_extra_dis: 2.0 # 前避车时额外增加的寻找距离
 
-    check_service_max_time: 1.0
-    distance_extend_outside: 1.1
-    inside_step: 0.1  # 每次往通道内部挪的步长（m）， GARAGE_FIND_PARKING_POINT_INSIDE_STEP 
+    check_service_max_time: 1.0   # 检查时间太长的也不要了
     show_global_costmap_raw_cv2: false
     show_global_costmap_raw_colored_cv2: false
-    max_inward_offset: 1.5
+    enable_dual_side: true           # 双侧找点。环境变量显式设为 false/0 时由 launch 关掉
     max_robot_pose_age: 1.0          # 机器人位姿超过 1 秒没更新的位姿，不当成有效位姿
     robot_pose_wait_timeout: 1.5     # 等待新鲜位姿超时
+    subscription_idle_timeout: 10.0  # 最后一次任务结束后，连续空闲 10 秒退订
+    task_data_wait_timeout: 2.0     # 每项启动数据（footprint、地图等）的等待上限，使用单调时间
 
-    #  GARAGE_FOOTPRINT_SWEEP_LONG_STEP
-    footprint_sweep_long_step: 999.0
-    # GARAGE_FOOTPRINT_SWEEP_SHORT_STEP 
-    footprint_sweep_short_step: 999.0
+    #  GARAGE_FOOTPRINT_SWEEP_LONG_STEP     沿移动方向的采样间隔
+    footprint_sweep_long_step: 0.3
+    # GARAGE_FOOTPRINT_SWEEP_SHORT_STEP     沿车宽方向的采样间隔
+    footprint_sweep_short_step: 0.3   
 
 
